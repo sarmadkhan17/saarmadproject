@@ -9,7 +9,7 @@ import time
 import logging
 import traceback
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -48,7 +48,7 @@ def _send_telegram_alert(text: str):
 
 
 def _alert_crash(mode: str, error: str, crash_count: int):
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     _send_telegram_alert(
         f"🚨 <b>BOT CRASH #{crash_count}</b>\n"
         f"<b>Mode:</b> {mode.upper()}\n"
@@ -59,7 +59,7 @@ def _alert_crash(mode: str, error: str, crash_count: int):
 
 
 def _alert_recovery(mode: str, crash_count: int):
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     _send_telegram_alert(
         f"✅ <b>BOT RECOVERED</b>\n"
         f"<b>Mode:</b> {mode.upper()}\n"
@@ -69,7 +69,7 @@ def _alert_recovery(mode: str, crash_count: int):
 
 
 def _alert_giving_up(mode: str, crash_count: int):
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     _send_telegram_alert(
         f"💀 <b>BOT STOPPED — TOO MANY CRASHES</b>\n"
         f"<b>Mode:</b> {mode.upper()}\n"

@@ -16,12 +16,14 @@ Shared:
 import json
 import os
 import time
+import threading
 import logging
 import logging.handlers
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import yaml
 from dataclasses import dataclass, asdict
 import sys
@@ -86,34 +88,69 @@ class StateManager:
     """
     Manages trade state.
     Spot and Futures use separate state files so they don't interfere.
+    Batches writes to reduce I/O — flushes every 10s or on demand.
     """
+
+    _FLUSH_INTERVAL = 10  # seconds
 
     def __init__(self, filename: str = "state.json"):
         self.path = DATA / filename
         DATA.mkdir(exist_ok=True)
+        self._lock = threading.Lock()
+        self._dirty = False
+        self._last_flush = time.time()
+        self._flush_thread = None
+        self._stop_flushing = threading.Event()
         self.state = self._load()
+        self._start_flush_thread()
+
+    def _start_flush_thread(self):
+        self._flush_thread = threading.Thread(target=self._periodic_flush, daemon=True)
+        self._flush_thread.start()
+
+    def _periodic_flush(self):
+        while not self._stop_flushing.wait(self._FLUSH_INTERVAL):
+            if self._dirty:
+                self._do_save()
+
+    def shutdown(self):
+        self._stop_flushing.set()
+        if self._dirty:
+            self._do_save()
+        if self._flush_thread:
+            self._flush_thread.join(timeout=5)
 
     def _load(self):
-        if self.path.exists():
-            with open(self.path) as f:
-                return json.load(f)
-        return {
-            "trades": [], "signals": [],
-            "stats": {
-                "total_trades": 0, "wins": 0, "losses": 0,
-                "total_pnl": 0.0,
-                "start_time": datetime.utcnow().isoformat(),
-            },
-        }
+        with self._lock:
+            if self.path.exists():
+                with open(self.path) as f:
+                    return json.load(f)
+            return {
+                "trades": [], "signals": [],
+                "stats": {
+                    "total_trades": 0, "wins": 0, "losses": 0,
+                    "total_pnl": 0.0,
+                    "start_time": datetime.now(timezone.utc).isoformat(),
+                },
+            }
 
     def save(self):
-        with open(self.path, "w") as f:
-            json.dump(self.state, f, indent=2, default=str)
-        try:
-            shutil.copy2(str(self.path),
-                         str(self.path.with_suffix(".backup.json")))
-        except Exception:
-            pass
+        with self._lock:
+            self._dirty = True
+
+    def _do_save(self):
+        with self._lock:
+            if not self._dirty:
+                return
+            with open(self.path, "w") as f:
+                json.dump(self.state, f, indent=2, default=str)
+            try:
+                shutil.copy2(str(self.path),
+                             str(self.path.with_suffix(".backup.json")))
+            except Exception:
+                pass
+            self._dirty = False
+            self._last_flush = time.time()
 
     def add_trade(self, trade: Trade):
         self.state["trades"].append(asdict(trade))
@@ -126,7 +163,7 @@ class StateManager:
                 t["status"]          = "closed"
                 t["close_price"]     = price
                 t["pnl"]             = pnl
-                t["close_timestamp"] = datetime.utcnow().isoformat()
+                t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
                 self.state["stats"]["total_pnl"] += pnl
                 if pnl > 0: self.state["stats"]["wins"]   += 1
                 else:       self.state["stats"]["losses"] += 1
@@ -244,26 +281,67 @@ class BaseBot:
                 for c in self.scanner.top_coins[:2]:
                     if c not in train_symbols:
                         train_symbols.append(c)
-            dfs = []
+            raw_dfs = []
             for sym in train_symbols:
                 try:
-                    df = self.feed.fetch_ohlcv(sym, "1h", limit=200)
+                    df = self.feed.fetch_ohlcv(sym, "1h", limit=500)
                     if df is not None and len(df) > 100:
-                        dfs.append(df)
+                        raw_dfs.append(df)
                         self.log.info(f"Training data: {sym} ({len(df)} bars)")
                 except Exception as e:
                     self.log.warning(f"Could not fetch {sym}: {e}")
-            if not dfs:
+            if not raw_dfs:
                 self.log.warning("No training data — using BTC fallback")
                 df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=500)
                 if df is not None:
-                    dfs = [df]
-            if not dfs:
+                    raw_dfs = [df]
+            if not raw_dfs:
                 self.log.error("Training skipped — no data available")
                 return
-            combined = pd.concat(dfs, ignore_index=True)
-            self.log.info(f"Training on {len(combined)} bars from {len(dfs)} coins")
-            results = self.ai.train_all(combined)
+            # Compute features+labels per symbol to avoid EMA/rolling contamination
+            # across coin price boundaries, then concat the clean feature rows.
+            import numpy as np
+            from ai_strategy import make_features, make_labels, AIStrategyEngine
+            feat_parts, label_parts = [], []
+            ctx_vol_parts, ctx_trend_parts, ctx_vratio_parts = [], [], []
+            fb = self.config.get("ml", {}).get("forward_bars", 1)
+            for sym_df in raw_dfs:
+                try:
+                    sym_reset = sym_df.reset_index(drop=True)
+                    f = make_features(sym_reset)
+                    l = make_labels(sym_reset, forward_bars=fb).reindex(f.index).dropna()
+                    f = f.loc[l.index]
+                    if len(f) < 50:
+                        continue
+                    ctx_v, ctx_t, ctx_r = AIStrategyEngine._compute_context_features(sym_reset)
+                    ctx_vol_parts.append(ctx_v[f.index.values])
+                    ctx_trend_parts.append(ctx_t[f.index.values])
+                    ctx_vratio_parts.append(ctx_r[f.index.values])
+                    feat_parts.append(f.reset_index(drop=True))
+                    label_parts.append(l.reset_index(drop=True))
+                except Exception as e:
+                    self.log.warning(f"Feature/label error for a symbol: {e}")
+            if not feat_parts:
+                self.log.error("Training skipped — no clean feature rows")
+                return
+            combined_feats  = pd.concat(feat_parts,  ignore_index=True)
+            combined_labels = pd.concat(label_parts, ignore_index=True)
+            combined_ctx    = (
+                np.concatenate(ctx_vol_parts),
+                np.concatenate(ctx_trend_parts),
+                np.concatenate(ctx_vratio_parts),
+            )
+            combined = pd.concat(raw_dfs, ignore_index=True)
+            self.log.info(
+                f"Training on {len(combined_feats)} clean rows "
+                f"from {len(feat_parts)} coins (forward_bars={fb})"
+            )
+            results = self.ai.train_all(
+                combined,
+                feat_df=combined_feats,
+                labels_s=combined_labels,
+                ctx_arrays=combined_ctx,
+            )
             self.log.info(f"Training complete: {results}")
             self._check_model_health(results)
 
@@ -472,7 +550,7 @@ class BaseBot:
                     done        = False,
                 )
 
-                action = self.rl_agent.decide(
+                action, rl_conf = self.rl_agent.decide(
                     trade         = trade,
                     current_price = current_price,
                     atr           = atr,
@@ -528,27 +606,34 @@ class BaseBot:
 
     def analyze_symbol(self, symbol, balance, open_trades, regime_ctx=None):
         """
-        Full autonomous analysis — IDENTICAL logic for spot and futures.
-        The only difference is what happens at order placement.
+        Decision hierarchy: Signal → Context → Execution → Risk.
+        IDENTICAL logic for spot and futures; subclasses only differ at order placement.
         """
         try:
             dfs = self.feed.fetch_multi_timeframe(symbol)
             if not dfs or "1h" not in dfs:
                 return
 
-            df_1h    = dfs["1h"]
-            self.ai.ingest_new_data(symbol, df_1h)   # feed online buffer
-            htf_bias = self.get_htf_bias(dfs)
-            ml_signal = self.ai.predict(df_1h, symbol)
-            all_agree = (ml_signal.get("indicators", {}).get("buy_votes", 0) == 3 or
-                         ml_signal.get("indicators", {}).get("sell_votes", 0) == 3)
-            signal    = self.agents.analyze(symbol, df_1h, ml_signal)
+            df_1h = dfs["1h"]
+            self.ai.ingest_new_data(symbol, df_1h)
+
+            # ══ SIGNAL LAYER ═════════════════════════════════════════════════
+            # ML models output direction + confidence; agent coordinator refines.
+            hmm_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
+            ml_signal  = self.ai.predict(df_1h, symbol, regime=hmm_regime)
+            all_agree  = (ml_signal.get("indicators", {}).get("buy_votes", 0) == 3 or
+                          ml_signal.get("indicators", {}).get("sell_votes", 0) == 3)
+            signal     = self.agents.analyze(symbol, df_1h, ml_signal)
 
             action = signal["action"]
             conf   = signal["confidence"]
             strat  = signal["strategy"]
 
-            # HTF filter — same for both modes
+            # ══ CONTEXT LAYER ════════════════════════════════════════════════
+            # Adjusts confidence / direction — never enforces portfolio constraints.
+
+            # HTF bias filter
+            htf_bias     = self.get_htf_bias(dfs)
             htf_conflict = (action == "BUY" and htf_bias == "SELL") or \
                            (action == "SELL" and htf_bias == "BUY")
             if htf_conflict:
@@ -565,7 +650,7 @@ class BaseBot:
                     action = "HOLD"
                     self.log.info(f"{symbol} {action} blocked by HTF {htf_bias} (strict)")
 
-            # BTC momentum modifier — adjust confidence for non-BTC symbols
+            # BTC momentum modifier
             if symbol != "BTC/USDT" and action in ("BUY", "SELL"):
                 btc_ret = self._get_btc_1h_return()
                 if action == "BUY" and btc_ret < -0.015:
@@ -575,19 +660,32 @@ class BaseBot:
                 elif action == "BUY" and btc_ret > 0.015:
                     conf = min(round(conf + 0.04, 4), 0.95)
 
+            # Regime gate (context — blocks direction, not portfolio)
+            if regime_ctx and action in ("BUY", "SELL"):
+                if not regime_ctx.get("gate", True):
+                    self.log.info(f"{symbol} {action} blocked: regime={regime_ctx['regime']}")
+                    action = "HOLD"
+                elif action == "BUY" and not regime_ctx.get("allow_longs", True):
+                    self.log.info(f"{symbol} BUY blocked — longs off in {regime_ctx['regime']}")
+                    action = "HOLD"
+                elif action == "SELL" and not regime_ctx.get("allow_shorts", True):
+                    self.log.info(f"{symbol} SELL blocked — shorts off in {regime_ctx['regime']}")
+                    action = "HOLD"
+
             self.state.add_signal({
                 "symbol": symbol, "action": action, "confidence": conf,
                 "strategy": f"HTF:{htf_bias}+{strat}", "timeframe": "AUTO",
                 "indicators": signal.get("indicators", {}),
-                "timestamp":  datetime.utcnow().isoformat(),
+                "timestamp":  datetime.now(timezone.utc).isoformat(),
             })
+            self.log.info(f"{symbol} | {action} | conf={conf:.2f} | HTF={htf_bias} | regime={hmm_regime}")
 
-            self.log.info(f"{symbol} | {action} | conf={conf:.2f} | HTF={htf_bias}")
+            # ══ EXECUTION LAYER ══════════════════════════════════════════════
+            # Decide whether to close, open, or wait. Handles position sizing.
 
-            # Find existing position
             holding = self._find_position(symbol, open_trades)
 
-            # ── CLOSE LOGIC ──────────────────────────────────────
+            # Close existing position on SELL signal
             if action == "SELL" and holding and conf >= self.min_conf:
                 order = self._place_close(symbol, holding["amount"], holding["side"])
                 if order:
@@ -602,27 +700,9 @@ class BaseBot:
                     self.notifier.send_alert(f"AI CLOSE {symbol}\nPnL: ${pnl:+.4f}")
                 return
 
-            # ── REGIME GATE (new entries only) ───────────────────
-            if regime_ctx:
-                if not regime_ctx.get("gate", True):
-                    if action in ["BUY", "SELL"]:
-                        self.log.info(
-                            f"{symbol} {action} blocked: regime={regime_ctx['regime']}"
-                        )
-                    return
-                if action == "BUY" and not regime_ctx.get("allow_longs", True):
-                    self.log.info(
-                        f"{symbol} BUY blocked — longs off in {regime_ctx['regime']}"
-                    )
-                    return
-                if action == "SELL" and not regime_ctx.get("allow_shorts", True):
-                    self.log.info(
-                        f"{symbol} SELL blocked — shorts off in {regime_ctx['regime']}"
-                    )
-                    return
-
-            # ── OPEN LOGIC ───────────────────────────────────────
-            if action not in ["BUY", "SELL"]: return
+            # No open position to manage → evaluate new entry
+            if action not in ("BUY", "SELL"):
+                return
             eff_conf = max(
                 self.min_conf,
                 regime_ctx.get("min_conf", self.min_conf) if regime_ctx else self.min_conf,
@@ -630,12 +710,13 @@ class BaseBot:
             if conf < eff_conf:
                 self.log.info(
                     f"{symbol} conf={conf:.2f} < eff_min={eff_conf:.2f}"
-                    f" ({regime_ctx.get('regime', '?') if regime_ctx else 'default'})"
+                    f" ({hmm_regime})"
                 )
                 return
-            if holding:                       return
+            if holding:
+                return
 
-            # Double-check exchange directly to prevent duplicate positions
+            # Dedup check for futures
             if self.MODE == "futures":
                 try:
                     positions = self.exchange.get_position()
@@ -645,12 +726,14 @@ class BaseBot:
                 except Exception:
                     pass
 
-
             price = self.get_price(symbol)
             if not price:
                 return
 
-            # Kelly Criterion position sizing — same for both modes
+            # Step 10: Trade filters — require vol spike + ATR expansion before entry
+            if not self._passes_trade_filters(df_1h, symbol):
+                return
+
             portfolio_mult = regime_ctx.get("size_mult", 1.0) if regime_ctx else 1.0
             _, est_usdt = self.risk.get_position_size(
                 confidence=conf, balance=balance, price=price,
@@ -658,18 +741,20 @@ class BaseBot:
                 portfolio_mult=portfolio_mult, all_agree=all_agree,
             )
 
-            # Full risk checks — same for both modes
+            # ══ RISK LAYER ═══════════════════════════════════════════════════
+            # ONLY enforces: max trades, portfolio heat, circuit breaker.
+            # Does NOT override signal direction or confidence.
             ok, reason = self.risk.can_open_trade(
                 symbol=symbol, open_trades=open_trades,
                 balance=balance, new_usdt=est_usdt,
                 get_price_fn=self.get_price,
             )
             if not ok:
-                self.log.info(f"SKIP {symbol}: {reason}")
+                self.log.info(f"RISK SKIP {symbol}: {reason}")
                 return
 
-            # GNN correlation filter (additional to rule-based CorrelationFilter)
-            open_syms       = [t["symbol"] for t in open_trades]
+            # GNN correlation filter (context-level, not risk-level)
+            open_syms = [t["symbol"] for t in open_trades]
             gnn_ok, gnn_msg, gnn_score = self.gnn_filter.check(symbol, open_syms)
             if not gnn_ok:
                 self.log.info(f"GNN SKIP {symbol}: {gnn_msg}")
@@ -701,7 +786,7 @@ class BaseBot:
                     side      = side,
                     amount    = amount,
                     price     = fill_price,
-                    timestamp = datetime.utcnow().isoformat(),
+                    timestamp = datetime.now(timezone.utc).isoformat(),
                     strategy  = strat,
                     timeframe = f"AUTO-{self.MODE}",
                     status    = "open",
@@ -723,6 +808,39 @@ class BaseBot:
 
         except Exception as e:
             self.log.error(f"Error analyzing {symbol}: {e}", exc_info=True)
+
+    def _passes_trade_filters(self, df_1h, symbol: str) -> bool:
+        """
+        Step 10: Pre-entry quality filters.
+        Requires: volume spike (vol > 1.5× vol_MA) AND ATR expansion (ATR > ATR_MA).
+        Returns True if entry is allowed, False to skip.
+        """
+        try:
+            close = df_1h["close"]
+            high  = df_1h["high"]
+            low   = df_1h["low"]
+            vol   = df_1h["volume"]
+
+            vol_ma   = vol.rolling(20).mean()
+            vol_ok   = float(vol.iloc[-1]) > 1.5 * float(vol_ma.iloc[-1])
+
+            import ta as _ta
+            atr      = _ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
+            atr_ma   = atr.rolling(20).mean()
+            atr_ok   = float(atr.iloc[-1]) > float(atr_ma.iloc[-1])
+
+            if not (vol_ok and atr_ok):
+                self.log.info(
+                    f"FILTER SKIP {symbol}: vol_spike={vol_ok} "
+                    f"(ratio={vol.iloc[-1]/vol_ma.iloc[-1]:.2f}) "
+                    f"atr_expand={atr_ok} "
+                    f"(ratio={atr.iloc[-1]/atr_ma.iloc[-1]:.2f})"
+                )
+                return False
+            return True
+        except Exception as e:
+            self.log.warning(f"Trade filter error for {symbol}: {e}")
+            return True  # fail-open so filter errors don't block all trades
 
     def _find_position(self, symbol, open_trades):
         """Find existing position for a symbol."""
@@ -781,7 +899,7 @@ class BaseBot:
                         "price":           pos["entry_price"],
                         "mark_price":      pos.get("mark_price", 0),
                         "live_pnl":        round(pos["pnl"], 6),
-                        "timestamp":       datetime.utcnow().isoformat(),
+                        "timestamp":       datetime.now(timezone.utc).isoformat(),
                         "strategy":        "synced_from_exchange",
                         "timeframe":       f"AUTO-{self.MODE}",
                         "status":          "open",
@@ -810,13 +928,22 @@ class BaseBot:
                     t["status"]          = "closed"
                     t["close_price"]     = last_price
                     t["pnl"]             = round(pnl, 6)
-                    t["close_timestamp"] = datetime.utcnow().isoformat()
+                    t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
                     self.log.info(f"Sync: closed orphan {t['symbol']} pnl={pnl:+.4f}")
+                    # Feed orphan close back to risk and AI systems
+                    try:
+                        self.risk.record_trade_result(pnl, usdt)
+                    except Exception:
+                        pass
+                    try:
+                        self.ai.record_trade_result(t.get("symbol", "unknown"), pnl)
+                    except Exception:
+                        pass
 
             live_pnl = round(sum(p["pnl"] for p in positions), 4)
             self.log.info(f"Sync saving balance=${usdt:.2f} live_pnl={live_pnl:.4f}")
             self.state.state["stats"]["balance"]        = round(usdt, 2)
-            self.state.state["stats"]["last_sync"]      = datetime.utcnow().isoformat()
+            self.state.state["stats"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
             self.state.state["stats"]["total_live_pnl"] = live_pnl
             self.state.save()
 
@@ -910,15 +1037,20 @@ class BaseBot:
         # RL execution layer: manages open trades, runs after ATR stops + HMM context ready
         self._rl_manage_trades(regime_ctx)
 
-        # GNN correlation graph: build/refresh from cached 1h OHLCV (fast — hits cache)
+        # Pre-fetch 1h OHLCV for all symbols once — shared between GNN and analysis
         try:
-            gnn_dfs = {}
-            for s in symbols:
+            ohlcv_1h = {}
+            def _fetch_1h(s):
                 df = self.feed.fetch_ohlcv(s, "1h", limit=168)
-                if df is not None and len(df) >= 24:
-                    gnn_dfs[s] = df
-            if len(gnn_dfs) >= 2:
-                self.gnn_filter.update_graph(gnn_dfs)
+                return s, df
+            with ThreadPoolExecutor(max_workers=min(10, len(symbols))) as executor:
+                for s, df in executor.map(_fetch_1h, symbols):
+                    if df is not None and len(df) >= 24:
+                        ohlcv_1h[s] = df
+
+            # GNN correlation graph from pre-fetched data
+            if len(ohlcv_1h) >= 2:
+                self.gnn_filter.update_graph(ohlcv_1h)
                 stats = self.gnn_filter.graph_stats()
                 self.log.info(
                     f"GNN graph: {stats['n_nodes']} nodes "
@@ -936,6 +1068,7 @@ class BaseBot:
         except Exception as e:
             self.log.warning(f"Online learning update failed: {e}")
 
+        # Process symbols — pass pre-fetched 1h data to avoid redundant fetches
         for symbol in symbols:
             if not can_trade or max_reached or trading_paused:
                 # Still save signals for dashboard
@@ -950,7 +1083,6 @@ class BaseBot:
                 continue
 
             self.analyze_symbol(symbol, balance, open_trades, regime_ctx)
-            time.sleep(0.5)
 
 
     def run(self):
@@ -963,11 +1095,11 @@ class BaseBot:
             f"Mode: {self.MODE.upper()}"
         )
 
-        last_train = datetime.utcnow().date()
+        last_train = datetime.now(timezone.utc).date()
 
         while True:
             try:
-                today = datetime.utcnow().date()
+                today = datetime.now(timezone.utc).date()
                 if today != last_train:
                     self._train()
                     last_train = today

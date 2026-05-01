@@ -23,7 +23,10 @@ def load_env():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, val = line.split("=", 1)
-                    os.environ.setdefault(key.strip(), val.strip())
+                    key = key.strip()
+                    val = val.strip()
+                    if val:
+                        os.environ[key] = val
 
 
 def get_secret(key, default=""):

@@ -4,3 +4,8 @@ logs/
 __pycache__/
 *.pkl
 *.keras
+*.pt
+venv/
+*.pyc
+*.json
+cryptobot_v3/

@@ -9,7 +9,7 @@ import logging
 import re
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from groq import Groq
 from env_config import get_groq_key, DATA_DIR, BOT_ROOT
 
@@ -52,7 +52,10 @@ class SelfLearner:
         last = self.insights.get("last_review")
         if not last:
             return True
-        return (datetime.utcnow() - datetime.fromisoformat(last)) > timedelta(hours=self.REVIEW_HOURS)
+        dt = datetime.fromisoformat(last)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt) > timedelta(hours=self.REVIEW_HOURS)
 
     def analyze_performance(self):
         trades = self._load_trades()
@@ -133,7 +136,7 @@ JSON only:
         perf = self.analyze_performance()
         if "error" in perf:
             log.warning(f"Learning skipped: {perf['error']}")
-            self.insights["last_review"] = datetime.utcnow().isoformat()
+            self.insights["last_review"] = datetime.now(timezone.utc).isoformat()
             self._save_insights()
             return perf
 
@@ -147,9 +150,9 @@ JSON only:
                 changes = self.apply_improvements(improvements)
 
         self.insights["total_reviews"] += 1
-        self.insights["last_review"]    = datetime.utcnow().isoformat()
+        self.insights["last_review"]    = datetime.now(timezone.utc).isoformat()
         self.insights["performance_history"].append({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "win_rate":  perf["win_rate"],
             "total_pnl": perf["total_pnl"],
             "trades":    perf["total_trades"],

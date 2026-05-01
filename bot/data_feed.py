@@ -10,8 +10,9 @@ import logging
 import json
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -134,7 +135,7 @@ class OHLCVCache:
         interval = self.CANDLE_SECONDS.get(tf, 3600)
         if last is None:
             return True
-        return (datetime.utcnow() - last).total_seconds() >= interval
+        return (datetime.now(timezone.utc) - last).total_seconds() >= interval
 
     def get(self, symbol: str, tf: str):
         return self._cache.get(self._key(symbol, tf))
@@ -142,7 +143,7 @@ class OHLCVCache:
     def set(self, symbol: str, tf: str, df):
         key = self._key(symbol, tf)
         self._cache[key] = df
-        self._times[key] = datetime.utcnow()
+        self._times[key] = datetime.now(timezone.utc)
 
 
 # ── REST price polling (fallback when WS unavailable) ─────────────────────────
@@ -301,10 +302,19 @@ class DataFeed:
         if timeframes is None:
             timeframes = [("1h", 300), ("4h", 200), ("1d", 100)]
         dfs = {}
-        for tf, limit in timeframes:
-            df = self.fetch_ohlcv(symbol, tf, limit)
-            if df is not None and len(df) >= 50:
-                dfs[tf] = df
+        with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
+            future_to_tf = {
+                executor.submit(self.fetch_ohlcv, symbol, tf, limit): tf
+                for tf, limit in timeframes
+            }
+            for future in as_completed(future_to_tf):
+                tf = future_to_tf[future]
+                try:
+                    df = future.result()
+                    if df is not None and len(df) >= 50:
+                        dfs[tf] = df
+                except Exception:
+                    pass
         return dfs
 
     # ── Live price ────────────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ import logging
 import re
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from groq import Groq
 import numpy as np
 from env_config import get_groq_key, DATA_DIR
@@ -65,7 +65,7 @@ class TokenBudgetManager:
     def __init__(self):
         self.path       = DATA / "token_budget.json"
         self.used_today = 0
-        self.reset_date = str(datetime.utcnow().date())
+        self.reset_date = str(datetime.now(timezone.utc).date())
         self._load()
 
     def _load(self):
@@ -73,8 +73,8 @@ class TokenBudgetManager:
             with open(self.path) as f:
                 d = json.load(f)
                 self.used_today = d.get("used_today", 0)
-                self.reset_date = d.get("reset_date", str(datetime.utcnow().date()))
-        today = str(datetime.utcnow().date())
+                self.reset_date = d.get("reset_date", str(datetime.now(timezone.utc).date()))
+        today = str(datetime.now(timezone.utc).date())
         if today != self.reset_date:
             self.used_today = 0
             self.reset_date = today
@@ -348,7 +348,7 @@ class AgentCoordinator:
         self._decision_actions = {}
 
     def _refresh_slow(self):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if (self._slow_time is None or
                 (now - self._slow_time).total_seconds() > self.SLOW_CACHE_SECS):
             self._fg_cache    = self.fear_greed.analyze()
@@ -362,7 +362,7 @@ class AgentCoordinator:
 
     def analyze(self, symbol, df, ml_signal):
         self._refresh_slow()
-        now     = datetime.utcnow()
+        now     = datetime.now(timezone.utc)
         last_dt = self._decision_time.get(symbol)
         cached  = self._decision_cache.get(symbol)
 

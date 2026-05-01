@@ -14,7 +14,7 @@ import warnings
 warnings.filterwarnings("ignore")
 from collections import deque
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -31,6 +31,8 @@ tf.get_logger().setLevel("ERROR")
 
 from env_config import DATA_DIR
 
+import os
+
 try:
     from models.tft_model import TFTStrategy
     _TFT_AVAILABLE = True
@@ -38,7 +40,8 @@ except Exception:
     _TFT_AVAILABLE = False
 
 log  = logging.getLogger("AIStrategy")
-DATA = DATA_DIR
+BOT_MODE = os.environ.get("BOT_MODE", "spot")
+DATA = DATA_DIR / BOT_MODE
 DATA.mkdir(exist_ok=True)
 
 MC_SAMPLES            = 15    # MC Dropout forward passes
@@ -51,7 +54,14 @@ def make_features(df):
     high  = df["high"]
     low   = df["low"]
     vol   = df["volume"]
+    opn   = df["open"]
     f     = pd.DataFrame(index=df.index)
+
+    # Pre-compute shared intermediates
+    ret            = close.pct_change()
+    vol_sma        = vol.rolling(20).mean()
+    max_oc         = pd.concat([close, opn], axis=1).max(axis=1)
+    min_oc         = pd.concat([close, opn], axis=1).min(axis=1)
 
     for p in [1, 2, 3, 5, 7, 14, 21]:
         f[f"ret_{p}"] = close.pct_change(p)
@@ -87,9 +97,8 @@ def make_features(df):
 
     atr = ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
     f["atr_pct"]   = atr / (close + 1e-9)
-    f["atr_ratio"] = atr / (atr.rolling(20).mean() + 1e-9)
+    f["atr_ratio"] = atr / (vol_sma.rolling(0).mean() + 1e-9) if False else atr / (atr.rolling(20).mean() + 1e-9)
 
-    vol_sma        = vol.rolling(20).mean()
     f["vol_ratio"] = vol / (vol_sma + 1e-9)
     f["vol_trend"] = vol.rolling(5).mean() / (vol_sma + 1e-9)
     f["vol_spike"] = (f["vol_ratio"] > 2.0).astype(int)
@@ -101,64 +110,96 @@ def make_features(df):
     f["cci"]        = ta.trend.CCIIndicator(high, low, close, 20).cci() / 100
     f["williams_r"] = ta.momentum.WilliamsRIndicator(high, low, close, 14).williams_r() / 100
 
-    for w in [14, 50]:
-        h = high.rolling(w).max()
-        l = low.rolling(w).min()
-        f[f"price_pos_{w}"] = (close - l) / (h - l + 1e-9)
+    hi14 = high.rolling(14).max()
+    lo14 = low.rolling(14).min()
+    hi50 = high.rolling(50).max()
+    lo50 = low.rolling(50).min()
+    f["price_pos_14"] = (close - lo14) / (hi14 - lo14 + 1e-9)
+    f["price_pos_50"] = (close - lo50) / (hi50 - lo50 + 1e-9)
 
-    f["body"]       = abs(close - df["open"]) / (close + 1e-9)
-    f["upper_wick"] = (high - pd.concat([close, df["open"]], axis=1).max(axis=1)) / (close + 1e-9)
-    f["lower_wick"] = (pd.concat([close, df["open"]], axis=1).min(axis=1) - low) / (close + 1e-9)
-    f["is_bullish"] = (close > df["open"]).astype(int)
+    f["body"]       = abs(close - opn) / (close + 1e-9)
+    f["upper_wick"] = (high - max_oc) / (close + 1e-9)
+    f["lower_wick"] = (min_oc - low) / (close + 1e-9)
+    f["is_bullish"] = (close > opn).astype(int)
 
-    ret             = close.pct_change()
     f["vol_5"]      = ret.rolling(5).std()
     f["vol_20"]     = ret.rolling(20).std()
     f["vol_regime"] = f["vol_5"] / (f["vol_20"] + 1e-9)
     f["adx"]        = ta.trend.ADXIndicator(high, low, close, 14).adx() / 100
 
-    # VWAP and deviation
     vwap            = (close * vol).cumsum() / (vol.cumsum() + 1e-9)
     f["vwap_dist"]  = (close - vwap) / (vwap + 1e-9)
     f["above_vwap"] = (close > vwap).astype(int)
 
-    # Cumulative volume delta (buying/selling pressure proxy)
-    delta        = vol * pd.Series(np.where(close >= df["open"], 1.0, -1.0), index=df.index)
-    f["cvd_5"]   = delta.rolling(5).sum()  / (vol.rolling(5).sum()  + 1e-9)
-    f["cvd_20"]  = delta.rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)
+    delta        = vol * pd.Series(np.where(close >= opn, 1.0, -1.0), index=df.index)
+    vol_roll5    = vol.rolling(5).sum()
+    vol_roll20   = vol.rolling(20).sum()
+    f["cvd_5"]   = delta.rolling(5).sum()  / (vol_roll5  + 1e-9)
+    f["cvd_20"]  = delta.rolling(20).sum() / (vol_roll20 + 1e-9)
 
-    # Price acceleration (momentum of momentum)
     f["price_accel"] = close.pct_change(3).diff(2)
 
-    # Rolling Sharpe ratio
-    ret            = close.pct_change()
-    f["sharpe_10"] = ret.rolling(10).mean() / (ret.rolling(10).std() + 1e-9)
-    f["sharpe_20"] = ret.rolling(20).mean() / (ret.rolling(20).std() + 1e-9)
+    ret10_mean = ret.rolling(10).mean()
+    ret10_std  = ret.rolling(10).std()
+    ret20_mean = ret.rolling(20).mean()
+    ret20_std  = ret.rolling(20).std()
+    f["sharpe_10"] = ret10_mean / (ret10_std + 1e-9)
+    f["sharpe_20"] = ret20_mean / (ret20_std + 1e-9)
 
-    # Donchian channel breakouts (trend continuation signals)
-    for w in [20, 50]:
-        f[f"dc_breakout_{w}"]  = (close >= high.rolling(w).max().shift(1)).astype(int)
-        f[f"dc_breakdown_{w}"] = (close <= low.rolling(w).min().shift(1)).astype(int)
+    hi20 = high.rolling(20).max()
+    lo20 = low.rolling(20).min()
+    f[f"dc_breakout_20"]  = (close >= hi20.shift(1)).astype(int)
+    f[f"dc_breakdown_20"] = (close <= lo20.shift(1)).astype(int)
+    f[f"dc_breakout_50"]  = (close >= hi50.shift(1)).astype(int)
+    f[f"dc_breakdown_50"] = (close <= lo50.shift(1)).astype(int)
+
+    # Additional features
+    f["vol_expansion"] = atr / (atr.rolling(50).mean() + 1e-9)
+    f["vol_delta"]     = (vol - vol_sma) / (vol_sma + 1e-9)
+
+    recent_hi = hi20.shift(1)
+    recent_lo = lo20.shift(1)
+    f["liq_sweep_up"]  = ((low < recent_lo) & (close > recent_lo)).astype(int)
+    f["liq_sweep_down"]= ((high > recent_hi) & (close < recent_hi)).astype(int)
+
+    ema96  = ta.trend.EMAIndicator(close, 96).ema_indicator()
+    ema200 = ta.trend.EMAIndicator(close, 200).ema_indicator()
+    f["htf_bull"]  = ((close > ema96) & (close > ema200)).astype(int)
+    f["htf_bear"]  = ((close < ema96) & (close < ema200)).astype(int)
+    f["htf_align"] = (
+        ((close > ema9) & (close > ema21) & (close > ema50) & (close > ema96)).astype(int)
+        - ((close < ema9) & (close < ema21) & (close < ema50) & (close < ema96)).astype(int)
+    )
 
     return f.dropna()
 
 
-def make_labels(df, forward_bars=1, min_move=0.003):
+def make_labels(df, forward_bars=1, atr_multiplier=0.5):
     """
-    Forward return labels. forward_bars=1, min_move=0.003 tested at 62%+ accuracy.
+    ATR-based dynamic threshold labels.
+    threshold = (ATR/close) * atr_multiplier, clipped [0.001, 0.02].
+    Adapts to market volatility — wider threshold in volatile regimes.
     """
+    import ta as _ta
     close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+
+    atr       = _ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
+    threshold = (atr / (close + 1e-9) * atr_multiplier).clip(lower=0.001, upper=0.02)
+
     future = close.shift(-forward_bars) / close - 1
     labels = pd.Series(1, index=df.index)
-    labels[future >  min_move] = 2   # BUY
-    labels[future < -min_move] = 0   # SELL
+    labels[future >  threshold] = 2   # BUY
+    labels[future < -threshold] = 0   # SELL
     labels = labels.dropna()
     counts = labels.value_counts().sort_index()
     total  = len(labels)
     log.info(
-        f"Labels: SELL={counts.get(0,0)/total*100:.1f}% "
+        f"Labels (ATR-dynamic): SELL={counts.get(0,0)/total*100:.1f}% "
         f"HOLD={counts.get(1,0)/total*100:.1f}% "
-        f"BUY={counts.get(2,0)/total*100:.1f}%"
+        f"BUY={counts.get(2,0)/total*100:.1f}% "
+        f"avg_threshold={threshold.mean():.4f}"
     )
     return labels
 
@@ -249,11 +290,15 @@ class RandomForestStrategy:
                 log.warning(f"RF load failed (will retrain): {e}")
                 self.is_trained = False
 
-    def train(self, df, use_decay_weights: bool = False):
+    def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None):
         log.info("Training Random Forest (walk-forward)...")
-        feat   = make_features(df)
-        labels = make_labels(df).reindex(feat.index).dropna()
-        feat   = feat.loc[labels.index]
+        if feat_df is not None and labels_s is not None:
+            feat   = feat_df
+            labels = labels_s
+        else:
+            feat   = make_features(df)
+            labels = make_labels(df).reindex(feat.index).dropna()
+            feat   = feat.loc[labels.index]
         if len(feat) < 300:
             return {"error": "need 300+ bars"}
 
@@ -309,7 +354,7 @@ class RandomForestStrategy:
             "accuracy":     round(new_acc, 4),
             "wf_accuracy":  round(float(wf_acc), 4),
             "test_accuracy":round(new_acc, 4),
-            "trained_at":   datetime.utcnow().isoformat(),
+            "trained_at":   datetime.now(timezone.utc).isoformat(),
             "n_samples":    len(X),
         }
         joblib.dump(self.model,        self.model_path)
@@ -365,11 +410,15 @@ class LightGBMStrategy:
                 log.warning(f"LightGBM load failed (will retrain): {e}")
                 self.is_trained = False
 
-    def train(self, df, use_decay_weights: bool = False):
+    def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None):
         log.info("Training LightGBM (walk-forward)...")
-        feat   = make_features(df)
-        labels = make_labels(df).reindex(feat.index).dropna()
-        feat   = feat.loc[labels.index]
+        if feat_df is not None and labels_s is not None:
+            feat   = feat_df
+            labels = labels_s
+        else:
+            feat   = make_features(df)
+            labels = make_labels(df).reindex(feat.index).dropna()
+            feat   = feat.loc[labels.index]
         if len(feat) < 300:
             return {"error": "need 300+ bars"}
         self.feature_cols = feat.columns.tolist()
@@ -429,7 +478,7 @@ class LightGBMStrategy:
             "accuracy":      round(new_acc, 4),
             "wf_accuracy":   round(wf_acc, 4),
             "test_accuracy": round(new_acc, 4),
-            "trained_at":    datetime.utcnow().isoformat(),
+            "trained_at":    datetime.now(timezone.utc).isoformat(),
             "n_samples":     len(X),
         }
         joblib.dump(self.model,        self.model_path)
@@ -591,7 +640,7 @@ class LSTMStrategy:
             "accuracy":     round(float(test_acc), 4),
             "test_accuracy": round(float(test_acc), 4),
             "epochs":       epochs_ran,
-            "trained_at":   datetime.utcnow().isoformat(),
+            "trained_at":   datetime.now(timezone.utc).isoformat(),
         }
         with open(self.meta_path, "w") as f:
             json.dump(self.metadata, f, indent=2)
@@ -604,6 +653,12 @@ class LSTMStrategy:
         try:
             feat = make_features(df)
             if len(feat) < self.SEQ_LEN:
+                return {"action": "HOLD", "confidence": 0.34, "probs": [0.33, 0.34, 0.33]}
+            if feat.shape[1] != self.n_features:
+                log.warning(
+                    f"LSTM stale: make_features={feat.shape[1]} model={self.n_features}. "
+                    f"Retrain LSTM."
+                )
                 return {"action": "HOLD", "confidence": 0.34, "probs": [0.33, 0.34, 0.33]}
             X_sc  = self.scaler.transform(feat.values)
             seq   = X_sc[-self.SEQ_LEN:].reshape(1, self.SEQ_LEN, self.n_features)
@@ -627,6 +682,12 @@ class LSTMStrategy:
         try:
             feat = make_features(df)
             if len(feat) < self.SEQ_LEN:
+                return None
+            if feat.shape[1] != self.n_features:
+                log.warning(
+                    f"LSTM stale (MC): make_features={feat.shape[1]} model={self.n_features}. "
+                    f"Retrain LSTM."
+                )
                 return None
             X_sc = self.scaler.transform(feat.values)
             seq  = X_sc[-self.SEQ_LEN:].reshape(1, self.SEQ_LEN, self.n_features)
@@ -749,7 +810,7 @@ class MetaModel:
             "accuracy":        round(float(new_acc), 4),
             "n_samples":       int(len(y)),
             "n_meta_features": int(meta_X.shape[1]),
-            "trained_at":      datetime.utcnow().isoformat(),
+            "trained_at":      datetime.now(timezone.utc).isoformat(),
         }
         joblib.dump(self.model,  self.model_path)
         joblib.dump(self.scaler, self.scaler_path)
@@ -770,10 +831,15 @@ class MetaModel:
             features.extend([volatility, trend_strength, vol_ratio])
             row = np.array([features])
 
-            # Feature-count guard: mismatch means meta was trained without/with TFT
-            expected = self.metadata.get("n_meta_features", row.shape[1])
-            if row.shape[1] != expected:
-                log.debug(f"MetaModel feature mismatch ({row.shape[1]} vs {expected}) — ensemble fallback")
+            # Feature-count guard: use model's ground-truth n_features_in_ so stale
+            # metadata (missing n_meta_features key) doesn't bypass the check.
+            expected = (self.metadata.get("n_meta_features")
+                        or getattr(self.model, "n_features_in_", None))
+            if expected is not None and row.shape[1] != expected:
+                log.warning(
+                    f"MetaModel feature mismatch ({row.shape[1]} vs {expected}) "
+                    f"— meta needs retrain (TFT added?). Ensemble fallback."
+                )
                 return None
 
             if np.isnan(row).any() or np.isinf(row).any():
@@ -801,17 +867,18 @@ class AIStrategyEngine:
         self.lstm          = LSTMStrategy()
         self.tft           = TFTStrategy() if _TFT_AVAILABLE else None
         self.meta          = MetaModel()
-        self.online_buffer = OnlineBuffer()
+        self.online_buffer   = OnlineBuffer()
+        self._unc_buffer: list = []   # uncertainty log write buffer (Step 7)
         self.performance_log = []
         p = DATA / "trade_results.json"
         if p.exists():
             with open(p) as f:
                 self.performance_log = json.load(f)
 
-    def train_all(self, df):
+    def train_all(self, df, feat_df=None, labels_s=None, ctx_arrays=None, use_decay_weights: bool = False):
         r = {}
-        r["rf"]   = self.rf.train(df)
-        r["lgbm"] = self.lgbm.train(df)
+        r["rf"]   = self.rf.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights)
+        r["lgbm"] = self.lgbm.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights)
         r["lstm"] = self.lstm.train(df)
         if self.tft is not None:
             r["tft"] = self.tft.train(df)
@@ -840,102 +907,163 @@ class AIStrategyEngine:
         return volatility, trend_strength, vol_ratio
 
     def _train_meta(self, df):
-        """Generate OOF predictions from base models and train meta-learner."""
-        log.info("Training MetaModel (OOF predictions)...")
+        """5-fold TimeSeriesSplit OOF — fresh base models per fold, no data leakage."""
+        log.info("Training MetaModel (5-fold OOF, no leakage)...")
         try:
             feat   = make_features(df)
             labels = make_labels(df).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
-            if len(feat) < 200:
-                log.warning("MetaModel: need 200+ rows")
-                return {"error": "need 200+ rows"}
+            if len(feat) < 400:
+                log.warning("MetaModel OOF: need 400+ rows")
+                return {"error": "need 400+ rows for OOF"}
 
             df_aligned = df.reindex(feat.index)
             X  = feat.values
             y  = labels.values.astype(int)
-            sp = int(len(X) * 0.8)
-            n  = len(X) - sp
+            n  = len(X)
 
-            # ── RF OOF ───────────────────────────────────────────────────────
-            if self.rf.is_trained:
-                try:
-                    raw      = self.rf.model.predict_proba(self.rf.scaler.transform(X[sp:]))
-                    rf_probs = np.zeros((n, 3))
-                    for i, c in enumerate(self.rf.model.classes_):
-                        rf_probs[:, int(c)] = raw[:, i]
-                except Exception:
-                    rf_probs = np.full((n, 3), 1/3)
-            else:
-                rf_probs = np.full((n, 3), 1/3)
+            tscv     = TimeSeriesSplit(n_splits=5)
+            oof_rf   = np.full((n, 3), 1/3)
+            oof_lgbm = np.full((n, 3), 1/3)
+            oof_lstm = np.full((n, 3), 1/3)
+            oof_mask = np.zeros(n, dtype=bool)
 
-            # ── LGBM OOF ─────────────────────────────────────────────────────
-            if self.lgbm.is_trained:
-                try:
-                    raw        = self.lgbm.model.predict_proba(self.lgbm.scaler.transform(X[sp:]))
-                    lgbm_probs = np.zeros((n, 3))
-                    for i, c in enumerate(self.lgbm.model.classes_):
-                        lgbm_probs[:, int(c)] = raw[:, i]
-                except Exception:
-                    lgbm_probs = np.full((n, 3), 1/3)
-            else:
-                lgbm_probs = np.full((n, 3), 1/3)
+            for fold_i, (tr_idx, val_idx) in enumerate(tscv.split(X)):
+                log.info(
+                    f"MetaModel OOF fold {fold_i+1}/5  "
+                    f"train={len(tr_idx)}  val={len(val_idx)}"
+                )
 
-            # ── LSTM OOF (per-row, uses preceding context) ───────────────────
-            if self.lstm.is_trained:
+                # ── RF fold ──────────────────────────────────────────────────
                 try:
-                    X_sc_lstm  = self.lstm.scaler.transform(feat.values)
-                    seq_len    = self.lstm.SEQ_LEN
-                    lstm_probs = np.full((n, 3), 1/3)
-                    for k, i in enumerate(range(sp, len(X))):
-                        if i >= seq_len:
-                            seq = X_sc_lstm[i-seq_len:i].reshape(
-                                1, seq_len, self.lstm.n_features
+                    sc_rf   = StandardScaler()
+                    Xtr_rf  = sc_rf.fit_transform(X[tr_idx])
+                    Xval_rf = sc_rf.transform(X[val_idx])
+                    cw_rf   = dict(zip(*[np.unique(y[tr_idx]),
+                                         compute_class_weight("balanced",
+                                         classes=np.unique(y[tr_idx]),
+                                         y=y[tr_idx])]))
+                    m_rf = RandomForestClassifier(
+                        n_estimators=200, max_depth=8, min_samples_leaf=8,
+                        class_weight=cw_rf,
+                        random_state=42 + fold_i, n_jobs=-1,
+                    )
+                    m_rf.fit(Xtr_rf, y[tr_idx])
+                    raw = m_rf.predict_proba(Xval_rf)
+                    p   = np.zeros((len(val_idx), 3))
+                    for ci, c in enumerate(m_rf.classes_):
+                        p[:, int(c)] = raw[:, ci]
+                    oof_rf[val_idx] = p
+                except Exception as e:
+                    log.warning(f"RF OOF fold {fold_i+1}: {e}")
+
+                # ── LGBM fold ─────────────────────────────────────────────────
+                try:
+                    sc_lgbm   = StandardScaler()
+                    Xtr_lgbm  = sc_lgbm.fit_transform(X[tr_idx])
+                    Xval_lgbm = sc_lgbm.transform(X[val_idx])
+                    vsp       = int(len(tr_idx) * 0.85)
+                    m_lgbm    = lgb.LGBMClassifier(
+                        n_estimators=200, max_depth=5, learning_rate=0.05,
+                        subsample=0.8, colsample_bytree=0.8, num_leaves=15,
+                        class_weight="balanced",
+                        random_state=42 + fold_i, verbose=-1, n_jobs=-1,
+                    )
+                    m_lgbm.fit(
+                        Xtr_lgbm[:vsp], y[tr_idx[:vsp]],
+                        eval_set=[(Xtr_lgbm[vsp:], y[tr_idx[vsp:]])],
+                        callbacks=[lgb.early_stopping(20, verbose=False),
+                                   lgb.log_evaluation(period=-1)],
+                    )
+                    raw = m_lgbm.predict_proba(Xval_lgbm)
+                    p   = np.zeros((len(val_idx), 3))
+                    for ci, c in enumerate(m_lgbm.classes_):
+                        p[:, int(c)] = raw[:, ci]
+                    oof_lgbm[val_idx] = p
+                except Exception as e:
+                    log.warning(f"LGBM OOF fold {fold_i+1}: {e}")
+
+                # ── LSTM fold (lightweight) ───────────────────────────────────
+                seq_len = self.lstm.SEQ_LEN
+                if len(tr_idx) > seq_len + 50:
+                    try:
+                        sc_l = MinMaxScaler()
+                        sc_l.fit(X[tr_idx])
+                        X_sc  = sc_l.transform(X)  # fit on train, apply to all
+                        X_seq_tr, y_seq_tr = make_sequences(
+                            X_sc[tr_idx], y[tr_idx], seq_len
+                        )
+                        if len(X_seq_tr) >= 20:
+                            m_lstm = Sequential([
+                                Bidirectional(LSTM(32, return_sequences=False,
+                                                  input_shape=(seq_len, X.shape[1]))),
+                                Dropout(0.3),
+                                Dense(3, activation="softmax"),
+                            ])
+                            m_lstm.compile(
+                                optimizer=Adam(0.001),
+                                loss="sparse_categorical_crossentropy",
                             )
-                            lstm_probs[k] = self.lstm.model.predict(seq, verbose=0)[0]
-                except Exception:
-                    lstm_probs = np.full((n, 3), 1/3)
-            else:
-                lstm_probs = np.full((n, 3), 1/3)
+                            m_lstm.fit(
+                                X_seq_tr, y_seq_tr,
+                                epochs=20, batch_size=32, verbose=0,
+                                callbacks=[EarlyStopping(patience=5,
+                                           restore_best_weights=True)],
+                            )
+                            for vi in val_idx:
+                                if vi >= seq_len:
+                                    seq = X_sc[vi - seq_len:vi].reshape(
+                                        1, seq_len, X.shape[1])
+                                    oof_lstm[vi] = m_lstm.predict(seq, verbose=0)[0]
+                            del m_lstm
+                    except Exception as e:
+                        log.warning(f"LSTM OOF fold {fold_i+1}: {e}")
 
-            # ── TFT OOF (per-row sequences, same pattern as LSTM) ────────────
+                oof_mask[val_idx] = True
+
+            # ── TFT OOF — single-pass (too expensive to fold) ────────────────
+            tft_probs = None
             if self.tft is not None and self.tft.is_trained:
                 try:
                     import torch
-                    X_sc_tft  = self.tft.scaler.transform(feat.values)
-                    seq_len   = self.tft.SEQ_LEN
+                    seq_tft  = self.tft.SEQ_LEN
+                    X_sc_tft = self.tft.scaler.transform(X)
                     tft_probs = np.full((n, 3), 1/3)
                     self.tft.model.eval()
                     with torch.no_grad():
-                        for k, i in enumerate(range(sp, len(X))):
-                            if i >= seq_len:
-                                seq  = torch.FloatTensor(
-                                    X_sc_tft[i-seq_len:i]
-                                ).unsqueeze(0)
-                                p    = torch.softmax(
-                                    self.tft.model(seq), dim=-1
-                                )[0].numpy()
-                                tft_probs[k] = p
-                except Exception:
+                        for i in range(seq_tft, n):
+                            s = torch.FloatTensor(
+                                X_sc_tft[i - seq_tft:i]).unsqueeze(0)
+                            tft_probs[i] = torch.softmax(
+                                self.tft.model(s), dim=-1)[0].numpy()
+                except Exception as e:
+                    log.warning(f"TFT OOF: {e}")
                     tft_probs = None
-            else:
-                tft_probs = None
 
-            # ── Context features (computed on full df, sliced to test rows) ──
+            # ── Context features ──────────────────────────────────────────────
             ctx_vol, ctx_trend, ctx_vratio = self._compute_context_features(df_aligned)
+            ctx_vol    = np.nan_to_num(ctx_vol)
+            ctx_trend  = np.nan_to_num(ctx_trend)
+            ctx_vratio = np.nan_to_num(ctx_vratio, nan=1.0)
 
-            parts = [rf_probs, lgbm_probs, lstm_probs]
+            parts = [oof_rf, oof_lgbm, oof_lstm]
             if tft_probs is not None:
                 parts.append(tft_probs)
-            parts.extend([
-                ctx_vol[sp:].reshape(-1, 1),
-                ctx_trend[sp:].reshape(-1, 1),
-                ctx_vratio[sp:].reshape(-1, 1),
-            ])
+            parts += [
+                ctx_vol.reshape(-1, 1),
+                ctx_trend.reshape(-1, 1),
+                ctx_vratio.reshape(-1, 1),
+            ]
             meta_X = np.column_stack(parts)
 
-            result = self.meta.train(meta_X, y[sp:])
-            log.info(f"MetaModel: {result}")
+            n_valid = int(oof_mask.sum())
+            if n_valid < 50:
+                return {"error": f"too few OOF rows: {n_valid}"}
+
+            result = self.meta.train(meta_X[oof_mask], y[oof_mask])
+            log.info(f"MetaModel 5-fold OOF: {result}")
             return result
+
         except Exception as e:
             log.error(f"MetaModel training failed: {e}", exc_info=True)
             return {"error": str(e)}
@@ -965,7 +1093,7 @@ class AIStrategyEngine:
             h["tft_trained"]  = self.tft.is_trained
         return h
 
-    def predict(self, df, symbol):
+    def predict(self, df, symbol, regime: str = "RANGING"):
         rf_p   = self.rf.predict(df)
         lgbm_p = self.lgbm.predict(df)
 
@@ -1038,7 +1166,9 @@ class AIStrategyEngine:
                    np.array(lgbm_p["probs"]) * W["lgbm"] +
                    np.array(lstm_p["probs"]) * W["lstm"])
             if tft_p is not None:
-                avg = (avg * 0.75 + np.array(tft_p["probs"]) * 0.25)
+                # Step 4: regime-aware TFT weight — higher in trending markets
+                tft_w = 0.35 if regime == "TRENDING" else 0.15
+                avg   = avg * (1.0 - tft_w) + np.array(tft_p["probs"]) * tft_w
             avg   /= avg.sum()
             label  = int(np.argmax(avg))
             conf   = float(avg[label])
@@ -1064,6 +1194,23 @@ class AIStrategyEngine:
             action = "HOLD"
             strat  = f"UNCERTAIN({combined_uncertainty:.3f})+" + strat
 
+        ts = datetime.now(timezone.utc).isoformat()
+
+        # Step 7: buffer uncertainty entry for periodic disk flush
+        self._unc_buffer.append({
+            "symbol":           symbol,
+            "timestamp":        ts,
+            "action":           action,
+            "confidence":       round(float(conf), 4),
+            "uncertainty":      round(combined_uncertainty, 4),
+            "ensemble_var":     round(ensemble_var, 4),
+            "mc_uncertainty":   round(mc_uncertainty, 4),
+            "gated":            combined_uncertainty > UNCERTAINTY_THRESHOLD,
+            "regime":           regime,
+        })
+        if len(self._unc_buffer) >= 50:
+            self._flush_uncertainty_log()
+
         return {
             "symbol":     symbol,
             "action":     action,
@@ -1088,8 +1235,26 @@ class AIStrategyEngine:
                 "mc_uncertainty":     round(mc_uncertainty, 4),
                 "uncertainty_gated":  combined_uncertainty > UNCERTAINTY_THRESHOLD,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": ts,
         }
+
+    def _flush_uncertainty_log(self):
+        if not self._unc_buffer:
+            return
+        log_path = DATA / "uncertainty_log.json"
+        try:
+            existing: list = []
+            if log_path.exists():
+                with open(log_path) as f:
+                    existing = json.load(f)
+            existing.extend(self._unc_buffer)
+            if len(existing) > 10_000:
+                existing = existing[-10_000:]
+            with open(log_path, "w") as f:
+                json.dump(existing, f)
+            self._unc_buffer = []
+        except Exception as e:
+            log.warning(f"Uncertainty log flush failed: {e}")
 
     def ingest_new_data(self, symbol: str, df: pd.DataFrame):
         """Feed latest OHLCV into rolling online buffer."""
@@ -1098,10 +1263,23 @@ class AIStrategyEngine:
     def incremental_update(self) -> dict:
         """
         Incrementally retrain base models on rolling buffered data with decay weights.
-        Triggered every OnlineBuffer.UPDATE_EVERY new bars. Falls back silently on error.
+        Step 6 gates: requires 50+ closed trades AND 52%+ win rate before updating.
+        Triggered every OnlineBuffer.UPDATE_EVERY new bars.
         """
         if not self.online_buffer.should_update():
             return {"status": "skipped"}
+
+        # Step 6: safety gates — only retrain with sufficient proven performance
+        total_trades = len(self.performance_log)
+        if total_trades < 50:
+            log.debug(f"Online learning skipped: {total_trades}/50 trades")
+            return {"status": "skipped", "reason": f"only {total_trades}/50 trades"}
+        wins     = sum(1 for t in self.performance_log if t.get("pnl", 0) > 0)
+        win_rate = wins / total_trades
+        if win_rate < 0.52:
+            log.debug(f"Online learning skipped: win_rate {win_rate:.2%} < 52%")
+            return {"status": "skipped", "reason": f"win_rate {win_rate:.2%} < 52%"}
+
         combined = self.online_buffer.get_combined()
         if combined is None:
             return {"status": "skipped", "reason": "insufficient data"}
@@ -1147,7 +1325,24 @@ class AIStrategyEngine:
     def record_trade_result(self, symbol, pnl):
         self.performance_log.append({
             "symbol": symbol, "pnl": pnl,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         with open(DATA / "trade_results.json", "w") as f:
             json.dump(self.performance_log, f, indent=2)
+
+        # Step 7: annotate most recent uncertainty entry for this symbol with outcome
+        try:
+            self._flush_uncertainty_log()   # ensure buffer is flushed first
+            log_path = DATA / "uncertainty_log.json"
+            if log_path.exists():
+                with open(log_path) as f:
+                    unc_log = json.load(f)
+                for entry in reversed(unc_log):
+                    if entry.get("symbol") == symbol and "outcome_pnl" not in entry:
+                        entry["outcome_pnl"] = round(float(pnl), 6)
+                        entry["outcome_win"] = bool(pnl > 0)
+                        break
+                with open(log_path, "w") as f:
+                    json.dump(unc_log, f)
+        except Exception:
+            pass

@@ -104,7 +104,14 @@ class BinanceDemoClient:
             r.raise_for_status()
             return r.json()
         except requests.exceptions.HTTPError:
-            log.error(f"Signed POST {path}: {r.text}")
+            try:
+                err_code = r.json().get("code", 0)
+            except Exception:
+                err_code = 0
+            if err_code == -4046:
+                log.debug(f"Signed POST {path}: {r.text}")
+            else:
+                log.error(f"Signed POST {path}: {r.text}")
             raise
 
     # ── Symbol normalization ────────────────────────────────────

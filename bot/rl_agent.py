@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import joblib
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
 from env_config import DATA_DIR
@@ -53,8 +53,11 @@ def build_state(
     vol_feat = float(np.clip((atr / entry) * 50, 0.0, 1.0))
 
     try:
-        ts  = trade.get("timestamp", datetime.utcnow().isoformat())
-        hrs = max(0.0, (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds() / 3600)
+        ts  = trade.get("timestamp", datetime.now(timezone.utc).isoformat())
+        ts_dt = datetime.fromisoformat(ts)
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        hrs = max(0.0, (datetime.now(timezone.utc) - ts_dt).total_seconds() / 3600)
     except Exception:
         hrs = 0.0
     time_feat = float(np.clip(np.log1p(hrs) / np.log1p(48), 0.0, 1.0))
@@ -116,14 +119,16 @@ class RLTradeManager:
     Learns online from closed-trade PnL. Safe before trained (returns HOLD).
     """
 
-    BATCH_SIZE    = 32
-    GAMMA         = 0.99
-    LR            = 1e-3
-    EPS_START     = 1.0
-    EPS_END       = 0.15
-    EPS_DECAY     = 0.995
-    TARGET_SYNC   = 50       # steps between target-net sync
-    MIN_EXPERIENCES = 64     # minimum buffer size before any non-HOLD action
+    BATCH_SIZE       = 32
+    GAMMA            = 0.99
+    LR               = 1e-3
+    EPS_START        = 1.0
+    EPS_END          = 0.15
+    EPS_DECAY        = 0.995
+    TARGET_SYNC      = 50    # steps between target-net sync
+    MIN_EXPERIENCES  = 64    # minimum buffer before any non-HOLD action
+    MIN_CONF_THRESH  = 0.60  # Q-net confidence below this → rule-based HOLD
+    SCALE_IN_MIN_EXP = 500   # experiences needed before SCALE_IN is allowed
 
     def __init__(self):
         self.model_path  = DATA / "rl_agent.pt"
@@ -182,7 +187,7 @@ class RLTradeManager:
                 "epsilon":   round(self.epsilon, 4),
                 "n_steps":   self.n_steps,
                 "buffer_len": len(self.buffer),
-                "saved_at":  datetime.utcnow().isoformat(),
+                "saved_at":  datetime.now(timezone.utc).isoformat(),
             })
             with open(self.meta_path, "w") as f:
                 json.dump(self.metadata, f, indent=2)
@@ -200,35 +205,62 @@ class RLTradeManager:
         atr: float,
         regime: str = "RANGING",
         price_1h_ago: float = 0.0,
-    ) -> str:
+    ) -> tuple:
         """
-        Returns action string. Falls back to HOLD on failure or insufficient training.
-        SCALE_IN only allowed after MIN_EXPERIENCES.
+        Returns (action: str, confidence: float).
+        Guardrails:
+          - HOLD until MIN_EXPERIENCES in buffer
+          - SCALE_IN blocked until SCALE_IN_MIN_EXP experiences
+          - fallback to HOLD if Q-net confidence < MIN_CONF_THRESH
         """
         try:
             state = build_state(trade, current_price, atr, regime, price_1h_ago)
 
             if len(self.buffer) < self.MIN_EXPERIENCES:
-                self._pending[trade["id"]] = (state, 0, current_price)  # HOLD
-                return "HOLD"
+                self._pending[trade["id"]] = (state, 0, current_price)
+                log.debug(f"RL {trade.get('symbol','?')}: HOLD (buffer {len(self.buffer)}/{self.MIN_EXPERIENCES})")
+                return "HOLD", 1.0
 
-            # Reduced epsilon for live trading (don't explore aggressively with real money)
+            # Reduced epsilon for live trading
             live_eps = self.epsilon * 0.2
             if random.random() < live_eps:
                 action_idx = random.randint(0, N_ACTIONS - 1)
+                confidence = 1.0 / N_ACTIONS  # random → low confidence
             else:
                 self.q_net.eval()
                 with torch.no_grad():
-                    action_idx = int(
-                        self.q_net(torch.FloatTensor(state).unsqueeze(0)).argmax().item()
-                    )
+                    q_vals     = self.q_net(torch.FloatTensor(state).unsqueeze(0))
+                    probs      = torch.softmax(q_vals, dim=-1)[0]
+                    action_idx = int(q_vals.argmax().item())
+                    confidence = float(probs[action_idx].item())
+
+            action = ACTIONS[action_idx]
+
+            # Guardrail: SCALE_IN disabled until enough experience
+            if action == "SCALE_IN" and len(self.buffer) < self.SCALE_IN_MIN_EXP:
+                action     = "HOLD"
+                action_idx = 0
+                log.debug(f"RL {trade.get('symbol','?')}: SCALE_IN blocked (exp={len(self.buffer)}/{self.SCALE_IN_MIN_EXP})")
+
+            # Guardrail: low-confidence network → fall back to rule-based HOLD
+            if confidence < self.MIN_CONF_THRESH and action not in ("HOLD", "CLOSE"):
+                log.debug(
+                    f"RL {trade.get('symbol','?')}: {action} → HOLD "
+                    f"(conf={confidence:.2f} < {self.MIN_CONF_THRESH})"
+                )
+                action     = "HOLD"
+                action_idx = 0
 
             self._pending[trade["id"]] = (state, action_idx, current_price)
-            return ACTIONS[action_idx]
+            log.info(
+                f"RL {trade.get('symbol','?')}: {action} conf={confidence:.2f} "
+                f"eps={self.epsilon:.3f} buf={len(self.buffer)}"
+            )
+            return action, confidence
 
         except Exception as e:
             log.error(f"RL decide error: {e}")
-            return "HOLD"
+            return "HOLD", 0.0
 
     # ── Learning ─────────────────────────────────────────────────────────────
 

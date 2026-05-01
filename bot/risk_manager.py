@@ -12,9 +12,10 @@ import pandas as pd
 import logging
 import json
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import List, Tuple, Optional
 from env_config import DATA_DIR
+from technical_indicators import calc_adx
 
 log  = logging.getLogger("RiskManager")
 DATA = DATA_DIR
@@ -26,7 +27,7 @@ class RegimeDetector:
             close     = df["close"]
             high      = df["high"]
             low       = df["low"]
-            adx       = self._calc_adx(high, low, close)
+            adx       = calc_adx(high, low, close)
             ret       = close.pct_change()
             vol_ratio = float(ret.rolling(5).std().iloc[-1] / (ret.rolling(20).std().iloc[-1] + 1e-9))
             adx_val   = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 25
@@ -42,21 +43,6 @@ class RegimeDetector:
                 return {"regime": "RANGING",  "adx": round(adx_val,1), "vol_ratio": round(vol_ratio,2), "size_mult": 0.8}
         except Exception:
             return {"regime": "UNKNOWN", "size_mult": 0.8}
-
-    def _calc_adx(self, high, low, close, period=14):
-        try:
-            up       = high.diff()
-            down     = -low.diff()
-            plus_dm  = up.where((up > down) & (up > 0), 0)
-            minus_dm = down.where((down > up) & (down > 0), 0)
-            tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-            atr      = tr.ewm(span=period).mean()
-            plus_di  = 100 * plus_dm.ewm(span=period).mean() / (atr + 1e-9)
-            minus_di = 100 * minus_dm.ewm(span=period).mean() / (atr + 1e-9)
-            dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
-            return dx.ewm(span=period).mean()
-        except Exception:
-            return pd.Series([25]*len(close), index=close.index)
 
 
 class CorrelationFilter:
@@ -90,7 +76,7 @@ class MarketRegimeGate:
         self._cache_time = None
 
     def detect(self, feed, watchlist: list) -> dict:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if (self._cache and self._cache_time and
                 (now - self._cache_time).total_seconds() < self.CACHE_SECS):
             return self._cache

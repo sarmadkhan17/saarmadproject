@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 import sys
@@ -78,7 +78,7 @@ def stats():
     result["last_sync"]      = fut_stats.get("last_sync", "never")
 
     # Today PnL
-    today  = datetime.utcnow().strftime("%Y-%m-%d")
+    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     trades_list = d["combined_trades"]
     today_trades = [t for t in trades_list
                     if t.get("status") == "closed"
@@ -178,7 +178,9 @@ def health():
     is_active = False
     if last:
         last_dt   = datetime.fromisoformat(last)
-        is_active = (datetime.utcnow() - last_dt) < timedelta(minutes=5)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        is_active = (datetime.now(timezone.utc) - last_dt) < timedelta(minutes=5)
     return jsonify({"status": "active" if is_active else "idle", "last_signal": last})
 
 
@@ -200,19 +202,30 @@ def model_health():
         "rf":   ("rf_model.pkl",    "rf_meta.json"),
         "lgbm": ("lgbm_model.pkl",  "lgbm_meta.json"),
         "lstm": ("lstm_model.keras","lstm_meta.json"),
+        "tft":  ("tft_model.pt",    "tft_meta.json"),
     }
     result = {}
     for name, (mf, meta_f) in models.items():
-        meta = {}
-        if (DATA / meta_f).exists():
-            with open(DATA / meta_f) as f:
-                meta = json.load(f)
+        best_meta = {}
+        loaded = False
+        # Check both spot and futures subdirectories, plus root for legacy
+        for subdir in ["spot", "futures", ""]:
+            base = DATA / subdir if subdir else DATA
+            mpath = base / mf
+            if mpath.exists():
+                loaded = True
+                meta_p = base / meta_f
+                if meta_p.exists():
+                    with open(meta_p) as f:
+                        m = json.load(f)
+                    if m.get("accuracy", 0) > best_meta.get("accuracy", 0):
+                        best_meta = m
         result[name] = {
-            "loaded":      (DATA / mf).exists(),
-            "accuracy":    meta.get("accuracy", 0),
-            "wf_accuracy": meta.get("wf_accuracy", 0),
-            "trained_at":  meta.get("trained_at", "never"),
-            "epochs":      meta.get("epochs", 0),
+            "loaded":      loaded,
+            "accuracy":    best_meta.get("accuracy", 0),
+            "wf_accuracy": best_meta.get("wf_accuracy", 0),
+            "trained_at":  best_meta.get("trained_at", "never"),
+            "epochs":      best_meta.get("epochs", 0),
         }
     return jsonify(result)
 
@@ -249,6 +262,7 @@ def scanner():
     return jsonify({"top_coins": [], "last_scan": None})
 
 
+
 @app.route("/api/detailed_health")
 def detailed_health():
     d       = load_combined()
@@ -259,7 +273,9 @@ def detailed_health():
     if signals:
         signals.sort(key=lambda x: x.get("timestamp",""))
         last    = datetime.fromisoformat(signals[-1]["timestamp"])
-        sig_age = int((datetime.utcnow() - last).total_seconds())
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        sig_age = int((datetime.now(timezone.utc) - last).total_seconds())
 
     result = subprocess.run(["ps","aux"], capture_output=True, text=True)
     lines  = result.stdout.split("\n")
@@ -271,10 +287,17 @@ def detailed_health():
     closed = len([t for t in trades if t.get("status")=="closed"])
     pnl    = sum(t.get("pnl",0) for t in trades if t.get("status")=="closed")
 
+    def _model_exists(name):
+        for subdir in ["spot", "futures", ""]:
+            base = DATA / subdir if subdir else DATA
+            if (base / name).exists():
+                return True
+        return False
+
     models_ok = all([
-        (DATA / "rf_model.pkl").exists(),
-        (DATA / "lgbm_model.pkl").exists(),
-        (DATA / "lstm_model.keras").exists(),
+        _model_exists("rf_model.pkl"),
+        _model_exists("lgbm_model.pkl"),
+        _model_exists("lstm_model.keras"),
     ])
 
     reviews = 0
@@ -297,9 +320,9 @@ def detailed_health():
         "bot_running":    len(bots) >= 1,
         "bot_instances":  len(bots),
         "dash_running":   len(dashes) >= 1,
-        "rf_model":       (DATA / "rf_model.pkl").exists(),
-        "xgb_model":      (DATA / "lgbm_model.pkl").exists(),
-        "lstm_model":     (DATA / "lstm_model.keras").exists(),
+        "rf_model":       _model_exists("rf_model.pkl"),
+        "xgb_model":      _model_exists("lgbm_model.pkl"),
+        "lstm_model":     _model_exists("lstm_model.keras"),
         "models_ok":      models_ok,
         "signal_age":     sig_age,
         "open_trades":    open_t,
@@ -341,16 +364,18 @@ def set_htf_mode():
 @app.route("/api/stop_trading", methods=["POST"])
 def stop_trading():
     p = DATA / "trading_paused.json"
+    p.parent.mkdir(exist_ok=True)
     with open(p, "w") as f:
-        json.dump({"paused": True, "timestamp": datetime.utcnow().isoformat()}, f)
+        json.dump({"paused": True, "timestamp": datetime.now(timezone.utc).isoformat()}, f)
     return jsonify({"status": "paused"})
 
 
 @app.route("/api/start_trading", methods=["POST"])
 def start_trading():
     p = DATA / "trading_paused.json"
+    p.parent.mkdir(exist_ok=True)
     with open(p, "w") as f:
-        json.dump({"paused": False, "timestamp": datetime.utcnow().isoformat()}, f)
+        json.dump({"paused": False, "timestamp": datetime.now(timezone.utc).isoformat()}, f)
     return jsonify({"status": "running"})
 
 

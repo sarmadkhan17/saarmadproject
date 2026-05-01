@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import joblib
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.utils.class_weight import compute_class_weight
@@ -119,12 +119,19 @@ class TFTStrategy:
     MIN_ACCURACY = 0.40
 
     def __init__(self, data_dir: Path = None):
+        import os
         from env_config import DATA_DIR
-        DATA = data_dir or DATA_DIR
+        if data_dir is not None:
+            DATA = data_dir
+        else:
+            mode = os.environ.get("BOT_MODE", "spot")
+            DATA = DATA_DIR / mode
+            DATA.mkdir(exist_ok=True)
 
         self.model_path  = DATA / "tft_model.pt"
         self.scaler_path = DATA / "tft_scaler.pkl"
         self.meta_path   = DATA / "tft_meta.json"
+        self._data_dir   = DATA
         self.model       = None
         self.scaler      = MinMaxScaler()
         self.n_features  = None
@@ -262,7 +269,7 @@ class TFTStrategy:
             self.metadata   = {
                 "accuracy":      round(float(test_acc), 4),
                 "test_accuracy": round(float(test_acc), 4),
-                "trained_at":    datetime.utcnow().isoformat(),
+                "trained_at":    datetime.now(timezone.utc).isoformat(),
                 "n_features":    self.n_features,
             }
             with open(self.meta_path, "w") as f:

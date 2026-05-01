@@ -12,7 +12,8 @@ import threading
 import time
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import yaml
 from env_config import get_telegram_config, DATA_DIR
 
@@ -58,13 +59,13 @@ class TelegramNotifier:
             return False
 
     def send_alert(self, message):
-        now = datetime.utcnow().strftime("%H:%M UTC")
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
         self.send(f"<b>ALERT {now}</b>\n{message}")
 
     def should_send(self):
         if self.last_sent is None:
             return True
-        return (datetime.utcnow() - self.last_sent).total_seconds() >= self.interval * 60
+        return (datetime.now(timezone.utc) - self.last_sent).total_seconds() >= self.interval * 60
 
     def send_report(self, exchange):
         if not self.should_send():
@@ -73,7 +74,7 @@ class TelegramNotifier:
         try:
             msg = self._build_report(exchange)
             if self.send(msg):
-                self.last_sent = datetime.utcnow()
+                self.last_sent = datetime.now(timezone.utc)
         except Exception as e:
             log.error(f"Report error: {e}")
 
@@ -105,25 +106,36 @@ class TelegramNotifier:
         if signals:
             signals.sort(key=lambda x: x.get("timestamp", ""))
             last    = datetime.fromisoformat(signals[-1]["timestamp"])
-            sig_age = f"{int((datetime.utcnow()-last).total_seconds())}s ago"
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            sig_age = f"{int((datetime.now(timezone.utc)-last).total_seconds())}s ago"
 
+        # Batch fetch all tickers in one call instead of one per position
         total_live = 0.0
         lines      = []
-        for t in open_t:
+        if open_t:
             try:
-                price = exchange.fetch_ticker(t["symbol"])["last"]
-                pnl   = (price - t["price"]) * t["amount"]
-                pct   = (price - t["price"]) / t["price"] * 100
-                total_live += pnl
-                mode  = t.get("mode", "spot").upper()
-                icon  = "📈" if pnl > 0 else "📉"
-                lines.append(f"  {icon} [{mode}] {t['symbol']:10} {pct:+.2f}% (${pnl:+.2f})")
+                symbols = list({t["symbol"] for t in open_t})
+                tickers = exchange.fetch_tickers(symbols)
             except Exception:
-                pass
+                tickers = {}
+
+            for t in open_t:
+                try:
+                    ticker = tickers.get(t["symbol"], {})
+                    price  = ticker.get("last", t["price"])
+                    pnl    = (price - t["price"]) * t["amount"]
+                    pct    = (price - t["price"]) / t["price"] * 100
+                    total_live += pnl
+                    mode  = t.get("mode", "spot").upper()
+                    icon  = "📈" if pnl > 0 else "📉"
+                    lines.append(f"  {icon} [{mode}] {t['symbol']:10} {pct:+.2f}% (${pnl:+.2f})")
+                except Exception:
+                    pass
 
         total = stats["wins"] + stats["losses"]
         wr    = f"{stats['wins']/total*100:.1f}%" if total else "N/A"
-        now   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         msg = (
             f"<b>🤖 CryptoBot v3 Report</b>\n<b>{now}</b>\n\n"
@@ -139,21 +151,25 @@ class TelegramNotifier:
         return msg
 
     def _poll_commands(self):
-        """Poll for commands. Works in both private and group chats."""
+        """Long-poll for commands. Works in both private and group chats."""
         while True:
             try:
                 url  = f"https://api.telegram.org/bot{self.token}/getUpdates"
                 resp = requests.get(
                     url,
-                    params={"offset": self.offset, "timeout": 10},
-                    timeout=15,
+                    params={"offset": self.offset, "timeout": 15},
+                    timeout=20,
                 )
                 if resp.status_code != 200:
-                    time.sleep(5)
+                    time.sleep(2)
                     continue
 
-                for update in resp.json().get("result", []):
-                    self.offset = update["update_id"] + 1
+                updates = resp.json().get("result", [])
+                max_offset = self.offset
+                for update in updates:
+                    update_id = update["update_id"]
+                    if update_id >= max_offset:
+                        max_offset = update_id + 1
                     msg  = update.get("message", {})
                     text = msg.get("text", "").strip().lower()
                     chat = str(msg.get("chat", {}).get("id", ""))
@@ -183,9 +199,11 @@ class TelegramNotifier:
                             "/stop":            self._cmd_stop,
                             "/mode":            self._cmd_current_mode,
                         }.get(text, lambda: None)()
+
+                self.offset = max_offset
             except Exception as e:
                 log.error(f"Command poll error: {e}")
-            time.sleep(3)
+                time.sleep(2)
 
     def _cmd_help(self):
         self.send(
@@ -257,7 +275,9 @@ class TelegramNotifier:
             if signals:
                 signals.sort(key=lambda x: x.get("timestamp", ""))
                 last      = datetime.fromisoformat(signals[-1]["timestamp"])
-                age_sec   = int((datetime.utcnow() - last).total_seconds())
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                age_sec   = int((datetime.now(timezone.utc) - last).total_seconds())
                 is_active = age_sec < 120
                 age_str   = f"{age_sec}s ago"
             else:
@@ -396,7 +416,10 @@ class TelegramNotifier:
             _, signals, _ = self._load_combined()
             if signals:
                 signals.sort(key=lambda x: x.get("timestamp", ""))
-                age = int((datetime.utcnow() - datetime.fromisoformat(signals[-1]["timestamp"])).total_seconds())
+                sig_ts = datetime.fromisoformat(signals[-1]["timestamp"])
+                if sig_ts.tzinfo is None:
+                    sig_ts = sig_ts.replace(tzinfo=timezone.utc)
+                age = int((datetime.now(timezone.utc) - sig_ts).total_seconds())
                 msg += f"\n{'✅' if age<120 else '⚠️'} Signal age: {age}s\n"
 
             p = DATA / "token_budget.json"
@@ -465,9 +488,9 @@ class TelegramNotifier:
         self.send("🔄 <b>Switching to SPOT mode...</b>\nThis will take ~30 seconds")
         try:
             home = str(Path.home())
-            # Stop futures bot
+            # Stop futures bot — kill specific screen session to avoid affecting spot
+            subprocess.run(["screen", "-S", "cryptobot_v3_futures", "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", "futures_bot.py"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
@@ -491,9 +514,9 @@ class TelegramNotifier:
         self.send("🔄 <b>Switching to FUTURES mode...</b>\nThis will take ~30 seconds")
         try:
             home = str(Path.home())
-            # Stop spot bot
+            # Stop spot bot — kill specific screen session to avoid affecting futures
+            subprocess.run(["screen", "-S", "cryptobot_v3_spot", "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", "spot_bot.py"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
@@ -517,12 +540,13 @@ class TelegramNotifier:
         self.send(f"🔄 <b>Restarting {current.upper()} bot...</b>")
         try:
             home = str(Path.home())
+            screen_name = f"cryptobot_v3_{current}"
+            # Kill specific screen session only
+            subprocess.run(["screen", "-S", screen_name, "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
-            screen_name = f"cryptobot_v3_{current}"
             subprocess.Popen([
                 "screen", "-dmS", screen_name,
                 "bash", "-c",
@@ -541,9 +565,10 @@ class TelegramNotifier:
 
         self.send(f"⏹ <b>Stopping {current.upper()} bot...</b>\nWill close after this message")
         try:
+            screen_name = f"cryptobot_v3_{current}"
             time.sleep(1)
+            subprocess.run(["screen", "-S", screen_name, "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
             time.sleep(2)
             subprocess.run(["screen", "-wipe"], timeout=5)
         except Exception as e:

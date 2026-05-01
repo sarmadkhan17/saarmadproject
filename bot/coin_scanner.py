@@ -8,7 +8,8 @@ import pandas as pd
 import logging
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from env_config import DATA_DIR
 
 log  = logging.getLogger("Scanner")
@@ -48,6 +49,8 @@ class CoinScanner:
             last = d.get("last_scan")
             if last:
                 self.last_scan = datetime.fromisoformat(last)
+                if self.last_scan.tzinfo is None:
+                    self.last_scan = self.last_scan.replace(tzinfo=timezone.utc)
             if self.top_coins:
                 log.info(f"Cached coins: {self.top_coins}")
 
@@ -60,7 +63,7 @@ class CoinScanner:
     def needs_scan(self):
         if not self.top_coins or not self.last_scan:
             return True
-        return (datetime.utcnow() - self.last_scan).total_seconds() >= self.rescan_h * 3600
+        return (datetime.now(timezone.utc) - self.last_scan).total_seconds() >= self.rescan_h * 3600
 
     def is_fake_volume(self, ticker, df):
         """
@@ -181,7 +184,9 @@ class CoinScanner:
 
         scores = {}
         fake_vol_count = 0
-        for sym, ticker in top50:
+
+        def fetch_and_score(sym_ticker):
+            sym, ticker = sym_ticker
             try:
                 ohlcv = exchange.fetch_ohlcv(sym, "1h", limit=60)
                 df    = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
@@ -190,7 +195,13 @@ class CoinScanner:
             except Exception:
                 df = None
             sc = self.score(ticker, df)
-            if sc < 0:
+            return sym, sc, sc < 0
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(fetch_and_score, top50))
+
+        for sym, sc, is_fake in results:
+            if is_fake:
                 fake_vol_count += 1
                 log.info(f"Fake volume detected: {sym} — excluded")
                 continue
@@ -217,7 +228,7 @@ class CoinScanner:
                 final_coins.append(sym)
 
         self.top_coins = final_coins[:self.top_n]
-        self.last_scan = datetime.utcnow()
+        self.last_scan = datetime.now(timezone.utc)
         self._save()
 
         log.info("Top coins selected:")

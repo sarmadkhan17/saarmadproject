@@ -9,7 +9,8 @@ import json
 import logging
 import numpy as np
 import joblib
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
 from typing import Tuple, Dict, Optional
 from pathlib import Path
 
@@ -71,6 +72,7 @@ class HMMRegimeModel:
         self.metadata: Dict               = {}
         self._last_regime: str            = "RANGING"
         self._last_infer_time: float      = 0.0
+        self._regime_history: deque       = deque(maxlen=3)  # Step 5: smoothing
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -170,7 +172,7 @@ class HMMRegimeModel:
             self.metadata  = {
                 "n_samples":  len(X),
                 "state_map":  self.state_map,
-                "trained_at": datetime.utcnow().isoformat(),
+                "trained_at": datetime.now(timezone.utc).isoformat(),
             }
             self._save()
             log.info(f"HMM trained! States={self.state_map} n={len(X)}")
@@ -200,11 +202,21 @@ class HMMRegimeModel:
             X_window      = X[-100:]
             states        = self.model.predict(X_window)
             current_state = int(states[-1])
-            regime        = self.state_map.get(current_state, "RANGING")
-            self._last_regime     = regime
+            raw_regime    = self.state_map.get(current_state, "RANGING")
+
+            # Step 5: smoothing — only switch regime after 3 consecutive identical predictions
+            self._regime_history.append(raw_regime)
+            if len(self._regime_history) == 3 and len(set(self._regime_history)) == 1:
+                self._last_regime = raw_regime
+                log.debug(f"HMM regime confirmed: {raw_regime} (3× consecutive)")
+            else:
+                log.debug(
+                    f"HMM raw={raw_regime} (smoothing: {list(self._regime_history)}) "
+                    f"→ holding {self._last_regime}"
+                )
+
             self._last_infer_time = now
-            log.debug(f"HMM regime: {regime} (state={current_state})")
-            return regime
+            return self._last_regime
         except Exception as e:
             log.warning(f"HMM predict error: {e}")
             return self._last_regime
