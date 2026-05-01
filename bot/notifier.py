@@ -1,0 +1,559 @@
+"""
+Telegram Notifier v3
+- Supports both personal and group chats (negative chat IDs for groups)
+- Combined SPOT + FUTURES reporting
+- Commands: /status /agents /pnl /trades /health /help
+"""
+
+import requests
+import logging
+import json
+import threading
+import time
+import subprocess
+from pathlib import Path
+from datetime import datetime
+import yaml
+from env_config import get_telegram_config, DATA_DIR
+
+log      = logging.getLogger("Notifier")
+DATA     = DATA_DIR
+BOT_ROOT = Path.home() / "cryptobot_v3"
+CFG_SPOT = BOT_ROOT / "config_spot.yaml"
+CFG_FUT  = BOT_ROOT / "config_futures.yaml"
+HTF_MODES = ("strict", "soft", "hard")
+
+
+class TelegramNotifier:
+    def __init__(self):
+        cfg            = get_telegram_config()
+        self.token     = cfg.get("token", "")
+        self.chat_id   = cfg.get("chat_id", "")  # Can be group (-100...) or user (positive)
+        self.last_sent = None
+        self.interval  = 30  # minutes
+        self.exchange  = None
+        self.offset    = 0
+
+        chat_type = "GROUP" if str(self.chat_id).startswith("-") else "PRIVATE"
+        log.info(f"Telegram chat type: {chat_type} | ID: {self.chat_id}")
+
+        if self.token:
+            t = threading.Thread(target=self._poll_commands, daemon=True)
+            t.start()
+            log.info("Telegram command listener started")
+
+    def send(self, message):
+        if not self.token or not self.chat_id:
+            return False
+        try:
+            url  = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            resp = requests.post(url, json={
+                "chat_id":    self.chat_id,
+                "text":       message,
+                "parse_mode": "HTML",
+            }, timeout=10)
+            return resp.status_code == 200
+        except Exception as e:
+            log.error(f"Telegram error: {e}")
+            return False
+
+    def send_alert(self, message):
+        now = datetime.utcnow().strftime("%H:%M UTC")
+        self.send(f"<b>ALERT {now}</b>\n{message}")
+
+    def should_send(self):
+        if self.last_sent is None:
+            return True
+        return (datetime.utcnow() - self.last_sent).total_seconds() >= self.interval * 60
+
+    def send_report(self, exchange):
+        if not self.should_send():
+            return
+        self.exchange = exchange
+        try:
+            msg = self._build_report(exchange)
+            if self.send(msg):
+                self.last_sent = datetime.utcnow()
+        except Exception as e:
+            log.error(f"Report error: {e}")
+
+    def _load_combined(self):
+        """Combine spot + futures state for unified reporting."""
+        trades  = []
+        signals = []
+        stats   = {"wins": 0, "losses": 0, "total_pnl": 0.0, "total_trades": 0}
+        for fname in ["state.json", "futures_state.json"]:
+            p = DATA / fname
+            if p.exists():
+                with open(p) as f:
+                    d = json.load(f)
+                trades.extend(d.get("trades", []))
+                signals.extend(d.get("signals", []))
+                s = d.get("stats", {})
+                stats["wins"]         += s.get("wins", 0)
+                stats["losses"]       += s.get("losses", 0)
+                stats["total_pnl"]    += s.get("total_pnl", 0.0)
+                stats["total_trades"] += s.get("total_trades", 0)
+        return trades, signals, stats
+
+    def _build_report(self, exchange):
+        trades, signals, stats = self._load_combined()
+        open_t = [t for t in trades if t["status"] == "open"]
+        closed = [t for t in trades if t["status"] == "closed"]
+
+        sig_age = "N/A"
+        if signals:
+            signals.sort(key=lambda x: x.get("timestamp", ""))
+            last    = datetime.fromisoformat(signals[-1]["timestamp"])
+            sig_age = f"{int((datetime.utcnow()-last).total_seconds())}s ago"
+
+        total_live = 0.0
+        lines      = []
+        for t in open_t:
+            try:
+                price = exchange.fetch_ticker(t["symbol"])["last"]
+                pnl   = (price - t["price"]) * t["amount"]
+                pct   = (price - t["price"]) / t["price"] * 100
+                total_live += pnl
+                mode  = t.get("mode", "spot").upper()
+                icon  = "📈" if pnl > 0 else "📉"
+                lines.append(f"  {icon} [{mode}] {t['symbol']:10} {pct:+.2f}% (${pnl:+.2f})")
+            except Exception:
+                pass
+
+        total = stats["wins"] + stats["losses"]
+        wr    = f"{stats['wins']/total*100:.1f}%" if total else "N/A"
+        now   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+        msg = (
+            f"<b>🤖 CryptoBot v3 Report</b>\n<b>{now}</b>\n\n"
+            f"<b>STATUS</b>\n"
+            f"  Signal: {sig_age} | Open: {len(open_t)} | Closed: {len(closed)}\n\n"
+            f"<b>PERFORMANCE</b>\n"
+            f"  WR: {wr} ({stats['wins']}W/{stats['losses']}L)\n"
+            f"  Closed PnL: ${stats['total_pnl']:+.4f}\n"
+            f"<b>Live PnL: ${total_live:+.2f} USDT</b>\n"
+        )
+        if lines:
+            msg += "\n<b>POSITIONS</b>\n" + "\n".join(lines)
+        return msg
+
+    def _poll_commands(self):
+        """Poll for commands. Works in both private and group chats."""
+        while True:
+            try:
+                url  = f"https://api.telegram.org/bot{self.token}/getUpdates"
+                resp = requests.get(
+                    url,
+                    params={"offset": self.offset, "timeout": 10},
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    time.sleep(5)
+                    continue
+
+                for update in resp.json().get("result", []):
+                    self.offset = update["update_id"] + 1
+                    msg  = update.get("message", {})
+                    text = msg.get("text", "").strip().lower()
+                    chat = str(msg.get("chat", {}).get("id", ""))
+
+                    # Only respond to authorized chat (group or private)
+                    if chat != self.chat_id:
+                        continue
+
+                    # Strip bot mention from group commands (e.g., /status@MyBot)
+                    if "@" in text:
+                        text = text.split("@")[0]
+
+                    if text.startswith("/htf"):
+                        self._cmd_htf(text)
+                    else:
+                        {
+                            "/help":            self._cmd_help,
+                            "/start":           self._cmd_status,
+                            "/status":          self._cmd_status,
+                            "/agents":          self._cmd_agents,
+                            "/pnl":             self._cmd_pnl,
+                            "/trades":          self._cmd_trades,
+                            "/health":          self._cmd_health,
+                            "/switch_spot":     self._cmd_switch_spot,
+                            "/switch_futures":  self._cmd_switch_futures,
+                            "/restart":         self._cmd_restart,
+                            "/stop":            self._cmd_stop,
+                            "/mode":            self._cmd_current_mode,
+                        }.get(text, lambda: None)()
+            except Exception as e:
+                log.error(f"Command poll error: {e}")
+            time.sleep(3)
+
+    def _cmd_help(self):
+        self.send(
+            "<b>🤖 CryptoBot v3 Commands</b>\n\n"
+            "<b>📊 Monitoring:</b>\n"
+            "/status  — Bot status check\n"
+            "/mode    — Show current mode\n"
+            "/agents  — Agent performance + tokens\n"
+            "/pnl     — Current PnL (spot + futures)\n"
+            "/trades  — Open positions\n"
+            "/health  — Full system health\n\n"
+            "<b>⚙️ Control:</b>\n"
+            "/switch_spot     — Switch to SPOT mode\n"
+            "/switch_futures  — Switch to FUTURES mode\n"
+            "/restart         — Restart current bot\n"
+            "/stop            — Stop bot\n"
+            "/htf             — Show HTF filter mode\n"
+            "/htf strict      — Force HOLD on HTF conflict\n"
+            "/htf soft        — Reduce conf by 30% on conflict\n"
+            "/htf hard        — Block unless conf >= 0.65\n"
+        )
+
+    def _cmd_htf(self, text: str):
+        parts = text.strip().split()
+        if len(parts) == 1:
+            mode = "strict"
+            if CFG_SPOT.exists():
+                with open(CFG_SPOT) as f:
+                    cfg = yaml.safe_load(f)
+                mode = cfg.get("strategy", {}).get("htf_filter_mode", "strict")
+            desc = {
+                "strict": "Force HOLD when HTF opposes signal",
+                "soft":   "Keep signal, cut confidence by 30%",
+                "hard":   "Block unless conf >= 0.65",
+            }
+            self.send(
+                f"<b>HTF Filter Mode</b>\n\n"
+                f"Current: <b>{mode.upper()}</b>\n"
+                f"{desc.get(mode,'')}\n\n"
+                f"Change with:\n"
+                f"/htf strict | /htf soft | /htf hard"
+            )
+            return
+
+        mode = parts[1].lower()
+        if mode not in HTF_MODES:
+            self.send(f"Unknown mode <b>{mode}</b>. Use: strict | soft | hard")
+            return
+
+        updated = []
+        for cfg_path in (CFG_SPOT, CFG_FUT):
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f)
+                cfg.setdefault("strategy", {})["htf_filter_mode"] = mode
+                with open(cfg_path, "w") as f:
+                    yaml.dump(cfg, f, default_flow_style=False, sort_keys=True)
+                updated.append(cfg_path.name)
+
+        self.send(
+            f"✅ <b>HTF filter set to {mode.upper()}</b>\n"
+            f"Updated: {', '.join(updated)}\n"
+            f"Takes effect on next scan cycle."
+        )
+
+    def _cmd_status(self):
+        try:
+            _, signals, _ = self._load_combined()
+            if signals:
+                signals.sort(key=lambda x: x.get("timestamp", ""))
+                last      = datetime.fromisoformat(signals[-1]["timestamp"])
+                age_sec   = int((datetime.utcnow() - last).total_seconds())
+                is_active = age_sec < 120
+                age_str   = f"{age_sec}s ago"
+            else:
+                is_active = False
+                age_str   = "never"
+
+            icon   = "✅" if is_active else "⚠️"
+            status = "ACTIVE" if is_active else "IDLE"
+
+            token_info = ""
+            p = DATA / "token_budget.json"
+            if p.exists():
+                with open(p) as f:
+                    tb = json.load(f)
+                pct = round(tb.get("used_today", 0) / tb.get("limit", 90000) * 100, 1)
+                token_info = f"\n  Groq: {pct}% used"
+
+            coins = []
+            p2 = DATA / "scanner_cache.json"
+            if p2.exists():
+                with open(p2) as f:
+                    coins = json.load(f).get("top_coins", [])
+
+            self.send(
+                f"{icon} <b>Bot: {status}</b>\n\n"
+                f"  Last signal: {age_str}\n"
+                f"  Watching: {len(coins)} coins{token_info}\n"
+                f"  Top: {', '.join([c.replace('/USDT','') for c in coins[:5]])}"
+            )
+        except Exception as e:
+            self.send(f"Status error: {e}")
+
+    def _cmd_agents(self):
+        try:
+            p   = DATA / "agent_performance.json"
+            msg = "<b>🎯 Agent Performance</b>\n\n"
+            if p.exists():
+                with open(p) as f:
+                    data = json.load(f)
+                for agent, stats in data.items():
+                    total = stats.get("total", 0)
+                    if total == 0:
+                        continue
+                    acc  = round(stats["correct"] / total * 100, 1)
+                    icon = "✅" if acc >= 55 else "⚠️" if acc >= 45 else "❌"
+                    msg += f"{icon} {agent:12} {acc}% ({stats['correct']}/{total})\n"
+            else:
+                msg += "No data yet.\n"
+
+            p2 = DATA / "token_budget.json"
+            if p2.exists():
+                with open(p2) as f:
+                    tb = json.load(f)
+                used  = tb.get("used_today", 0)
+                limit = tb.get("limit", 90000)
+                msg  += f"\n<b>Groq Tokens</b>\n"
+                msg  += f"  {used:,}/{limit:,} ({round(used/limit*100,1)}%)"
+            self.send(msg)
+        except Exception as e:
+            self.send(f"Agents error: {e}")
+
+    def _cmd_pnl(self):
+        try:
+            trades, _, stats = self._load_combined()
+            open_t = [t for t in trades if t["status"] == "open"]
+            total  = stats["wins"] + stats["losses"]
+            wr     = f"{stats['wins']/total*100:.1f}%" if total else "N/A"
+
+            # Today stats
+            today_pnl, today_wins, today_loss, today_total = self._calc_today_pnl(trades)
+            today_icon = "📈" if today_pnl >= 0 else "📉"
+
+            msg = (
+                f"<b>💰 PnL Report</b>\n\n"
+                f"<b>TODAY</b>\n"
+                f"  {today_icon} PnL: ${today_pnl:+.4f} USDT\n"
+                f"  Trades: {today_total} ({today_wins}W/{today_loss}L)\n\n"
+                f"<b>ALL TIME</b>\n"
+                f"  Total PnL: ${stats['total_pnl']:+.4f} USDT\n"
+                f"  Win Rate:  {wr} ({stats['wins']}W/{stats['losses']}L)\n"
+                f"  Open:      {len(open_t)} trades\n"
+            )
+            if self.exchange and open_t:
+                live = 0.0
+                for t in open_t:
+                    try:
+                        price = self.exchange.fetch_ticker(t["symbol"])["last"]
+                        entry = float(t["price"])
+                        amt   = float(t["amount"])
+                        if t.get("mode","spot") == "futures":
+                            side = t.get("side","long")
+                            pnl  = (price-entry)*amt if side=="long" else (entry-price)*amt
+                        else:
+                            pnl  = (price - entry) * amt
+                        live += pnl
+                        pct   = (price - entry) / entry * 100
+                        icon  = "📈" if pnl > 0 else "📉"
+                        mode  = t.get("mode","spot").upper()
+                        msg  += f"\n  {icon} [{mode}] {t['symbol']:10} {pct:+.2f}% ${pnl:+.4f}"
+                    except Exception:
+                        pass
+                msg += f"\n\n<b>Live PnL: ${live:+.4f} USDT</b>"
+            self.send(msg)
+        except Exception as e:
+            self.send(f"PnL error: {e}")
+
+    def _cmd_trades(self):
+        try:
+            trades, _, _ = self._load_combined()
+            open_t = [t for t in trades if t["status"] == "open"]
+            if not open_t:
+                self.send("📭 No open trades.")
+                return
+            msg = f"<b>📊 Open Positions ({len(open_t)})</b>\n\n"
+            for t in open_t:
+                mode = t.get("mode", "spot").upper()
+                lev  = f" {t.get('leverage',1)}x" if t.get("leverage", 1) > 1 else ""
+                msg += f"  [{mode}{lev}] {t['symbol']:10} {t.get('side','buy').upper()}\n"
+                msg += f"  Entry: ${t['price']:.4f} | Amount: {t['amount']:.5f}\n\n"
+            self.send(msg)
+        except Exception as e:
+            self.send(f"Trades error: {e}")
+
+    def _cmd_health(self):
+        try:
+            models = {
+                "RF":       "rf_model.pkl",
+                "LightGBM": "lgbm_model.pkl",
+                "LSTM":     "lstm_model.keras",
+            }
+            msg = "<b>🩺 System Health</b>\n\n<b>Models:</b>\n"
+            for name, fname in models.items():
+                ok   = (DATA / fname).exists()
+                msg += f"  {'✅' if ok else '❌'} {name}\n"
+
+            _, signals, _ = self._load_combined()
+            if signals:
+                signals.sort(key=lambda x: x.get("timestamp", ""))
+                age = int((datetime.utcnow() - datetime.fromisoformat(signals[-1]["timestamp"])).total_seconds())
+                msg += f"\n{'✅' if age<120 else '⚠️'} Signal age: {age}s\n"
+
+            p = DATA / "token_budget.json"
+            if p.exists():
+                with open(p) as f:
+                    tb = json.load(f)
+                pct = round(tb.get("used_today", 0) / tb.get("limit", 90000) * 100, 1)
+                msg += f"{'✅' if pct < 80 else '⚠️'} Groq: {pct}% used\n"
+
+            p2 = DATA / "learning_insights.json"
+            if p2.exists():
+                with open(p2) as f:
+                    ins = json.load(f)
+                msg += f"✅ Self-learning: {ins.get('total_reviews',0)} reviews\n"
+
+            self.send(msg)
+        except Exception as e:
+            self.send(f"Health error: {e}")
+
+    def _get_current_mode(self):
+        """Detect current bot mode from running processes."""
+        import os
+        # First check our own process environment (fastest path)
+        env_mode = os.environ.get("BOT_MODE", "").lower()
+        if env_mode in ("spot", "futures"):
+            return env_mode
+        # Fall back to scanning process environments via /proc
+        try:
+            for pid_entry in os.listdir("/proc"):
+                if not pid_entry.isdigit():
+                    continue
+                try:
+                    env_path = f"/proc/{pid_entry}/environ"
+                    with open(env_path, "rb") as f:
+                        env_data = f.read().decode("utf-8", errors="replace")
+                    if "launcher.py" in open(f"/proc/{pid_entry}/cmdline", "rb").read().decode("utf-8", errors="replace"):
+                        for var in env_data.split("\x00"):
+                            if var.startswith("BOT_MODE="):
+                                return var.split("=", 1)[1].lower()
+                except (PermissionError, FileNotFoundError):
+                    continue
+        except Exception:
+            pass
+        # Last resort: check screen session names
+        try:
+            result = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
+            if "cryptobot_v3_futures" in result.stdout:
+                return "futures"
+            if "cryptobot_v3_spot" in result.stdout:
+                return "spot"
+        except Exception:
+            pass
+        return "unknown"
+
+    def _cmd_current_mode(self):
+        mode = self._get_current_mode()
+        icons = {"spot": "🔵", "futures": "🟣", "unknown": "⚪"}
+        self.send(f"{icons.get(mode, '⚪')} <b>Current Mode: {mode.upper()}</b>")
+
+    def _cmd_switch_spot(self):
+        current = self._get_current_mode()
+        if current == "spot":
+            self.send("ℹ️ Already running in SPOT mode")
+            return
+
+        self.send("🔄 <b>Switching to SPOT mode...</b>\nThis will take ~30 seconds")
+        try:
+            home = str(Path.home())
+            # Stop futures bot
+            subprocess.run(["pkill", "-9", "-f", "futures_bot.py"], timeout=10)
+            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
+            time.sleep(3)
+            subprocess.run(["screen", "-wipe"], timeout=5)
+            time.sleep(2)
+            # Start spot bot
+            subprocess.Popen([
+                "screen", "-dmS", "cryptobot_v3_spot",
+                "bash", "-c",
+                f"cd {home}/cryptobot_v3/bot && BOT_MODE=spot python3 launcher.py"
+            ])
+            time.sleep(3)
+            self.send("✅ <b>Switched to SPOT mode!</b>\nUse /status to verify")
+        except Exception as e:
+            self.send(f"❌ Switch failed: {e}")
+
+    def _cmd_switch_futures(self):
+        current = self._get_current_mode()
+        if current == "futures":
+            self.send("ℹ️ Already running in FUTURES mode")
+            return
+
+        self.send("🔄 <b>Switching to FUTURES mode...</b>\nThis will take ~30 seconds")
+        try:
+            home = str(Path.home())
+            # Stop spot bot
+            subprocess.run(["pkill", "-9", "-f", "spot_bot.py"], timeout=10)
+            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
+            time.sleep(3)
+            subprocess.run(["screen", "-wipe"], timeout=5)
+            time.sleep(2)
+            # Start futures bot
+            subprocess.Popen([
+                "screen", "-dmS", "cryptobot_v3_futures",
+                "bash", "-c",
+                f"cd {home}/cryptobot_v3/bot && BOT_MODE=futures python3 launcher.py"
+            ])
+            time.sleep(3)
+            self.send("✅ <b>Switched to FUTURES mode!</b>\nUse /status to verify")
+        except Exception as e:
+            self.send(f"❌ Switch failed: {e}")
+
+    def _cmd_restart(self):
+        current = self._get_current_mode()
+        if current == "unknown":
+            self.send("⚠️ No bot is running. Use /switch_spot or /switch_futures")
+            return
+
+        self.send(f"🔄 <b>Restarting {current.upper()} bot...</b>")
+        try:
+            home = str(Path.home())
+            subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
+            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
+            time.sleep(3)
+            subprocess.run(["screen", "-wipe"], timeout=5)
+            time.sleep(2)
+            screen_name = f"cryptobot_v3_{current}"
+            subprocess.Popen([
+                "screen", "-dmS", screen_name,
+                "bash", "-c",
+                f"cd {home}/cryptobot_v3/bot && BOT_MODE={current} python3 launcher.py"
+            ])
+            time.sleep(3)
+            self.send(f"✅ <b>{current.upper()} bot restarted!</b>")
+        except Exception as e:
+            self.send(f"❌ Restart failed: {e}")
+
+    def _cmd_stop(self):
+        current = self._get_current_mode()
+        if current == "unknown":
+            self.send("ℹ️ Bot is not running")
+            return
+
+        self.send(f"⏹ <b>Stopping {current.upper()} bot...</b>\nWill close after this message")
+        try:
+            time.sleep(1)
+            subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
+            subprocess.run(["pkill", "-9", "-f", "launcher.py"], timeout=10)
+            time.sleep(2)
+            subprocess.run(["screen", "-wipe"], timeout=5)
+        except Exception as e:
+            log.error(f"Stop failed: {e}")
+
+    def send_error_alert(self, error_msg, context=""):
+        """Called by other modules to alert on errors."""
+        msg = f"🚨 <b>BOT ERROR</b> 🚨\n\n"
+        if context:
+            msg += f"<b>Context:</b> {context}\n"
+        msg += f"<b>Error:</b> {str(error_msg)[:200]}"
+        self.send(msg)
+

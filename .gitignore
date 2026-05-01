@@ -1,0 +1,6 @@
+.env
+data/
+logs/
+__pycache__/
+*.pkl
+*.keras

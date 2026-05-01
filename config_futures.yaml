@@ -1,0 +1,39 @@
+bot:
+  groq_cache_seconds: 1800
+  scan_interval_seconds: 30
+  slow_cache_seconds: 7200
+dashboard:
+  host: 0.0.0.0
+  port: 5002
+exchange:
+  margin_type: ISOLATED
+logging:
+  backup_count: 5
+  max_bytes: 10485760
+ml:
+  forward_bars: 2
+  min_move: 0.002
+  min_trades_to_learn: 10
+  retrain_hours: 24
+risk:
+  leverage: 5
+  max_consecutive_losses: 10
+  max_daily_loss_pct: 0.05
+  max_open_trades: 20
+  max_portfolio_heat: 0.6
+  max_position_pct: 0.03
+  stop_loss_atr_multiplier: 2.0
+  take_profit_pct: 0.02
+scanner:
+  blacklist:
+  - USDC/USDT
+  - BUSD/USDT
+  - TUSD/USDT
+  - FDUSD/USDT
+  min_volume_usdt: 50000000
+  rescan_hours: 4
+  top_n: 15
+strategy:
+  htf_filter_mode: soft
+  min_confidence: 0.42
+  min_votes: 2
