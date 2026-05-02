@@ -11,7 +11,7 @@ logging:
   backup_count: 5
   max_bytes: 10485760
 ml:
-  forward_bars: 2
+  forward_bars: 3
   min_move: 0.002
   min_trades_to_learn: 10
   retrain_hours: 24
@@ -23,6 +23,7 @@ risk:
   max_portfolio_heat: 0.6
   max_position_pct: 0.03
   stop_loss_atr_multiplier: 2.0
+  take_profit_atr_multiplier: 2.5
   take_profit_pct: 0.02
 scanner:
   blacklist:

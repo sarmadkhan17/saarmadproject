@@ -271,6 +271,78 @@ class BinanceDemoClient:
             "info":    data,
         }
 
+    def create_stop_market_order(self, symbol: str, side: str, amount: float, stop_price: float, params: dict = None) -> dict:
+        """Place STOP_MARKET order (exchange-side stop loss)."""
+        sym = self._normalize_symbol(symbol)
+        amount = self._round_amount(symbol, amount)
+
+        order_params = {
+            "symbol":      sym,
+            "side":        side.upper(),
+            "type":        "STOP_MARKET",
+            "quantity":    amount,
+            "stopPrice":   self._round_price(symbol, stop_price),
+            "workingType": "CONTRACT_PRICE",
+        }
+
+        if params:
+            if params.get("reduceOnly"):
+                order_params["reduceOnly"] = "true"
+            if params.get("closePosition"):
+                order_params["closePosition"] = "true"
+
+        path = "/order"
+        data = self._signed_post(path, order_params)
+
+        return {
+            "id":        str(data.get("orderId", "")),
+            "symbol":    symbol,
+            "side":      side,
+            "amount":    float(data.get("origQty", amount)),
+            "stopPrice": float(data.get("stopPrice", stop_price)),
+            "status":    data.get("status", "unknown").lower(),
+            "type":      "stop_market",
+            "info":      data,
+        }
+
+    def cancel_order(self, order_id: str, symbol: str) -> dict:
+        """Cancel an open order."""
+        sym = self._normalize_symbol(symbol)
+        data = self._signed_post("/order", {
+            "symbol":  sym,
+            "orderId": order_id,
+            "_method": "DELETE",
+        })
+
+        return {
+            "id":     str(data.get("orderId", "")),
+            "symbol": symbol,
+            "status": data.get("status", "cancelled").lower(),
+            "info":   data,
+        }
+
+    def fetch_open_orders(self, symbol: str = None) -> list:
+        """Get all open orders for a symbol or all symbols."""
+        params = {}
+        if symbol:
+            params["symbol"] = self._normalize_symbol(symbol)
+        data = self._signed_get("/openOrders", params)
+
+        return [
+            {
+                "id":      str(d.get("orderId", "")),
+                "symbol":  self._denormalize_symbol(d["symbol"]),
+                "side":    d.get("side", "").lower(),
+                "type":    d.get("type", "").lower(),
+                "amount":  float(d.get("origQty", 0)),
+                "price":   float(d.get("price", 0)),
+                "stopPrice": float(d.get("stopPrice", 0)),
+                "status":  d.get("status", "unknown").lower(),
+                "info":    d,
+            }
+            for d in data
+        ]
+
     def fetch_order(self, order_id: str, symbol: str) -> dict:
         """Get order status."""
         sym = self._normalize_symbol(symbol)
@@ -318,6 +390,24 @@ class BinanceDemoClient:
         except Exception as e:
             log.error(f"get_valid_symbols failed: {e}")
             return set()
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round price per symbol's PRICE_FILTER."""
+        sym = self._normalize_symbol(symbol)
+        try:
+            info = self._get_exchange_info()
+            for s in info.get("symbols", []):
+                if s["symbol"] == sym:
+                    for f in s["filters"]:
+                        if f["filterType"] == "PRICE_FILTER":
+                            tick = float(f["tickSize"])
+                            if tick > 0:
+                                precision = max(0, len(f"{tick:.10f}".rstrip("0").split(".")[-1]))
+                                rounded = round(price / tick) * tick
+                                return round(rounded, precision)
+        except Exception:
+            pass
+        return round(price, 2)
 
     def _round_amount(self, symbol: str, amount: float) -> float:
         """Round amount per symbol's LOT_SIZE filter."""
@@ -423,6 +513,15 @@ class DemoExchangeAdapter:
 
     def create_market_order(self, symbol, side, amount, params=None):
         return self.client.create_market_order(symbol, side, amount, params)
+
+    def create_stop_market_order(self, symbol, side, amount, stop_price, params=None):
+        return self.client.create_stop_market_order(symbol, side, amount, stop_price, params)
+
+    def cancel_order(self, order_id, symbol):
+        return self.client.cancel_order(order_id, symbol)
+
+    def fetch_open_orders(self, symbol=None):
+        return self.client.fetch_open_orders(symbol)
 
     def fetch_order(self, order_id, symbol):
         return self.client.fetch_order(order_id, symbol)

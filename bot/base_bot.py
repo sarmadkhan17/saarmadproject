@@ -82,6 +82,7 @@ class Trade:
     pnl: float = 0.0
     close_price: float = 0.0
     close_timestamp: str = ""
+    sl_order_id: str = ""
 
 
 class StateManager:
@@ -223,7 +224,6 @@ class BaseBot:
         self.max_open      = risk.get("max_open_trades", 8)
         self.min_conf      = self.config.get("strategy", {}).get("min_confidence", 0.52)
         self.htf_filter_mode = self.config.get("strategy", {}).get("htf_filter_mode", "strict")
-        self.take_profit   = risk.get("take_profit_pct", 0.05)
 
         # State — separate files for spot and futures
         state_file    = "state.json" if self.MODE == "spot" else "futures_state.json"
@@ -277,14 +277,14 @@ class BaseBot:
             # Use cached watchlist — don't trigger rescan during training
             train_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
             if self.scanner.top_coins:
-                # Add up to 2 coins from cached watchlist
-                for c in self.scanner.top_coins[:2]:
+                # Add up to 4 coins from cached watchlist (total 8)
+                for c in self.scanner.top_coins[:4]:
                     if c not in train_symbols:
                         train_symbols.append(c)
             raw_dfs = []
             for sym in train_symbols:
                 try:
-                    df = self.feed.fetch_ohlcv(sym, "1h", limit=500)
+                    df = self.feed.fetch_ohlcv(sym, "1h", limit=1000)
                     if df is not None and len(df) > 100:
                         raw_dfs.append(df)
                         self.log.info(f"Training data: {sym} ({len(df)} bars)")
@@ -292,7 +292,7 @@ class BaseBot:
                     self.log.warning(f"Could not fetch {sym}: {e}")
             if not raw_dfs:
                 self.log.warning("No training data — using BTC fallback")
-                df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=500)
+                df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=1000)
                 if df is not None:
                     raw_dfs = [df]
             if not raw_dfs:
@@ -304,7 +304,7 @@ class BaseBot:
             from ai_strategy import make_features, make_labels, AIStrategyEngine
             feat_parts, label_parts = [], []
             ctx_vol_parts, ctx_trend_parts, ctx_vratio_parts = [], [], []
-            fb = self.config.get("ml", {}).get("forward_bars", 1)
+            fb = self.config.get("ml", {}).get("forward_bars", 3)
             for sym_df in raw_dfs:
                 try:
                     sym_reset = sym_df.reset_index(drop=True)
@@ -497,6 +497,9 @@ class BaseBot:
                 if fraction >= 1.0:
                     self.state.close_trade(trade["id"], price, pnl)
                     self.risk.cleanup_trade(trade["id"])
+                    self._cancel_exchange_stop_loss(
+                        trade["symbol"], trade.get("sl_order_id", "")
+                    )
                 else:
                     self.state.partial_close_trade(trade["id"], close_amount, pnl)
                 self.ai.record_trade_result(trade["symbol"], pnl)
@@ -567,6 +570,9 @@ class BaseBot:
                         pnl = self._calc_pnl(trade, current_price)
                         self.state.close_trade(trade["id"], current_price, pnl)
                         self.risk.cleanup_trade(trade["id"])
+                        self._cancel_exchange_stop_loss(
+                            symbol, trade.get("sl_order_id", "")
+                        )
                         self.ai.record_trade_result(symbol, pnl)
                         self.agents.record_trade_result(symbol, pnl)
                         self.risk.record_trade_result(pnl, balance)
@@ -696,6 +702,9 @@ class BaseBot:
                     self.agents.record_trade_result(symbol, pnl)
                     self.risk.record_trade_result(pnl, balance)
                     self.risk.cleanup_trade(holding["id"])
+                    self._cancel_exchange_stop_loss(
+                        symbol, holding.get("sl_order_id", "")
+                    )
                     self.log.info(f"AI CLOSE {symbol} | PnL={pnl:+.4f}")
                     self.notifier.send_alert(f"AI CLOSE {symbol}\nPnL: ${pnl:+.4f}")
                 return
@@ -734,11 +743,10 @@ class BaseBot:
             if not self._passes_trade_filters(df_1h, symbol):
                 return
 
-            portfolio_mult = regime_ctx.get("size_mult", 1.0) if regime_ctx else 1.0
             _, est_usdt = self.risk.get_position_size(
                 confidence=conf, balance=balance, price=price,
                 df=df_1h, recent_trades=self.state.get_all_trades(),
-                portfolio_mult=portfolio_mult, all_agree=all_agree,
+                regime_ctx=regime_ctx, all_agree=all_agree,
             )
 
             # ══ RISK LAYER ═══════════════════════════════════════════════════
@@ -763,7 +771,7 @@ class BaseBot:
             amount, usdt = self.risk.get_position_size(
                 confidence=conf, balance=balance, price=price,
                 df=df_1h, recent_trades=self.state.get_all_trades(),
-                portfolio_mult=portfolio_mult, all_agree=all_agree,
+                regime_ctx=regime_ctx, all_agree=all_agree,
             )
             if usdt < 10:
                 return
@@ -794,6 +802,16 @@ class BaseBot:
                     leverage  = self._get_leverage(),
                 )
                 self.state.add_trade(trade)
+
+                if self.MODE == "futures":
+                    atr = self.get_atr(symbol)
+                    sl_id = self._place_exchange_stop_loss(
+                        symbol, side, amount, fill_price, atr
+                    )
+                    if sl_id:
+                        trade.sl_order_id = sl_id
+                        self.state.save()
+
                 self.log.info(
                     f"{side.upper()} {symbol} | ${usdt:.2f} | conf={conf:.2f}"
                 )
@@ -812,8 +830,8 @@ class BaseBot:
     def _passes_trade_filters(self, df_1h, symbol: str) -> bool:
         """
         Step 10: Pre-entry quality filters.
-        Requires: volume spike (vol > 1.5× vol_MA) AND ATR expansion (ATR > ATR_MA).
-        Returns True if entry is allowed, False to skip.
+        Scoring: need >= 1/2 conditions (vol spike OR ATR expansion).
+        Both pass = high conviction entry.
         """
         try:
             close = df_1h["close"]
@@ -822,25 +840,34 @@ class BaseBot:
             vol   = df_1h["volume"]
 
             vol_ma   = vol.rolling(20).mean()
-            vol_ok   = float(vol.iloc[-1]) > 1.5 * float(vol_ma.iloc[-1])
+            vol_ratio = float(vol.iloc[-1]) / (float(vol_ma.iloc[-1]) + 1e-9)
+            vol_ok   = vol_ratio > 1.5
 
             import ta as _ta
             atr      = _ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
             atr_ma   = atr.rolling(20).mean()
-            atr_ok   = float(atr.iloc[-1]) > float(atr_ma.iloc[-1])
+            atr_ratio = float(atr.iloc[-1]) / (float(atr_ma.iloc[-1]) + 1e-9)
+            atr_ok   = atr_ratio > 1.0
 
-            if not (vol_ok and atr_ok):
+            score = int(vol_ok) + int(atr_ok)
+            if score == 0:
                 self.log.info(
-                    f"FILTER SKIP {symbol}: vol_spike={vol_ok} "
-                    f"(ratio={vol.iloc[-1]/vol_ma.iloc[-1]:.2f}) "
-                    f"atr_expand={atr_ok} "
-                    f"(ratio={atr.iloc[-1]/atr_ma.iloc[-1]:.2f})"
+                    f"FILTER SKIP {symbol}: vol={vol_ratio:.2f}x "
+                    f"atr={atr_ratio:.2f}x (need >= 1)"
                 )
                 return False
+            elif score == 2:
+                self.log.info(f"FILTER PASS {symbol}: vol={vol_ratio:.2f}x atr={atr_ratio:.2f}x (both)")
+            else:
+                self.log.info(
+                    f"FILTER PASS {symbol}: score=1/2 "
+                    f"vol={'OK' if vol_ok else 'skip'}({vol_ratio:.2f}x) "
+                    f"atr={'OK' if atr_ok else 'skip'}({atr_ratio:.2f}x)"
+                )
             return True
         except Exception as e:
             self.log.warning(f"Trade filter error for {symbol}: {e}")
-            return True  # fail-open so filter errors don't block all trades
+            return True
 
     def _find_position(self, symbol, open_trades):
         """Find existing position for a symbol."""
@@ -852,6 +879,14 @@ class BaseBot:
     def _get_leverage(self) -> int:
         """Override in futures bot."""
         return 1
+
+    def _place_exchange_stop_loss(self, symbol, side, amount, entry_price, atr):
+        """Override in futures bot to place exchange-side SL."""
+        return ""
+
+    def _cancel_exchange_stop_loss(self, symbol, sl_order_id):
+        """Override in futures bot to cancel exchange-side SL."""
+        pass
 
     def sync_with_exchange(self):
         """Sync state with real exchange positions."""
@@ -930,6 +965,9 @@ class BaseBot:
                     t["pnl"]             = round(pnl, 6)
                     t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
                     self.log.info(f"Sync: closed orphan {t['symbol']} pnl={pnl:+.4f}")
+                    self._cancel_exchange_stop_loss(
+                        t["symbol"], t.get("sl_order_id", "")
+                    )
                     # Feed orphan close back to risk and AI systems
                     try:
                         self.risk.record_trade_result(pnl, usdt)

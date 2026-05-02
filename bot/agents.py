@@ -1,10 +1,8 @@
 """
 Multi-Agent System v2 - Production Grade
 - Agent performance tracking
-- Confidence gate (calls Groq only when ML models strongly agree)
-- Token budget management
-- Negation-aware news sentiment
-- Fallback chain: Groq → ML
+- Confidence gate (deterministic ensemble, no LLM)
+- Fallback chain: Ensemble → ML
 """
 
 import json
@@ -13,9 +11,8 @@ import re
 import requests
 from pathlib import Path
 from datetime import datetime, timezone
-from groq import Groq
 import numpy as np
-from env_config import get_groq_key, DATA_DIR
+from env_config import DATA_DIR
 
 log  = logging.getLogger("Agents")
 DATA = DATA_DIR
@@ -60,7 +57,7 @@ class AgentPerformanceTracker:
 
 class TokenBudgetManager:
     DAILY_LIMIT   = 90000
-    COST_PER_CALL = 200   # Reduced with shorter prompt
+    COST_PER_CALL = 200
 
     def __init__(self):
         self.path       = DATA / "token_budget.json"
@@ -257,79 +254,98 @@ class MacroAgent:
 
 
 class MasterAgent:
-    def __init__(self):
-        self.client = Groq(api_key=get_groq_key())
-        self.model  = "llama-3.1-8b-instant"
-        self.budget = TokenBudgetManager()
+    """
+    Deterministic ensemble — replaces Groq LLM (37% accuracy).
+    Combines technical, fear/greed, news, onchain, and macro signals
+    with weighted voting. No API calls, no tokens wasted.
+    """
+
+    WEIGHTS = {
+        "technical":  0.35,
+        "fear_greed": 0.15,
+        "news":       0.15,
+        "onchain":    0.20,
+        "macro":      0.15,
+    }
+
+    SIGNAL_MAP = {
+        "STRONG_BUY": 1.0, "BUY": 0.6, "BULLISH": 0.5,
+        "POSITIVE": 0.3, "STRONG_MOMENTUM": 0.4,
+        "NEUTRAL": 0.0,
+        "STRONG_SELL": -1.0, "SELL": -0.6, "BEARISH": -0.5,
+        "NEGATIVE": -0.3,
+    }
 
     def decide(self, symbol, technical, fear_greed, news, onchain, macro):
+        scores = []
         fg = fear_greed or {}
         mc = macro or {}
 
-        if not self.budget.can_call():
-            log.warning(f"Groq budget exhausted ({self.budget.get_usage_pct():.1f}%) — ML fallback")
-            return self._ml_fallback(technical)
+        tech_score = self._map_signal(technical.get("trend", "NEUTRAL"))
+        ml_boost = 0.1 if technical.get("ml_action") == "BUY" else (-0.1 if technical.get("ml_action") == "SELL" else 0)
+        scores.append(("technical", tech_score + ml_boost))
 
-        # Short prompt to minimize tokens
-        prompt = (
-            f"{symbol}: Price=${technical.get('price','?')} "
-            f"1h={technical.get('change_1h',0):+.1f}% "
-            f"Trend={technical.get('trend','?')} "
-            f"RSI={technical.get('rsi','?')} "
-            f"ML={technical.get('ml_action','?')} {technical.get('ml_conf',0):.0%} | "
-            f"Fear={fg.get('value',50)} News={news.get('signal','?')} "
-            f"Market={mc.get('market_trend','?')}\n"
-            f'JSON: {{"action":"BUY/SELL/HOLD","confidence":0-1,"reasoning":"5 words","risk_level":"LOW/MEDIUM/HIGH"}}'
+        fg_signal = fg.get("signal", "NEUTRAL")
+        fg_val = fg.get("value", 50)
+        fg_score = self._map_signal(fg_signal)
+        if fg_val < 20:
+            fg_score = min(fg_score + 0.2, 1.0)
+        elif fg_val > 80:
+            fg_score = max(fg_score - 0.2, -1.0)
+        scores.append(("fear_greed", fg_score))
+
+        news_score = self._map_signal(news.get("signal", "NEUTRAL"))
+        news_mag = min(abs(news.get("score", 0)) / 10.0, 0.3)
+        news_score = news_score * (0.7 + news_mag)
+        scores.append(("news", news_score))
+
+        onchain_score = self._map_signal(onchain.get("ath_signal", "UNKNOWN"))
+        ch7d = onchain.get("change_7d", 0)
+        if abs(ch7d) > 5:
+            onchain_score = onchain_score * 1.2
+        scores.append(("onchain", onchain_score))
+
+        macro_score = self._map_signal(mc.get("market_trend", "NEUTRAL"))
+        scores.append(("macro", macro_score))
+
+        weighted = sum(
+            self.WEIGHTS.get(name, 0.1) * score
+            for name, score in scores
         )
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "Trading AI. JSON only."},
-                    {"role": "user",   "content": prompt},
-                ],
-                max_tokens=80,
-                temperature=0.1,
-            )
-            self.budget.record_call()
-            raw   = resp.choices[0].message.content.strip()
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                raw = match.group()
-            d      = json.loads(raw)
-            action = d.get("action", "HOLD").upper()
-            if action not in ["BUY", "SELL", "HOLD"]:
-                action = "HOLD"
-            conf = max(0.0, min(1.0, float(d.get("confidence", 0.5))))
-            return {
-                "action": action, "confidence": round(conf, 4),
-                "reasoning": d.get("reasoning", "")[:80],
-                "risk_level": d.get("risk_level", "MEDIUM"),
-                "source": "groq",
-            }
-        except Exception as e:
-            log.error(f"Groq error: {e}")
-            return self._ml_fallback(technical)
 
-    def _ml_fallback(self, technical):
+        weighted = max(-1.0, min(1.0, weighted))
+        if weighted > 0.25:
+            action = "BUY"
+            conf = 0.55 + abs(weighted) * 0.35
+        elif weighted < -0.25:
+            action = "SELL"
+            conf = 0.55 + abs(weighted) * 0.35
+        else:
+            action = technical.get("ml_action", "HOLD")
+            conf = float(technical.get("ml_conf", 0.5)) * 0.9
+
+        conf = max(0.3, min(0.95, conf))
+
         return {
-            "action":     technical.get("ml_action", "HOLD"),
-            "confidence": float(technical.get("ml_conf", 0.5)),
-            "reasoning":  "ML fallback",
-            "risk_level": "MEDIUM",
-            "source":     "ml_fallback",
+            "action": action,
+            "confidence": round(conf, 4),
+            "reasoning": f"Ensemble={weighted:+.2f}",
+            "risk_level": "HIGH" if abs(weighted) > 0.6 else "MEDIUM",
+            "source": "ensemble",
         }
+
+    def _map_signal(self, signal: str) -> float:
+        return self.SIGNAL_MAP.get(signal.upper(), 0.0)
 
 
 class AgentCoordinator:
     """
     Coordinates all agents.
-    CONFIDENCE GATE: Only calls Groq when all 3 ML models agree
-    AND confidence >= 0.62. Reduces token usage by ~90%.
+    Uses deterministic ensemble (no LLM) to combine signals.
     """
 
-    GROQ_CACHE_SECS = 1800   # 30 min cache
-    SLOW_CACHE_SECS = 7200   # 2 hour cache for fear/greed/macro
+    GROQ_CACHE_SECS = 1800
+    SLOW_CACHE_SECS = 7200
 
     def __init__(self):
         self.technical  = TechnicalAgent()
@@ -356,8 +372,7 @@ class AgentCoordinator:
             self._slow_time   = now
             log.info(
                 f"Fear&Greed: {self._fg_cache.get('value',50)}/100 | "
-                f"Market: {self._macro_cache.get('market_trend','?')} | "
-                f"Groq tokens remaining: {self.master.budget.tokens_remaining()}"
+                f"Market: {self._macro_cache.get('market_trend','?')}"
             )
 
     def analyze(self, symbol, df, ml_signal):
@@ -366,7 +381,6 @@ class AgentCoordinator:
         last_dt = self._decision_time.get(symbol)
         cached  = self._decision_cache.get(symbol)
 
-        # Return cached if fresh
         if (cached and last_dt and
                 (now - last_dt).total_seconds() < self.GROQ_CACHE_SECS):
             remaining          = int(self.GROQ_CACHE_SECS - (now - last_dt).total_seconds())
@@ -375,22 +389,18 @@ class AgentCoordinator:
             log.info(f"CACHED {symbol}: {cached['action']} | conf={cached['confidence']:.2f} | refresh in {remaining}s")
             return cached
 
-        # ── CONFIDENCE GATE ───────────────────────────────────────
-        # Only call Groq when ALL 3 ML models agree AND conf >= 0.62
-        # This reduces Groq calls by ~90% and saves tokens
         ml_action  = ml_signal.get("action", "HOLD")
         ml_conf    = ml_signal.get("confidence", 0.5)
         indicators = ml_signal.get("indicators", {})
         buy_votes  = indicators.get("buy_votes", 0)
         sell_votes = indicators.get("sell_votes", 0)
-        worth_groq = (buy_votes >= 2 or sell_votes >= 2) and ml_conf >= 0.50 and ml_action != "HOLD"
+        worth_ensemble = (buy_votes >= 2 or sell_votes >= 2) and ml_conf >= 0.50 and ml_action != "HOLD"
 
-        if not worth_groq:
-            # Skip Groq — use ML decision directly
+        if not worth_ensemble:
             log.info(
                 f"ML-ONLY {symbol}: {ml_action} | "
                 f"conf={ml_conf:.2f} | "
-                f"votes={buy_votes}B/{sell_votes}S (Groq skipped)"
+                f"votes={buy_votes}B/{sell_votes}S (ensemble skipped)"
             )
             signal = {
                 "symbol":     symbol,
@@ -398,7 +408,7 @@ class AgentCoordinator:
                 "confidence": ml_conf,
                 "strategy":   f"ML-ONLY+{ml_signal.get('strategy','')}",
                 "timeframe":  "ML",
-                "reasoning":  "ML only — Groq skipped",
+                "reasoning":  "ML only — ensemble skipped",
                 "risk_level": "MEDIUM",
                 "source":     "ml_only",
                 "indicators": {
@@ -414,8 +424,6 @@ class AgentCoordinator:
             self._decision_actions[symbol] = ml_action
             return signal
 
-        # ── GROQ CALL — only for high confidence signals ──────────
-        log.info(f"GROQ WORTHY {symbol}: {ml_action} conf={ml_conf:.2f} — calling Groq")
         tech    = self.technical.analyze(symbol, df, ml_signal)
         news    = self.news.analyze(symbol)
         onchain = self.onchain.analyze(symbol)
@@ -426,7 +434,7 @@ class AgentCoordinator:
             onchain=onchain, macro=self._macro_cache,
         )
         log.info(
-            f"GROQ {symbol}: {decision['action']} | "
+            f"ENSEMBLE {symbol}: {decision['action']} | "
             f"conf={decision['confidence']:.2f} | "
             f"src={decision['source']} | "
             f"{decision['reasoning'][:50]}"
@@ -436,7 +444,7 @@ class AgentCoordinator:
             "symbol":     symbol,
             "action":     decision["action"],
             "confidence": decision["confidence"],
-            "strategy":   f"GROQ+{ml_signal.get('strategy','')}",
+            "strategy":   f"ENSEMBLE+{ml_signal.get('strategy','')}",
             "timeframe":  "MULTI-AGENT",
             "reasoning":  decision["reasoning"],
             "risk_level": decision["risk_level"],
@@ -463,6 +471,6 @@ class AgentCoordinator:
     def get_performance_report(self):
         return {
             "agent_accuracy":   self.tracker.get_report(),
-            "token_usage_pct":  self.master.budget.get_usage_pct(),
-            "tokens_remaining": self.master.budget.tokens_remaining(),
+            "token_usage_pct":  0,
+            "tokens_remaining": 999999,
         }

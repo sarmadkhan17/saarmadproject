@@ -45,7 +45,7 @@ DATA = DATA_DIR / BOT_MODE
 DATA.mkdir(exist_ok=True)
 
 MC_SAMPLES            = 15    # MC Dropout forward passes
-UNCERTAINTY_THRESHOLD = 0.03  # combined uncertainty → force HOLD
+UNCERTAINTY_THRESHOLD = 0.06  # combined uncertainty → force HOLD
 
 
 def make_features(df):
@@ -174,7 +174,7 @@ def make_features(df):
     return f.dropna()
 
 
-def make_labels(df, forward_bars=1, atr_multiplier=0.5):
+def make_labels(df, forward_bars=3, atr_multiplier=1.0):
     """
     ATR-based dynamic threshold labels.
     threshold = (ATR/close) * atr_multiplier, clipped [0.001, 0.02].
@@ -1150,6 +1150,15 @@ class AIStrategyEngine:
             vol_ratio      = _safe(ctx_vratio, default=1.0),
             tft_probs      = tft_probs_for_meta,
         )
+
+        # Bypass meta if it's performing worse than base models
+        meta_acc = self.meta.metadata.get("accuracy", 0)
+        if meta_result is not None and meta_acc < 0.50:
+            log.debug(
+                f"Meta bypass: accuracy={meta_acc:.2%} < 50% — "
+                f"using weighted ensemble instead"
+            )
+            meta_result = None
 
         tft_tag = f"+TFT:{tft_p['action']}" if tft_p is not None else ""
 

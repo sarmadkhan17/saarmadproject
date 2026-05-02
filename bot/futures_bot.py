@@ -62,7 +62,6 @@ class FuturesBot(BaseBot):
                 try:
                     self.exchange.set_margin_mode(margin_type.lower(), symbol)
                 except Exception as e:
-                    # "No need to change" is OK - already set
                     if "-4046" not in str(e):
                         log.debug(f"Margin {symbol}: {e}")
         except Exception as e:
@@ -105,6 +104,44 @@ class FuturesBot(BaseBot):
 
     def _get_leverage(self) -> int:
         return self.leverage
+
+    def _place_exchange_stop_loss(self, symbol: str, side: str, amount: float, entry_price: float, atr: float) -> str:
+        """
+        Place exchange-side STOP_MARKET order for safety.
+        Returns the stop-loss order ID.
+        """
+        try:
+            sl_atr_mult = self.config.get("risk", {}).get("stop_loss_atr_multiplier", 2.0)
+            if side == "long":
+                stop_price = entry_price - (atr * sl_atr_mult)
+                close_side = "sell"
+            else:
+                stop_price = entry_price + (atr * sl_atr_mult)
+                close_side = "buy"
+
+            if stop_price <= 0:
+                self.log.warning(f"Invalid SL price for {symbol}: {stop_price}")
+                return ""
+
+            order = self.exchange.create_stop_market_order(
+                symbol, close_side, amount, stop_price,
+                params={"reduceOnly": True},
+            )
+            self.log.info(f"Exchange SL placed for {symbol}: {side} @ {stop_price:.4f} (order_id={order['id']})")
+            return order["id"]
+        except Exception as e:
+            self.log.error(f"Failed to place exchange SL for {symbol}: {e}")
+            return ""
+
+    def _cancel_exchange_stop_loss(self, symbol: str, sl_order_id: str):
+        """Cancel an existing exchange stop-loss order."""
+        if not sl_order_id:
+            return
+        try:
+            self.exchange.cancel_order(sl_order_id, symbol)
+            self.log.info(f"Exchange SL cancelled for {symbol}: {sl_order_id}")
+        except Exception as e:
+            self.log.debug(f"Failed to cancel exchange SL for {symbol}: {e}")
 
 
 if __name__ == "__main__":

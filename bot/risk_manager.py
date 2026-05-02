@@ -15,34 +15,9 @@ from pathlib import Path
 from datetime import datetime, date, timezone
 from typing import List, Tuple, Optional
 from env_config import DATA_DIR
-from technical_indicators import calc_adx
 
 log  = logging.getLogger("RiskManager")
 DATA = DATA_DIR
-
-
-class RegimeDetector:
-    def detect(self, df):
-        try:
-            close     = df["close"]
-            high      = df["high"]
-            low       = df["low"]
-            adx       = calc_adx(high, low, close)
-            ret       = close.pct_change()
-            vol_ratio = float(ret.rolling(5).std().iloc[-1] / (ret.rolling(20).std().iloc[-1] + 1e-9))
-            adx_val   = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 25
-            bb_std    = close.rolling(20).std()
-            bb_mid    = close.rolling(20).mean()
-            bb_width  = float((bb_std.iloc[-1] * 4) / (bb_mid.iloc[-1] + 1e-9))
-
-            if vol_ratio > 1.8:
-                return {"regime": "VOLATILE", "adx": round(adx_val,1), "vol_ratio": round(vol_ratio,2), "size_mult": 0.4}
-            elif adx_val > 25 and bb_width > 0.04:
-                return {"regime": "TRENDING", "adx": round(adx_val,1), "vol_ratio": round(vol_ratio,2), "size_mult": 1.2}
-            else:
-                return {"regime": "RANGING",  "adx": round(adx_val,1), "vol_ratio": round(vol_ratio,2), "size_mult": 0.8}
-        except Exception:
-            return {"regime": "UNKNOWN", "size_mult": 0.8}
 
 
 class CorrelationFilter:
@@ -293,16 +268,28 @@ class KellyCriterionSizer:
             pos_pct = self.BASE_PCT * (0.6 + confidence * 0.8)
         else:
             last_20 = closed[-20:]
-            wins    = [t["pnl"] for t in last_20 if t.get("pnl", 0) > 0]
-            losses  = [abs(t["pnl"]) for t in last_20 if t.get("pnl", 0) <= 0]
-            if wins and losses:
-                wr      = len(wins) / len(last_20)
-                avg_win = np.mean(wins)
-                avg_los = np.mean(losses)
-                kelly   = (wr * avg_win - (1-wr) * avg_los) / (avg_win + 1e-9)
-                pos_pct = max(0, kelly) * self.KELLY_FRACTION * (0.5 + confidence * 0.5)
+            pct_returns = []
+            for t in last_20:
+                entry_price = float(t.get("price", 0))
+                amount = float(t.get("amount", 0))
+                pnl = float(t.get("pnl", 0))
+                if entry_price > 0 and amount > 0:
+                    notional = entry_price * amount
+                    pct_returns.append(pnl / notional)
+
+            if len(pct_returns) >= 5:
+                wins = [r for r in pct_returns if r > 0]
+                losses = [abs(r) for r in pct_returns if r <= 0]
+                if wins and losses:
+                    wr = len(wins) / len(pct_returns)
+                    avg_win = np.mean(wins)
+                    avg_los = np.mean(losses)
+                    kelly = (wr * avg_win - (1 - wr) * avg_los) / (avg_los + 1e-9)
+                    pos_pct = max(0, kelly) * self.KELLY_FRACTION * (0.5 + confidence * 0.5)
+                else:
+                    pos_pct = self.BASE_PCT
             else:
-                pos_pct = self.BASE_PCT
+                pos_pct = self.BASE_PCT * (0.6 + confidence * 0.8)
 
         if atr_pct > 0.04:    pos_pct *= 0.6
         elif atr_pct > 0.02:  pos_pct *= 0.8
@@ -314,7 +301,6 @@ class KellyCriterionSizer:
                 pos_pct *= 0.5
                 log.warning(f"Losing streak — reducing size to {pos_pct*100:.1f}%")
 
-        # Tiered cap: scale up only when high-conviction setup
         if all_agree and confidence >= 0.70 and regime.get("regime") == "STRONG_TREND":
             cap = 0.15
         elif all_agree and confidence >= 0.60:
@@ -350,6 +336,8 @@ class PortfolioHeatTracker:
 
 
 class CircuitBreaker:
+    WINDOW_DAYS = 2
+
     def __init__(self, config):
         self.max_daily_loss  = config.get("max_daily_loss_pct", 0.05)
         self.max_consec_loss = config.get("max_consecutive_losses", 4)
@@ -360,35 +348,42 @@ class CircuitBreaker:
         if p.exists():
             with open(p) as f:
                 d = json.load(f)
-                self.daily_pnl     = d.get("daily_pnl", 0.0)
+                self.pnl_history   = d.get("pnl_history", {})
                 self.consec_losses = d.get("consec_losses", 0)
-                self.reset_date    = d.get("reset_date", str(date.today()))
         else:
-            self.daily_pnl = 0.0; self.consec_losses = 0
-            self.reset_date = str(date.today())
+            self.pnl_history   = {}
+            self.consec_losses = 0
 
     def _save(self):
+        from datetime import timedelta
+        cutoff = (date.today() - timedelta(days=self.WINDOW_DAYS)).isoformat()
+        self.pnl_history = {k: v for k, v in self.pnl_history.items() if k >= cutoff}
         with open(DATA / "circuit_breaker.json", "w") as f:
-            json.dump({"daily_pnl": self.daily_pnl,
-                       "consec_losses": self.consec_losses,
-                       "reset_date": self.reset_date}, f)
+            json.dump({"pnl_history": self.pnl_history,
+                       "consec_losses": self.consec_losses}, f)
 
-    def _reset_if_new_day(self):
-        if str(date.today()) != self.reset_date:
-            self.daily_pnl = 0.0; self.consec_losses = 0
-            self.reset_date = str(date.today())
-            self._save()
+    def _get_rolling_loss(self):
+        from datetime import timedelta
+        today_str = str(date.today())
+        if today_str not in self.pnl_history:
+            self.pnl_history[today_str] = 0.0
+        total = 0.0
+        for i in range(self.WINDOW_DAYS):
+            d = date.today() - timedelta(days=i)
+            total += self.pnl_history.get(str(d), 0.0)
+        return total
 
     def record_trade(self, pnl, balance):
-        self._reset_if_new_day()
-        self.daily_pnl += pnl
+        today_str = str(date.today())
+        self.pnl_history[today_str] = self.pnl_history.get(today_str, 0.0) + pnl
         self.consec_losses = self.consec_losses + 1 if pnl < 0 else 0
         self._save()
 
     def can_trade(self, balance):
-        self._reset_if_new_day()
-        if self.daily_pnl < -(balance * self.max_daily_loss):
-            return False, f"Daily loss limit: ${self.daily_pnl:.2f}"
+        rolling_loss = self._get_rolling_loss()
+        threshold = balance * self.max_daily_loss * self.WINDOW_DAYS
+        if rolling_loss < -threshold:
+            return False, f"Rolling {self.WINDOW_DAYS}-day loss ${rolling_loss:.2f} (limit -${threshold:.2f})"
         if self.consec_losses >= self.max_consec_loss:
             return False, f"Consecutive losses: {self.consec_losses}"
         return True, "OK"
@@ -397,14 +392,14 @@ class CircuitBreaker:
 class RiskManager:
     def __init__(self, config):
         risk             = config.get("risk", {})
-        self.regime      = RegimeDetector()
         self.market_gate = MarketRegimeGate()
         self.correlation = CorrelationFilter()
         self.trailing    = ATRTrailingStop(risk.get("stop_loss_atr_multiplier", 2.0))
         self.sizer       = KellyCriterionSizer()
         self.breaker     = CircuitBreaker(risk)
         self.heat        = PortfolioHeatTracker(risk.get("max_portfolio_heat", 0.40))
-        self.take_profit = risk.get("take_profit_pct", 0.05)
+        self.tp_atr_mult = risk.get("take_profit_atr_multiplier", 2.5)
+        self.fallback_tp = risk.get("take_profit_pct", 0.05)
 
     def check_exits(self, open_trades, get_price_fn, get_atr_fn):
         exits = []
@@ -417,14 +412,28 @@ class RiskManager:
             side     = trade.get("side", "long")
             is_short = side in ("short", "sell")
 
-            if is_short:
-                if price <= entry * (1 - self.take_profit):
-                    exits.append((trade, price, "TAKE_PROFIT", 1.0))
-                    continue
+            atr = get_atr_fn(trade["symbol"])
+            if atr > 0:
+                tp_distance = atr * self.tp_atr_mult
+                if is_short:
+                    tp_price = entry - tp_distance
+                    if price <= tp_price:
+                        exits.append((trade, price, f"ATR TP ${tp_price:.4f} ({self.tp_atr_mult}xATR)", 1.0))
+                        continue
+                else:
+                    tp_price = entry + tp_distance
+                    if price >= tp_price:
+                        exits.append((trade, price, f"ATR TP ${tp_price:.4f} ({self.tp_atr_mult}xATR)", 1.0))
+                        continue
             else:
-                if price >= entry * (1 + self.take_profit):
-                    exits.append((trade, price, "TAKE_PROFIT", 1.0))
-                    continue
+                if is_short:
+                    if price <= entry * (1 - self.fallback_tp):
+                        exits.append((trade, price, f"Fixed TP {self.fallback_tp:.0%}", 1.0))
+                        continue
+                else:
+                    if price >= entry * (1 + self.fallback_tp):
+                        exits.append((trade, price, f"Fixed TP {self.fallback_tp:.0%}", 1.0))
+                        continue
 
             atr = get_atr_fn(trade["symbol"])
             if atr > 0:
@@ -454,12 +463,11 @@ class RiskManager:
     def detect_market_regime(self, feed, watchlist: list) -> dict:
         return self.market_gate.detect(feed, watchlist)
 
-    def get_position_size(self, confidence, balance, price, df, recent_trades, portfolio_mult=1.0, all_agree=False):
-        regime  = self.regime.detect(df)
+    def get_position_size(self, confidence, balance, price, df, recent_trades, regime_ctx=None, all_agree=False):
+        regime = dict(regime_ctx) if regime_ctx else self.market_gate._neutral()
         atr     = df["high"].sub(df["low"]).rolling(14).mean().iloc[-1]
         atr_pct = float(atr / (df["close"].iloc[-1] + 1e-9))
-        regime["size_mult"] = regime.get("size_mult", 1.0) * portfolio_mult
-        log.info(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} portfolio_mult={portfolio_mult:.2f}")
+        log.info(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f}")
         return self.sizer.calculate(confidence, balance, price, atr_pct, regime, recent_trades, all_agree=all_agree)
 
     def record_trade_result(self, pnl, balance):
