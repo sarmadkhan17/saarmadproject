@@ -31,7 +31,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from env_config   import get_exchange_config, DATA_DIR, LOGS_DIR, BOT_ROOT
-from data_feed    import DataFeed
+from data_feed    import DataFeed, TrainingFeed, TrainingDataStore
 from data_feed_ws import BinanceWSPriceFeed
 from ai_strategy  import AIStrategyEngine
 from regime_model import HMMRegimeModel
@@ -247,6 +247,7 @@ class BaseBot:
         self.hmm_regime = HMMRegimeModel()
         self.rl_agent   = RLTradeManager()
         self.gnn_filter = GNNCorrelationFilter()
+        self.training_feed = TrainingFeed()  # v4: real Binance data for training
 
         self._balance_cache: Optional[float] = None
 
@@ -290,52 +291,50 @@ class BaseBot:
             self.log.warning(f"Config reload failed: {e}")
 
     def _train(self):
-        # Reload config before training so dashboard changes take effect
         self._reload_config()
         self.log.info("=" * 50)
-        self.log.info(f"TRAINING AI MODELS [{self.MODE.upper()} MODE]...")
+        self.log.info(f"TRAINING AI MODELS v4 [{self.MODE.upper()} MODE]...")
+        self.log.info("Training source: real Binance public API (api.binance.com)")
         self.log.info("=" * 50)
         try:
             import pandas as pd
-            watched      = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols)
-            # Use cached watchlist — don't trigger rescan during training
-            train_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+            import numpy as np
+            from ai_strategy import make_features, make_labels, AIStrategyEngine
+
+            train_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+                             "XRP/USDT", "DOGE/USDT", "ADA/USDT", "LINK/USDT"]
             if self.scanner.top_coins:
-                # Add up to 4 coins from cached watchlist (total 8)
                 for c in self.scanner.top_coins[:4]:
                     if c not in train_symbols:
                         train_symbols.append(c)
+
             tf = self.config.get("ml", {}).get("timeframe") or self.config.get("scanner", {}).get("timeframe", "15m")
+            training_cfg = self.config.get("training", {})
+            min_bars = training_cfg.get("min_bars_per_coin", 3000)
+
+            self.log.info(f"Fetching training data from real Binance (limit=5000, min_bars={min_bars})...")
+            fetched = self.training_feed.fetch_training_data(train_symbols, timeframe=tf, limit=5000, min_bars=100)
+
             raw_dfs = []
-            btc_limit = 10000
-            alt_limit = 5000
+            btc_bars = 0
             for sym in train_symbols:
-                try:
-                    limit = btc_limit if sym == "BTC/USDT" else alt_limit
-                    df = self.feed.fetch_ohlcv(sym, tf, limit=limit)
-                    if df is not None and len(df) > 100:
-                        raw_dfs.append(df)
-                        self.log.info(f"Training data: {sym} ({len(df)} bars @ {tf})")
-                except Exception as e:
-                    self.log.warning(f"Could not fetch {sym}: {e}")
+                df = fetched.get(sym)
+                if df is not None and len(df) >= 100:
+                    raw_dfs.append(df)
+                    self.log.info(f"Training data: {sym} ({len(df)} bars @ {tf})")
+                    if sym == "BTC/USDT":
+                        btc_bars = len(df)
+
             if not raw_dfs:
-                self.log.warning("No training data — using BTC fallback")
-                df = self.feed.fetch_ohlcv("BTC/USDT", tf, limit=btc_limit)
-                if df is not None:
-                    raw_dfs = [df]
-            if not raw_dfs:
-                self.log.error("Training skipped — no data available")
+                self.log.error("Training skipped — no data available from real Binance")
                 return
-            # Compute features+labels per symbol to avoid EMA/rolling contamination
-            # across coin price boundaries, then concat the clean feature rows.
-            import numpy as np
-            from ai_strategy import make_features, make_labels, AIStrategyEngine
+
             feat_parts, label_parts = [], []
             ctx_vol_parts, ctx_trend_parts, ctx_vratio_parts = [], [], []
-            fb = self.config.get("ml", {}).get("forward_bars", 1)
-            tf = self.config.get("ml", {}).get("timeframe") or self.config.get("scanner", {}).get("timeframe", "15m")
+            fb = self.config.get("ml", {}).get("forward_bars", 2)
             mc = self.config.get("strategy", {}).get("min_confidence", 0.52)
             mv = self.config.get("strategy", {}).get("min_votes", 2)
+
             for sym_df in raw_dfs:
                 try:
                     sym_reset = sym_df.reset_index(drop=True)
@@ -343,6 +342,7 @@ class BaseBot:
                     l = make_labels(sym_reset, forward_bars=fb).reindex(f.index).dropna()
                     f = f.loc[l.index]
                     if len(f) < 50:
+                        self.log.warning(f"Feature skip: coin had {len(sym_df)} bars, {len(f)} clean rows (<50)")
                         continue
                     ctx_v, ctx_t, ctx_r = AIStrategyEngine._compute_context_features(sym_reset)
                     ctx_vol_parts.append(ctx_v[f.index.values])
@@ -351,10 +351,12 @@ class BaseBot:
                     feat_parts.append(f.reset_index(drop=True))
                     label_parts.append(l.reset_index(drop=True))
                 except Exception as e:
-                    self.log.warning(f"Feature/label error for a symbol: {e}")
+                    self.log.warning(f"Feature/label error: {e}")
+
             if not feat_parts:
                 self.log.error("Training skipped — no clean feature rows")
                 return
+
             combined_feats  = pd.concat(feat_parts,  ignore_index=True)
             combined_labels = pd.concat(label_parts, ignore_index=True)
             combined_ctx    = (
@@ -363,17 +365,18 @@ class BaseBot:
                 np.concatenate(ctx_vratio_parts),
             )
             combined = pd.concat(raw_dfs, ignore_index=True)
-            btc_rows = len(raw_dfs[0]) if raw_dfs else 0
+
             self.log.info(
                 f"Training on {len(combined_feats)} clean rows "
-                f"from {len(feat_parts)} coins (forward_bars={fb}, BTC={btc_rows} bars)"
+                f"from {len(feat_parts)} coins (forward_bars={fb}, BTC={btc_bars} bars, source=real Binance)"
             )
+
             results = self.ai.train_all(
                 combined,
                 feat_df=combined_feats,
                 labels_s=combined_labels,
                 ctx_arrays=combined_ctx,
-                btc_rows=btc_rows,
+                btc_rows=btc_bars if btc_bars > 0 else len(raw_dfs[0]) if raw_dfs else 0,
                 forward_bars=fb,
                 timeframe=tf,
                 min_confidence=mc,
@@ -382,14 +385,21 @@ class BaseBot:
             self.log.info(f"Training complete: {results}")
             self._check_model_health(results)
 
-            # HMM regime model: train on BTC 1h (captures broad market regimes)
             try:
-                btc_df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=500)
+                btc_df = fetched.get("BTC/USDT") or self.training_feed.fetch_training_data(
+                    ["BTC/USDT"], timeframe="1h", limit=1000, min_bars=100
+                ).get("BTC/USDT")
                 if btc_df is not None and len(btc_df) >= 200:
                     hmm_result = self.hmm_regime.train(btc_df)
                     self.log.info(f"HMM regime trained: {hmm_result}")
+                else:
+                    self.log.warning("HMM skipped: insufficient BTC data for regime training")
             except Exception as e:
                 self.log.warning(f"HMM training skipped: {e}")
+
+            manifest = TrainingDataStore.get_manifest()
+            self.log.info(f"Training cache: {len(manifest.get('coins',[]))} coins cached to disk")
+
         except Exception as e:
             self.log.error(f"Training failed: {e}", exc_info=True)
             try:
@@ -1149,19 +1159,22 @@ class BaseBot:
         # HMM overlay: adjusts thresholds only, never overrides signal direction
         try:
             btc_df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=150)
-            if btc_df is not None:
+            if btc_df is not None and len(btc_df) >= 50:
                 hmm_regime, hmm_adj = self.hmm_regime.get_regime_and_adjustments(btc_df)
-                if regime_ctx:
-                    old_min_conf  = regime_ctx.get("min_conf", self.min_conf)
-                    old_size_mult = regime_ctx.get("size_mult", 1.0)
-                    regime_ctx["min_conf"]   = round(old_min_conf  + hmm_adj["min_conf_delta"], 4)
-                    regime_ctx["size_mult"]  = round(old_size_mult * hmm_adj["size_mult"], 4)
-                    regime_ctx["hmm_regime"] = hmm_regime
-                self.log.info(
-                    f"HMM regime: {hmm_regime} | "
-                    f"min_conf_delta={hmm_adj['min_conf_delta']:+.2f} "
-                    f"size_mult={hmm_adj['size_mult']:.2f}"
-                )
+            else:
+                hmm_regime, hmm_adj = self.hmm_regime.predict_fallback(btc_df)
+                self.log.info(f"HMM fallback (no BTC data): regime={hmm_regime}")
+            if regime_ctx:
+                old_min_conf  = regime_ctx.get("min_conf", self.min_conf)
+                old_size_mult = regime_ctx.get("size_mult", 1.0)
+                regime_ctx["min_conf"]   = round(old_min_conf  + hmm_adj["min_conf_delta"], 4)
+                regime_ctx["size_mult"]  = round(old_size_mult * hmm_adj["size_mult"], 4)
+                regime_ctx["hmm_regime"] = hmm_regime
+            self.log.info(
+                f"HMM regime: {hmm_regime} | "
+                f"min_conf_delta={hmm_adj['min_conf_delta']:+.2f} "
+                f"size_mult={hmm_adj['size_mult']:.2f}"
+            )
         except Exception as e:
             self.log.warning(f"HMM overlay failed: {e}")
 

@@ -1,3 +1,7 @@
+training:
+  min_bars_per_coin: 3000
+  min_coins: 8
+  use_real_api: true
 bot:
   groq_cache_seconds: 1800
   scan_interval_seconds: 30

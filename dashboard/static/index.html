@@ -813,6 +813,7 @@ td {
 
   <div class="hright">
     <span class="mode-badge spot" id="modeBadge">SPOT</span>
+    <span class="badge demo" id="execBadge">DEMO</span>
 
     <div class="vdivider"></div>
 
@@ -1098,6 +1099,27 @@ td {
     </div>
   </div>
 
+  <div class="section-label">Training Data</div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Training Data Status</span>
+      <span class="panel-badge" id="tdStatus">Loading...</span>
+    </div>
+    <div class="table-wrap" style="max-height:200px">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Bars</th><th>Quality</th>
+        </tr></thead>
+        <tbody id="tdBody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div style="padding:10px 16px;border-top:1px solid var(--border);font-family:var(--mono);font-size:10px;color:var(--text2)">
+      Source: api.binance.com (real public) |
+      Min required: 3000 bars/coin, 8 coins
+      <span style="float:right" id="tdSummary"></span>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -1142,7 +1164,41 @@ function showNotif(msg, type) {
   setTimeout(function() { el.className = 'notif'; }, 3000);
 }
 
-/* ─── TRADING TOGGLE ─── */
+/* ─── EXCHANGE MODE ─── */
+function updateExchangeMode() {
+  get('/api/exchange_mode', function(d) {
+    var badge = document.getElementById('execBadge');
+    if (!badge) return;
+    badge.textContent = (d.execution_mode || 'demo').toUpperCase();
+    badge.className = 'badge ' + (d.is_demo ? 'demo' : 'futures');
+  });
+}
+
+/* ─── TRAINING DATA ─── */
+function updateTrainingData() {
+  get('/api/training_data', function(d) {
+    var el = document.getElementById('tdBody');
+    var statusEl = document.getElementById('tdStatus');
+    var summaryEl = document.getElementById('tdSummary');
+    if (!el) return;
+    var coins = d.coins || [];
+    if (!coins.length) { el.innerHTML = "<tr><td colspan='3' class='empty'>No training data cached</td></tr>"; return; }
+    var h = '';
+    for (var i = 0; i < coins.length; i++) {
+      var c = coins[i];
+      var q = c.quality === 'good' ? '✓ GOOD' : (c.quality === 'ok' ? '⚠ OK' : '✗ LOW');
+      var qc = c.quality === 'good' ? 'td-buy' : (c.quality === 'ok' ? 'td-open' : 'td-sell');
+      h += "<tr><td class='td-sym'>" + escapeHtml(c.symbol) + "</td>" +
+        "<td>" + c.bars + "</td>" +
+        "<td class='" + qc + "'>" + q + "</td></tr>";
+    }
+    el.innerHTML = h;
+    var st = d.status === 'good' ? '✓ HEALTHY' : (d.status === 'degraded' ? '⚠ DEGRADED' : '✗ CRITICAL');
+    var sc = d.status === 'good' ? 'td-buy' : (d.status === 'degraded' ? 'td-open' : 'td-sell');
+    if (statusEl) { statusEl.textContent = st; statusEl.style.color = 'var(--' + (d.status === 'good' ? 'green' : d.status === 'degraded' ? 'gold' : 'red') + ')'; }
+    if (summaryEl) summaryEl.textContent = 'Coins OK: ' + (d.coins_passed || 0) + '/' + coins.length + ' | Rows: ' + (d.total_clean_rows || 0);
+  });
+} ─── */
 function toggleTrading() {
   if (tradingToggleInProgress) return;
   tradingToggleInProgress = true;
@@ -1679,11 +1735,13 @@ function updateModelHealth() {
     for (var key in models) {
       var m   = models[key];
       var acc = m.loaded ? (m.accuracy * 100).toFixed(1) + '%' : 'N/A';
-      // Threshold 0.40: random baseline for 3-class is 33%, meaningful signal starts at ~40%
       var cls = (m.loaded && m.accuracy >= 0.40) ? 'good' : 'warn';
       var trainedAt = m.trained_at ? escapeHtml(m.trained_at.slice(0, 10)) : '—';
-      h += "<div class='model-cell'>" +
-        "<div class='model-name'>" + escapeHtml(names[key] || key) + "</div>" +
+      var badge = m.in_ensemble
+        ? "<span class='panel-badge' style='font-size:8px;color:#10b981;border-color:rgba(16,185,129,0.3)'>ACTIVE " + (m.weight * 100).toFixed(0) + "%</span>"
+        : "<span class='panel-badge' style='font-size:8px;color:#64748b;border-color:rgba(100,116,139,0.3)'>ARCHIVED</span>";
+      h += "<div class='model-cell'" + (m.in_ensemble ? '' : " style='opacity:0.55'") + ">" +
+        "<div class='model-name'>" + escapeHtml(names[key] || key) + " " + badge + "</div>" +
         "<div class='model-accuracy " + cls + "'>" + acc + "</div>" +
         "<div class='model-date'>" + trainedAt + "</div>" +
         "</div>";
@@ -1700,18 +1758,20 @@ function updateHealth() {
     var el = document.getElementById('healthGrid');
     if (!r || !el) return;
     var items = [
-      { l: 'Bot Process',   ok: r.bot_running,               v: (r.bot_instances || 0) + ' running' },
-      { l: 'Dashboard',     ok: r.dash_running,               v: 'Running' },
-      { l: 'RF Model',      ok: r.rf_model,                   v: r.rf_model   ? 'Loaded' : 'MISSING' },
-      { l: 'LightGBM',      ok: r.xgb_model,                  v: r.xgb_model  ? 'Loaded' : 'MISSING' },
-      { l: 'LSTM',          ok: r.lstm_model,                  v: r.lstm_model ? 'Loaded' : 'MISSING' },
-      { l: 'Signal Age',    ok: (r.signal_age || 9999) < 120, v: (r.signal_age || 0) + 's' },
-      { l: 'Spot Open',     ok: true,                          v: r.spot_open     || 0 },
-      { l: 'Futures Open',  ok: true,                          v: r.futures_open  || 0 },
-      { l: 'Closed Trades', ok: true,                          v: r.closed_trades || 0 },
-      { l: 'Total PnL',     ok: (r.total_pnl || 0) >= 0,      v: '$' + (r.total_pnl || 0).toFixed(4) },
-      { l: 'Self Learning', ok: (r.reviews || 0) > 0,         v: (r.reviews || 0) + ' reviews' },
-      { l: 'Groq Tokens',   ok: (r.token_usage_pct || 0) < 80, v: (r.token_usage_pct || 0).toFixed(1) + '%' },
+      { l: 'Bot Process',    ok: r.bot_running,                v: (r.bot_instances || 0) + ' running' },
+      { l: 'Exchange',       ok: (r.exchange_mode || 'demo') === 'demo' || r.exchange_mode === 'live',
+                               v: (r.exchange_mode || 'demo').toUpperCase() },
+      { l: 'Training Data',  ok: (r.training_source || '').indexOf('api.binance') >= 0,
+                               v: 'api.binance.com' },
+      { l: 'Ensemble v4',    ok: r.ensemble_v4,                 v: r.ensemble_v4 ? '3-model vote' : 'Legacy' },
+      { l: 'LSTM Status',    ok: r.lstm_archived,               v: r.lstm_archived ? 'Archived' : 'Active' },
+      { l: 'Signal Age',     ok: (r.signal_age || 9999) < 120,  v: (r.signal_age || 0) + 's' },
+      { l: 'Spot Open',      ok: true,                           v: r.spot_open     || 0 },
+      { l: 'Futures Open',   ok: true,                           v: r.futures_open  || 0 },
+      { l: 'Closed Trades',  ok: true,                           v: r.closed_trades || 0 },
+      { l: 'Total PnL',      ok: (r.total_pnl || 0) >= 0,       v: '$' + (r.total_pnl || 0).toFixed(4) },
+      { l: 'Self Learning',  ok: (r.reviews || 0) > 0,          v: (r.reviews || 0) + ' reviews' },
+      { l: 'Dashboard',      ok: r.dash_running,                 v: 'Running' },
     ];
     var h = '';
     for (var i = 0; i < items.length; i++) {
@@ -1762,6 +1822,8 @@ function refresh() {
   updateStatus();
   updateModelHealth();
   updateHealth();
+  updateTrainingData();
+  updateExchangeMode();
   loadMode();
   loadStrategyConfig();
   // Only poll retrain status if no dedicated poll interval running

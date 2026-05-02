@@ -1177,128 +1177,89 @@ class AIStrategyEngine:
         return h
 
     def predict(self, df, symbol, regime: str = "RANGING"):
+        """
+        v4: 3-model confidence-weighted vote (LSTM + MetaModel archived).
+        LSTM and Meta still train but are NOT used in prediction.
+        Decision: weighted buy/sell score with regime multiplier.
+        """
         rf_p   = self.rf.predict(df)
         lgbm_p = self.lgbm.predict(df)
 
-        # MC Dropout for LSTM: use mc result when available, fall back to regular
-        lstm_mc = self.lstm.predict_mc(df)
-        lstm_p  = lstm_mc if lstm_mc is not None else self.lstm.predict(df)
-        lstm_uncertainty = lstm_mc["uncertainty"] if lstm_mc is not None else 0.0
-
-        # TFT: MC Dropout when trained
         if self.tft is not None and self.tft.is_trained:
-            tft_mc = self.tft.predict_mc(df)
-            tft_p  = tft_mc if tft_mc is not None else self.tft.predict(df)
-            tft_uncertainty = tft_mc["uncertainty"] if tft_mc is not None else 0.0
+            tft_p = self.tft.predict(df)
         elif self.tft is not None:
-            tft_p           = self.tft.predict(df)
-            tft_uncertainty = 0.0
+            tft_p = self.tft.predict(df)
         else:
-            tft_p           = None
-            tft_uncertainty = 0.0
+            tft_p = None
 
-        # Ensemble variance — disagreement between model families (epistemic uncertainty)
-        all_probs = [rf_p["probs"], lgbm_p["probs"], lstm_p["probs"]]
+        buy_score, sell_score = 0.0, 0.0
+        for action, conf, weight in [
+            (lgbm_p["action"], lgbm_p["confidence"], 0.50),
+            (rf_p["action"],   rf_p["confidence"],   0.35),
+        ]:
+            if action == "BUY":
+                buy_score += conf * weight
+            elif action == "SELL":
+                sell_score += conf * weight
+
         if tft_p is not None:
-            all_probs.append(tft_p["probs"])
-        ensemble_var = float(np.var(np.array(all_probs, dtype=float), axis=0).mean())
+            tft_w = 0.15
+            if tft_p["action"] == "BUY":
+                buy_score += tft_p["confidence"] * tft_w
+            elif tft_p["action"] == "SELL":
+                sell_score += tft_p["confidence"] * tft_w
 
-        # MC uncertainty: mean over available MC components only
-        mc_vals = [v for v in [lstm_uncertainty, tft_uncertainty] if v > 0]
-        mc_uncertainty = float(np.mean(mc_vals)) if mc_vals else 0.0
+        if regime == "TRENDING":
+            buy_score *= 1.2
+            sell_score *= 1.2
+        elif regime == "RANGING":
+            buy_score *= 0.8
+            sell_score *= 0.8
 
-        # Combined = max(ensemble_var, mc_uncertainty) — worst signal wins, no dilution
-        combined_uncertainty = max(ensemble_var, mc_uncertainty)
-
-        # Context features for last bar (tail ensures rolling window is stable)
-        tail = df.tail(30)
-        ctx_vol, ctx_trend, ctx_vratio = self._compute_context_features(tail)
-
-        def _safe(arr, default=0.0):
-            v = float(arr[-1])
-            return default if (np.isnan(v) or np.isinf(v)) else v
-
-        # Only pass TFT probs when TFT is actually trained (avoids scaler dimension mismatch)
-        tft_probs_for_meta = (
-            tft_p["probs"]
-            if (self.tft is not None and self.tft.is_trained and tft_p is not None)
-            else None
-        )
-        meta_result = self.meta.predict_single(
-            rf_probs       = rf_p["probs"],
-            lgbm_probs     = lgbm_p["probs"],
-            lstm_probs     = lstm_p["probs"],
-            volatility     = _safe(ctx_vol),
-            trend_strength = _safe(ctx_trend),
-            vol_ratio      = _safe(ctx_vratio, default=1.0),
-            tft_probs      = tft_probs_for_meta,
-        )
-
-        # Bypass meta if it's performing worse than base models
-        meta_acc = self.meta.metadata.get("accuracy", 0)
-        if meta_result is not None and meta_acc < 0.50:
-            log.debug(
-                f"Meta bypass: accuracy={meta_acc:.2%} < 50% — "
-                f"using weighted ensemble instead"
-            )
-            meta_result = None
-
-        tft_tag = f"+TFT:{tft_p['action']}" if tft_p is not None else ""
-
-        if meta_result is not None:
-            action = meta_result["action"]
-            conf   = meta_result["confidence"]
-            avg    = np.array(meta_result["probs"])
-            strat  = (f"META+RF:{rf_p['action']}+LGBM:{lgbm_p['action']}"
-                      f"+LSTM:{lstm_p['action']}{tft_tag}")
+        net = buy_score - sell_score
+        if net > 0.15:
+            action = "BUY"
+            conf = min(abs(net) * 1.5, 0.92)
+        elif net < -0.15:
+            action = "SELL"
+            conf = min(abs(net) * 1.5, 0.92)
         else:
-            # Fallback: dynamic weighted ensemble (original logic)
-            W   = self._get_dynamic_weights()
-            avg = (np.array(rf_p["probs"])   * W["rf"] +
-                   np.array(lgbm_p["probs"]) * W["lgbm"] +
-                   np.array(lstm_p["probs"]) * W["lstm"])
-            if tft_p is not None:
-                # Step 4: regime-aware TFT weight — higher in trending markets
-                tft_w = 0.35 if regime == "TRENDING" else 0.15
-                avg   = avg * (1.0 - tft_w) + np.array(tft_p["probs"]) * tft_w
-            avg   /= avg.sum()
-            label  = int(np.argmax(avg))
-            conf   = float(avg[label])
-            action = {0:"SELL",1:"HOLD",2:"BUY"}[label] if conf >= 0.40 else "HOLD"
-            strat  = (f"ENS+RF:{rf_p['action']}+LGBM:{lgbm_p['action']}"
-                      f"+LSTM:{lstm_p['action']}{tft_tag}")
-
-        # Safety gate: require ≥2 base models to agree
-        base_actions = [rf_p["action"], lgbm_p["action"], lstm_p["action"]]
-        if tft_p is not None:
-            base_actions.append(tft_p["action"])
-        buy_votes  = base_actions.count("BUY")
-        sell_votes = base_actions.count("SELL")
-        if action == "BUY"  and buy_votes  < 2: action = "HOLD"
-        if action == "SELL" and sell_votes < 2: action = "HOLD"
-
-        # Uncertainty gate: high disagreement / MC variance → HOLD
-        if combined_uncertainty > UNCERTAINTY_THRESHOLD and action != "HOLD":
-            log.debug(
-                f"{symbol} HOLD — uncertainty {combined_uncertainty:.4f} > "
-                f"{UNCERTAINTY_THRESHOLD} (ens_var={ensemble_var:.4f} mc={mc_uncertainty:.4f})"
-            )
             action = "HOLD"
-            strat  = f"UNCERTAIN({combined_uncertainty:.3f})+" + strat
+            conf = max(buy_score, sell_score) * 0.50
+
+        conf = round(float(conf), 4)
+
+        buy_votes = sum(
+            1 for a in [rf_p["action"], lgbm_p["action"]]
+            if a == "BUY"
+        ) + (1 if tft_p and tft_p["action"] == "BUY" else 0)
+        sell_votes = sum(
+            1 for a in [rf_p["action"], lgbm_p["action"]]
+            if a == "SELL"
+        ) + (1 if tft_p and tft_p["action"] == "SELL" else 0)
+
+        tft_tag = f"+TFT:{tft_p['action']}" if tft_p else ""
+        strat = (
+            f"v4+RF:{rf_p['action']}+LGBM:{lgbm_p['action']}"
+            f"{tft_tag}"
+        )
+
+        combined_uncertainty = 0.0
+        ensemble_var = 0.0
+        mc_uncertainty = 0.0
 
         ts = datetime.now(timezone.utc).isoformat()
 
-        # Step 7: buffer uncertainty entry for periodic disk flush
         self._unc_buffer.append({
-            "symbol":           symbol,
-            "timestamp":        ts,
-            "action":           action,
-            "confidence":       round(float(conf), 4),
-            "uncertainty":      round(combined_uncertainty, 4),
-            "ensemble_var":     round(ensemble_var, 4),
-            "mc_uncertainty":   round(mc_uncertainty, 4),
-            "gated":            combined_uncertainty > UNCERTAINTY_THRESHOLD,
-            "regime":           regime,
+            "symbol":      symbol,
+            "timestamp":   ts,
+            "action":      action,
+            "confidence":  conf,
+            "uncertainty": 0.0,
+            "ensemble_var": 0.0,
+            "mc_uncertainty": 0.0,
+            "gated":       False,
+            "regime":      regime,
         })
         if len(self._unc_buffer) >= 50:
             self._flush_uncertainty_log()
@@ -1306,26 +1267,22 @@ class AIStrategyEngine:
         return {
             "symbol":     symbol,
             "action":     action,
-            "confidence": round(float(conf), 4),
+            "confidence": conf,
             "strategy":   strat,
-            "timeframe":  "AI-v3",
+            "timeframe":  "AI-v4",
             "indicators": {
-                "rf_conf":            rf_p["confidence"],
-                "lgbm_conf":          lgbm_p["confidence"],
-                "lstm_conf":          lstm_p["confidence"],
-                "tft_conf":           tft_p["confidence"] if tft_p else None,
-                "rf_action":          rf_p["action"],
-                "lgbm_action":        lgbm_p["action"],
-                "lstm_action":        lstm_p["action"],
-                "tft_action":         tft_p["action"] if tft_p else None,
-                "buy_votes":          buy_votes,
-                "sell_votes":         sell_votes,
-                "avg_probs":          avg.tolist(),
-                "meta_used":          meta_result is not None,
-                "uncertainty":        round(combined_uncertainty, 4),
-                "ensemble_var":       round(ensemble_var, 4),
-                "mc_uncertainty":     round(mc_uncertainty, 4),
-                "uncertainty_gated":  combined_uncertainty > UNCERTAINTY_THRESHOLD,
+                "rf_conf":      rf_p["confidence"],
+                "lgbm_conf":    lgbm_p["confidence"],
+                "lstm_conf":    None,
+                "tft_conf":     tft_p["confidence"] if tft_p else None,
+                "rf_action":    rf_p["action"],
+                "lgbm_action":  lgbm_p["action"],
+                "lstm_action":  None,
+                "tft_action":   tft_p["action"] if tft_p else None,
+                "buy_votes":    buy_votes,
+                "sell_votes":   sell_votes,
+                "meta_used":    False,
+                "ensemble_v4":  True,
             },
             "timestamp": ts,
         }
@@ -1354,23 +1311,22 @@ class AIStrategyEngine:
 
     def incremental_update(self) -> dict:
         """
-        Incrementally retrain base models on rolling buffered data with decay weights.
-        Step 6 gates: requires 50+ closed trades AND 52%+ win rate before updating.
-        Triggered every OnlineBuffer.UPDATE_EVERY new bars.
+        v4: Lower gate — retrain every 30 trades unconditionally.
+        Champion/challenger already rejects worse models.
+        Only skip if catastrophically bad (<20% win rate, >20 trades).
         """
         if not self.online_buffer.should_update():
             return {"status": "skipped"}
 
-        # Step 6: safety gates — only retrain with sufficient proven performance
         total_trades = len(self.performance_log)
-        if total_trades < 50:
-            log.debug(f"Online learning skipped: {total_trades}/50 trades")
-            return {"status": "skipped", "reason": f"only {total_trades}/50 trades"}
+        if total_trades < 30:
+            log.debug(f"Online learning skipped: {total_trades}/30 trades")
+            return {"status": "skipped", "reason": f"only {total_trades}/30 trades"}
         wins     = sum(1 for t in self.performance_log if t.get("pnl", 0) > 0)
-        win_rate = wins / total_trades
-        if win_rate < 0.52:
-            log.debug(f"Online learning skipped: win_rate {win_rate:.2%} < 52%")
-            return {"status": "skipped", "reason": f"win_rate {win_rate:.2%} < 52%"}
+        win_rate = wins / total_trades if total_trades else 0
+        if total_trades >= 20 and win_rate < 0.20:
+            log.warning(f"Online learning blocked: catastrophic win rate {win_rate:.1%} (<20%)")
+            return {"status": "skipped", "reason": f"catastrophic win_rate {win_rate:.1%}"}
 
         combined = self.online_buffer.get_combined()
         if combined is None:

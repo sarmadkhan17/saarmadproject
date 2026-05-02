@@ -412,6 +412,7 @@ class RiskManager:
 
     def check_exits(self, open_trades, get_price_fn, get_atr_fn):
         exits = []
+        now = datetime.now(timezone.utc) if hasattr(self, 'tp_atr_mult') else None
         for trade in open_trades:
             price = get_price_fn(trade["symbol"])
             if price is None or price <= 0:
@@ -420,6 +421,26 @@ class RiskManager:
             trade_id = trade["id"]
             side     = trade.get("side", "long")
             is_short = side in ("short", "sell")
+
+            stale_exit = False
+            if now:
+                try:
+                    opened = datetime.fromisoformat(trade.get("timestamp", ""))
+                    if opened.tzinfo is None:
+                        opened = opened.replace(tzinfo=timezone.utc)
+                    age_hours = (now - opened).total_seconds() / 3600
+                    if age_hours > 72:
+                        pnl_est = (price - entry) / entry * 100
+                        if is_short:
+                            pnl_est = -pnl_est
+                        if pnl_est < 0:
+                            stale_exit = True
+                except (ValueError, TypeError):
+                    pass
+
+            if stale_exit:
+                exits.append((trade, price, f"Stale exit (72h, loss)", 1.0))
+                continue
 
             atr = get_atr_fn(trade["symbol"])
             if atr > 0:
@@ -485,6 +506,28 @@ class RiskManager:
 
     def record_trade_result(self, pnl, balance):
         self.breaker.record_trade(pnl, balance)
+
+    def get_dynamic_min_conf(self, base_min_conf: float, recent_trades: list) -> float:
+        """
+        v4: Dynamically adjust min_confidence based on recent P&L trajectory.
+        Aggressive when winning, defensive when losing.
+        Returns adjusted min_conf clamped to [0.35, 0.65].
+        """
+        if len(recent_trades) < 10:
+            return base_min_conf
+        closed = [t for t in recent_trades if t.get("status") == "closed"]
+        if len(closed) < 5:
+            return base_min_conf
+        wins = sum(1 for t in closed if t.get("pnl", 0) > 0)
+        win_rate = wins / len(closed)
+        adj = 0.0
+        if win_rate > 0.60:
+            adj = -0.03
+        elif win_rate < 0.35:
+            adj = 0.05
+        elif win_rate < 0.45:
+            adj = 0.02
+        return round(max(0.35, min(0.65, base_min_conf + adj)), 4)
 
     def cleanup_trade(self, trade_id):
         self.trailing.cleanup(trade_id)

@@ -394,7 +394,7 @@ class AgentCoordinator:
         indicators = ml_signal.get("indicators", {})
         buy_votes  = indicators.get("buy_votes", 0)
         sell_votes = indicators.get("sell_votes", 0)
-        worth_ensemble = (buy_votes >= 2 or sell_votes >= 2) and ml_conf >= 0.50 and ml_action != "HOLD"
+        worth_ensemble = ml_action != "HOLD"
 
         if not worth_ensemble:
             log.info(

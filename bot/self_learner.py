@@ -157,8 +157,12 @@ JSON only:
         if perf["significant"]:
             improvements = self.ask_ai_for_improvements(perf)
             if improvements:
-                log.info(f"Insight: {improvements.get('key_insight','')}")
+                log.info(f"AI Insight: {improvements.get('key_insight','')}")
                 changes = self.apply_improvements(improvements)
+
+        # v4: Rule-based auto-tuning — applies regardless of AI availability
+        rule_changes = self._auto_tune_rules(perf, changes)
+        changes.extend(rule_changes)
 
         self.insights["total_reviews"] += 1
         self.insights["last_review"]    = datetime.now(timezone.utc).isoformat()
@@ -169,5 +173,78 @@ JSON only:
             "trades":    perf["total_trades"],
         })
         self.insights["performance_history"] = self.insights["performance_history"][-30:]
+        if changes:
+            self.insights.setdefault("adjustments", []).append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "changes": changes,
+            })
+            self.insights["adjustments"] = self.insights["adjustments"][-20:]
         self._save_insights()
         return {"performance": perf, "changes": changes}
+
+    def _auto_tune_rules(self, perf, existing_changes):
+        """
+        v4: Deterministic auto-tuning rules.
+        Applied regardless of Groq availability.
+        Only adjust if confidence hasn't been changed already this cycle.
+        """
+        changes = []
+        history = self.insights.get("performance_history", [])
+        if len(history) < 3:
+            return changes
+
+        recent_pnls = [h.get("total_pnl", 0) for h in history[-3:]]
+        consecutive_losses = all(p < 0 for p in recent_pnls)
+        if not consecutive_losses:
+            return changes
+
+        already_changed_conf = any("confidence" in c for c in existing_changes)
+        if not already_changed_conf:
+            try:
+                import yaml, fcntl
+                for cfg_file in ["config_futures.yaml"]:
+                    cfg_path = BOT_ROOT / cfg_file
+                    if not cfg_path.exists():
+                        continue
+                    with open(cfg_path) as f:
+                        config = yaml.safe_load(f)
+                    old = config["strategy"]["min_confidence"]
+                    new = round(min(old + 0.03, 0.65), 3)
+                    config["strategy"]["min_confidence"] = new
+                    tmp_path = cfg_path.with_suffix(".tmp.yaml")
+                    with open(tmp_path, "w") as f:
+                        fcntl.flock(f, fcntl.LOCK_EX)
+                        yaml.dump(config, f, default_flow_style=False)
+                        fcntl.flock(f, fcntl.LOCK_UN)
+                    tmp_path.replace(cfg_path)
+                    changes.append(f"{cfg_file}: auto confidence {old}→{new} (3× consecutive loss)")
+                    log.warning(f"Auto-tune: min_confidence {old}→{new} (3 consecutive negative reviews)")
+            except Exception as e:
+                log.warning(f"Auto-tune failed: {e}")
+
+        if perf["win_rate"] < 35 and perf["total_trades"] >= 10:
+            already_changed_stop = any("stop" in c for c in existing_changes)
+            if not already_changed_stop:
+                try:
+                    import yaml, fcntl
+                    for cfg_file in ["config_futures.yaml"]:
+                        cfg_path = BOT_ROOT / cfg_file
+                        if not cfg_path.exists():
+                            continue
+                        with open(cfg_path) as f:
+                            config = yaml.safe_load(f)
+                        old_sl = config["risk"]["stop_loss_atr_multiplier"]
+                        new_sl = round(min(old_sl + 0.5, 4.0), 1)
+                        config["risk"]["stop_loss_atr_multiplier"] = new_sl
+                        tmp_path = cfg_path.with_suffix(".tmp.yaml")
+                        with open(tmp_path, "w") as f:
+                            fcntl.flock(f, fcntl.LOCK_EX)
+                            yaml.dump(config, f, default_flow_style=False)
+                            fcntl.flock(f, fcntl.LOCK_UN)
+                        tmp_path.replace(cfg_path)
+                        changes.append(f"{cfg_file}: stop_loss {old_sl}→{new_sl} (win_rate {perf['win_rate']}%)")
+                        log.warning(f"Auto-tune: stop_loss {old_sl}→{new_sl} (low win rate {perf['win_rate']}%)")
+                except Exception as e:
+                    log.warning(f"Auto-tune SL failed: {e}")
+
+        return changes

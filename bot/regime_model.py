@@ -232,3 +232,37 @@ class HMMRegimeModel:
     def get_regime_and_adjustments(self, df) -> Tuple[str, Dict]:
         regime = self.predict(df)
         return regime, self.get_adjustments(regime)
+
+    def predict_fallback(self, df=None) -> Tuple[str, Dict]:
+        """
+        Rule-based fallback when HMM is untrained or BTC data is unavailable.
+        Uses ADX + volatility + EMA alignment on provided dataframe.
+        Falls back to 'RANGING' if no data.
+        """
+        if df is None or len(df) < 50:
+            return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()
+
+        try:
+            close = df["close"]
+            high = df["high"]
+            low = df["low"]
+
+            import ta
+            adx = ta.trend.ADXIndicator(high, low, close, 14).adx().iloc[-1]
+            ema9 = ta.trend.EMAIndicator(close, 9).ema_indicator().iloc[-1]
+            ema50 = ta.trend.EMAIndicator(close, 50).ema_indicator().iloc[-1]
+            ret = close.pct_change()
+            vol_ratio = ret.rolling(20).std().iloc[-1] / (ret.rolling(50).std().iloc[-1] + 1e-9)
+            price = close.iloc[-1]
+            ch_24 = (price - close.iloc[-96] if len(close) >= 96 else close.iloc[0]) / close.iloc[-96 if len(close) >= 96 else 0]
+
+            if ch_24 < -0.10:
+                return "CRASH", REGIME_ADJUSTMENTS["CRASH"].copy()
+            if vol_ratio > 2.0:
+                return "HIGH_VOL", REGIME_ADJUSTMENTS["HIGH_VOL"].copy()
+            if adx > 25 and ((price > ema9 > ema50) or (price < ema9 < ema50)):
+                return "TRENDING", REGIME_ADJUSTMENTS["TRENDING"].copy()
+            return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()
+
+        except Exception:
+            return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()

@@ -262,13 +262,13 @@ def logs():
 @app.route("/api/model_health")
 def model_health():
     models = {
-        "rf":   ("rf_model.pkl",    "rf_meta.json"),
-        "lgbm": ("lgbm_model.pkl",  "lgbm_meta.json"),
-        "lstm": ("lstm_model.keras","lstm_meta.json"),
-        "tft":  ("tft_model.pt",    "tft_meta.json"),
+        "rf":   ("rf_model.pkl",    "rf_meta.json",   0.35),
+        "lgbm": ("lgbm_model.pkl",  "lgbm_meta.json", 0.50),
+        "lstm": ("lstm_model.keras","lstm_meta.json", 0.00),
+        "tft":  ("tft_model.pt",    "tft_meta.json",  0.15),
     }
     result = {}
-    for name, (mf, meta_f) in models.items():
+    for name, (mf, meta_f, weight) in models.items():
         best_meta = {}
         loaded    = False
         for subdir in ["spot", "futures", ""]:
@@ -285,12 +285,16 @@ def model_health():
                             best_meta = m
                     except (json.JSONDecodeError, OSError):
                         pass
+        in_ensemble = weight > 0
         result[name] = {
-            "loaded":      loaded,
-            "accuracy":    best_meta.get("accuracy", 0),
-            "wf_accuracy": best_meta.get("wf_accuracy", 0),
-            "trained_at":  best_meta.get("trained_at", "never"),
-            "epochs":      best_meta.get("epochs", 0),
+            "loaded":       loaded,
+            "accuracy":     best_meta.get("accuracy", 0),
+            "wf_accuracy":  best_meta.get("wf_accuracy", 0),
+            "trained_at":   best_meta.get("trained_at", "never"),
+            "epochs":       best_meta.get("epochs", 0),
+            "in_ensemble":  in_ensemble,
+            "weight":       weight,
+            "status":       "active" if in_ensemble else "archived",
         }
     return jsonify(result)
 
@@ -325,6 +329,58 @@ def token_budget():
         except (json.JSONDecodeError, OSError):
             pass
     return jsonify({"used_today": 0, "limit": 90000})
+
+
+@app.route("/api/exchange_mode")
+def exchange_mode():
+    env_path = BOT_ROOT / ".env"
+    exec_mode = "demo"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                if line.startswith("BOT_EXECUTION_MODE="):
+                    exec_mode = line.split("=", 1)[1].strip().strip("\"'").lower()
+                    break
+    return jsonify({
+        "execution_mode": exec_mode,
+        "training_source": "api.binance.com (real, public)" if exec_mode == "demo" else "api.binance.com (live)",
+        "is_demo": exec_mode == "demo",
+    })
+
+
+@app.route("/api/training_data")
+def training_data():
+    try:
+        from data_feed import TrainingDataStore
+        manifest = TrainingDataStore.get_manifest()
+    except Exception:
+        manifest = {"coins": [], "status": "error"}
+    import yaml
+    cfg_path = BOT_ROOT / "config_futures.yaml"
+    min_bars = 3000
+    min_coins = 8
+    if cfg_path.exists():
+        try:
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            training_cfg = cfg.get("training", {})
+            min_bars = training_cfg.get("min_bars_per_coin", 3000)
+            min_coins = training_cfg.get("min_coins", 8)
+        except Exception:
+            pass
+    coins = manifest.get("coins", [])
+    good_coins = sum(1 for c in coins if c.get("bars", 0) >= min_bars)
+    total_rows = sum(c.get("bars", 0) for c in coins)
+    status = "good" if good_coins >= min_coins else ("degraded" if good_coins >= 2 else "critical")
+    return jsonify({
+        "coins": coins,
+        "total_clean_rows": total_rows,
+        "coins_passed": good_coins,
+        "min_required_bars": min_bars,
+        "min_required_coins": min_coins,
+        "status": status,
+        "source": "api.binance.com (real, public)",
+    })
 
 
 @app.route("/api/scanner")
@@ -406,22 +462,35 @@ def detailed_health():
     spot_open    = sum(1 for t in d["spot"].get("trades", []) if t.get("status") == "open")
     futures_open = sum(1 for t in d["futures"].get("trades", []) if t.get("status") == "open")
 
+    exec_mode = "demo"
+    env_path = BOT_ROOT / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                if line.startswith("BOT_EXECUTION_MODE="):
+                    exec_mode = line.split("=", 1)[1].strip().strip("\"'").lower()
+                    break
+
     return jsonify({
-        "bot_running":     len(bots) >= 1,
-        "bot_instances":   len(bots),
-        "dash_running":    len(dashes) >= 1,
-        "rf_model":        _model_exists("rf_model.pkl"),
-        "xgb_model":       _model_exists("lgbm_model.pkl"),
-        "lstm_model":      _model_exists("lstm_model.keras"),
-        "models_ok":       models_ok,
-        "signal_age":      sig_age,
-        "open_trades":     open_t,
-        "closed_trades":   closed,
-        "total_pnl":       round(pnl, 4),
-        "reviews":         reviews,
-        "token_usage_pct": token_pct,
-        "spot_open":       spot_open,
-        "futures_open":    futures_open,
+        "bot_running":      len(bots) >= 1,
+        "bot_instances":    len(bots),
+        "dash_running":     len(dashes) >= 1,
+        "rf_model":         _model_exists("rf_model.pkl"),
+        "xgb_model":        _model_exists("lgbm_model.pkl"),
+        "lstm_model":       _model_exists("lstm_model.keras"),
+        "models_ok":        models_ok,
+        "signal_age":       sig_age,
+        "open_trades":      open_t,
+        "closed_trades":    closed,
+        "total_pnl":        round(pnl, 4),
+        "reviews":          reviews,
+        "token_usage_pct":  token_pct,
+        "spot_open":        spot_open,
+        "futures_open":     futures_open,
+        "exchange_mode":    exec_mode,
+        "training_source":  "api.binance.com",
+        "ensemble_v4":      True,
+        "lstm_archived":    True,
     })
 
 
@@ -562,12 +631,16 @@ def get_strategy_config():
                     cfg = yaml.safe_load(f) or {}
                 strat = cfg.get("strategy", {})
                 ml    = cfg.get("ml", {})
+                train = cfg.get("training", {})
                 return jsonify({
-                    "forward_bars":    ml.get("forward_bars", 1),
-                    "timeframe":       ml.get("timeframe", "1h"),
-                    "min_confidence":  strat.get("min_confidence", 0.42),
-                    "min_votes":       strat.get("min_votes", 2),
-                    "htf_filter_mode": strat.get("htf_filter_mode", "strict"),
+                    "forward_bars":       ml.get("forward_bars", 1),
+                    "timeframe":          ml.get("timeframe", "1h"),
+                    "min_confidence":     strat.get("min_confidence", 0.42),
+                    "min_votes":          strat.get("min_votes", 2),
+                    "htf_filter_mode":    strat.get("htf_filter_mode", "strict"),
+                    "training_min_bars":  train.get("min_bars_per_coin", 3000),
+                    "training_min_coins": train.get("min_coins", 8),
+                    "dynamic_min_conf":   True,
                 })
             except (yaml.YAMLError, OSError):
                 pass
@@ -575,6 +648,8 @@ def get_strategy_config():
         "forward_bars": 1, "timeframe": "1h",
         "min_confidence": 0.42, "min_votes": 2,
         "htf_filter_mode": "strict",
+        "training_min_bars": 3000, "training_min_coins": 8,
+        "dynamic_min_conf": True,
     })
 
 
