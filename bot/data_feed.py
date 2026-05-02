@@ -123,6 +123,7 @@ class OHLCVCache:
     }
 
     def __init__(self):
+        self._lock  = threading.Lock()
         self._cache: Dict[str, object] = {}   # stores polars or pandas
         self._times: Dict[str, datetime] = {}
 
@@ -131,19 +132,22 @@ class OHLCVCache:
 
     def needs_refresh(self, symbol: str, tf: str) -> bool:
         key      = self._key(symbol, tf)
-        last     = self._times.get(key)
+        with self._lock:
+            last = self._times.get(key)
         interval = self.CANDLE_SECONDS.get(tf, 3600)
         if last is None:
             return True
         return (datetime.now(timezone.utc) - last).total_seconds() >= interval
 
     def get(self, symbol: str, tf: str):
-        return self._cache.get(self._key(symbol, tf))
+        with self._lock:
+            return self._cache.get(self._key(symbol, tf))
 
     def set(self, symbol: str, tf: str, df):
         key = self._key(symbol, tf)
-        self._cache[key] = df
-        self._times[key] = datetime.now(timezone.utc)
+        with self._lock:
+            self._cache[key] = df
+            self._times[key] = datetime.now(timezone.utc)
 
 
 # ── REST price polling (fallback when WS unavailable) ─────────────────────────
@@ -182,7 +186,7 @@ class PriceMonitor:
                     tickers = self.exchange.fetch_tickers(symbols)
                     with self._lock:
                         for sym, ticker in tickers.items():
-                            if ticker.get("last"):
+                            if ticker.get("last") is not None:
                                 self._prices[sym] = float(ticker["last"])
                 except Exception as e:
                     log.error(f"REST price poll error: {e}")
@@ -325,12 +329,12 @@ class DataFeed:
         # 1. WebSocket (lowest latency)
         if self.ws_feed is not None:
             price = self.ws_feed.get_price(symbol)
-            if price:
+            if price is not None:
                 return price
 
         # 2. REST polling fallback
         price = self.monitor.get_price(symbol)
-        if price:
+        if price is not None:
             return price
 
         # 3. Direct API call (final fallback)

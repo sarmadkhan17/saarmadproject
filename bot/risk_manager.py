@@ -414,7 +414,7 @@ class RiskManager:
         exits = []
         for trade in open_trades:
             price = get_price_fn(trade["symbol"])
-            if not price:
+            if price is None or price <= 0:
                 continue
             entry    = float(trade["price"])
             trade_id = trade["id"]
@@ -474,7 +474,11 @@ class RiskManager:
 
     def get_position_size(self, confidence, balance, price, df, recent_trades, regime_ctx=None, all_agree=False):
         regime = dict(regime_ctx) if regime_ctx else self.market_gate._neutral()
-        atr     = df["high"].sub(df["low"]).rolling(14).mean().iloc[-1]
+        high  = df["high"]
+        low   = df["low"]
+        close = df["close"]
+        tr    = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr   = tr.rolling(14).mean().iloc[-1]
         atr_pct = float(atr / (df["close"].iloc[-1] + 1e-9))
         log.info(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f}")
         return self.sizer.calculate(confidence, balance, price, atr_pct, regime, recent_trades, all_agree=all_agree)

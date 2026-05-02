@@ -164,12 +164,13 @@ class TFTStrategy:
             log.warning(f"TFT load failed: {e}")
             self.is_trained = False
 
-    def train(self, df):
+    def train(self, df, forward_bars: int = 1, timeframe: str = "15m",
+              min_confidence: float = 0.52, min_votes: int = 2):
         log.info("Training TFT...")
         try:
             from ai_strategy import make_features, make_labels, make_sequences
             feat   = make_features(df)
-            labels = make_labels(df).reindex(feat.index).dropna()
+            labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
 
             if len(feat) < self.SEQ_LEN + 200:
@@ -256,8 +257,18 @@ class TFTStrategy:
                 }
 
             stored_acc = self.metadata.get("test_accuracy", 0)
-            if self.is_trained and stored_acc > test_acc + 0.02:
+            stored_cfg = (
+                self.metadata.get("forward_bars"),
+                self.metadata.get("timeframe"),
+                self.metadata.get("min_confidence"),
+                self.metadata.get("min_votes"),
+            )
+            new_cfg = (forward_bars, timeframe, min_confidence, min_votes)
+            if stored_cfg == new_cfg and stored_acc > test_acc + 0.02:
                 log.warning(f"TFT new ({test_acc:.2%}) worse — keeping old")
+                return {"accuracy": stored_acc, "status": "kept_old"}
+            if stored_acc > test_acc + 0.08:
+                log.warning(f"TFT new ({test_acc:.2%}) catastrophic drop from {stored_acc:.2%} — keeping old")
                 return {"accuracy": stored_acc, "status": "kept_old"}
 
             torch.save({"state_dict": model.state_dict(), "n_features": self.n_features},
@@ -269,6 +280,10 @@ class TFTStrategy:
             self.metadata   = {
                 "accuracy":      round(float(test_acc), 4),
                 "test_accuracy": round(float(test_acc), 4),
+                "forward_bars":  forward_bars,
+                "timeframe":     timeframe,
+                "min_confidence": min_confidence,
+                "min_votes":     min_votes,
                 "trained_at":    datetime.now(timezone.utc).isoformat(),
                 "n_features":    self.n_features,
             }

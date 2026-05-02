@@ -10,7 +10,11 @@ import re
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from groq import Groq
+try:
+    from groq import Groq
+    _GROQ_AVAILABLE = True
+except ImportError:
+    _GROQ_AVAILABLE = False
 from env_config import get_groq_key, DATA_DIR, BOT_ROOT
 
 log  = logging.getLogger("SelfLearner")
@@ -22,7 +26,7 @@ class SelfLearner:
     REVIEW_HOURS = 2
 
     def __init__(self):
-        self.client   = Groq(api_key=get_groq_key())
+        self.client   = Groq(api_key=get_groq_key()) if _GROQ_AVAILABLE else None
         self.model    = "llama-3.1-8b-instant"
         self.insights = self._load_insights()
 
@@ -93,6 +97,8 @@ class SelfLearner:
 
 JSON only:
 {{"confidence_adjustment":-0.05_to_0.05,"stop_loss_adjustment":-0.005_to_0.005,"take_profit_adjustment":-0.01_to_0.01,"key_insight":"brief","should_retrain":true_or_false}}"""
+        if not self.client:
+            return {}
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
@@ -126,8 +132,13 @@ JSON only:
                 config["strategy"]["min_confidence"] = new
                 changed.append(f"{cfg_file}: confidence {old}→{new}")
 
-            with open(cfg_path, "w") as f:
+            import fcntl
+            tmp_path = cfg_path.with_suffix(".tmp.yaml")
+            with open(tmp_path, "w") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
                 yaml.dump(config, f, default_flow_style=False)
+                fcntl.flock(f, fcntl.LOCK_UN)
+            tmp_path.replace(cfg_path)
 
         return changed
 

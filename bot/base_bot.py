@@ -179,6 +179,8 @@ class StateManager:
                 self.state["stats"]["total_pnl"] += pnl
                 if pnl > 0:
                     self.state["stats"]["wins"] += 1
+                else:
+                    self.state["stats"]["losses"] += 1
                 break
         self.save()
 
@@ -208,6 +210,7 @@ class BaseBot:
     MODE = "spot"   # Override in subclass
 
     def __init__(self, config_file: str = "config.yaml", log_file: str = "bot.log"):
+        self.config_file = config_file
         cfg_path = BOT_ROOT / config_file
         with open(cfg_path) as f:
             self.config = yaml.safe_load(f)
@@ -269,7 +272,26 @@ class BaseBot:
         """Override in subclass. Spot=simple, Futures=leveraged."""
         raise NotImplementedError
 
+    def _reload_config(self):
+        """Reload strategy config from YAML. Called before each retrain so dashboard changes apply."""
+        try:
+            cfg_path = BOT_ROOT / self.config_file
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    self.config = yaml.safe_load(f)
+                risk = self.config.get("risk", {})
+                strat = self.config.get("strategy", {})
+                self.min_conf = strat.get("min_confidence", self.min_conf)
+                self.htf_filter_mode = strat.get("htf_filter_mode", self.htf_filter_mode)
+                self.scan_interval = self.config.get("bot", {}).get("scan_interval_seconds", self.scan_interval)
+                self.max_open = risk.get("max_open_trades", self.max_open)
+                self.log.info(f"Config reloaded: min_conf={self.min_conf}, htf={self.htf_filter_mode}, max_open={self.max_open}")
+        except Exception as e:
+            self.log.warning(f"Config reload failed: {e}")
+
     def _train(self):
+        # Reload config before training so dashboard changes take effect
+        self._reload_config()
         self.log.info("=" * 50)
         self.log.info(f"TRAINING AI MODELS [{self.MODE.upper()} MODE]...")
         self.log.info("=" * 50)
@@ -283,21 +305,22 @@ class BaseBot:
                 for c in self.scanner.top_coins[:4]:
                     if c not in train_symbols:
                         train_symbols.append(c)
+            tf = self.config.get("ml", {}).get("timeframe") or self.config.get("scanner", {}).get("timeframe", "15m")
             raw_dfs = []
             btc_limit = 10000
             alt_limit = 5000
             for sym in train_symbols:
                 try:
                     limit = btc_limit if sym == "BTC/USDT" else alt_limit
-                    df = self.feed.fetch_ohlcv(sym, "1h", limit=limit)
+                    df = self.feed.fetch_ohlcv(sym, tf, limit=limit)
                     if df is not None and len(df) > 100:
                         raw_dfs.append(df)
-                        self.log.info(f"Training data: {sym} ({len(df)} bars)")
+                        self.log.info(f"Training data: {sym} ({len(df)} bars @ {tf})")
                 except Exception as e:
                     self.log.warning(f"Could not fetch {sym}: {e}")
             if not raw_dfs:
                 self.log.warning("No training data — using BTC fallback")
-                df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=btc_limit)
+                df = self.feed.fetch_ohlcv("BTC/USDT", tf, limit=btc_limit)
                 if df is not None:
                     raw_dfs = [df]
             if not raw_dfs:
@@ -309,7 +332,10 @@ class BaseBot:
             from ai_strategy import make_features, make_labels, AIStrategyEngine
             feat_parts, label_parts = [], []
             ctx_vol_parts, ctx_trend_parts, ctx_vratio_parts = [], [], []
-            fb = self.config.get("ml", {}).get("forward_bars", 3)
+            fb = self.config.get("ml", {}).get("forward_bars", 1)
+            tf = self.config.get("ml", {}).get("timeframe") or self.config.get("scanner", {}).get("timeframe", "15m")
+            mc = self.config.get("strategy", {}).get("min_confidence", 0.52)
+            mv = self.config.get("strategy", {}).get("min_votes", 2)
             for sym_df in raw_dfs:
                 try:
                     sym_reset = sym_df.reset_index(drop=True)
@@ -348,6 +374,10 @@ class BaseBot:
                 labels_s=combined_labels,
                 ctx_arrays=combined_ctx,
                 btc_rows=btc_rows,
+                forward_bars=fb,
+                timeframe=tf,
+                min_confidence=mc,
+                min_votes=mv,
             )
             self.log.info(f"Training complete: {results}")
             self._check_model_health(results)
@@ -436,11 +466,13 @@ class BaseBot:
         return price or 0.0
 
     def get_atr(self, symbol) -> float:
-        return self.feed.get_atr(symbol, "1h", 14)
+        tf = self.config.get("scanner", {}).get("timeframe", "15m")
+        return self.feed.get_atr(symbol, tf, 14)
 
-    def _get_btc_1h_return(self) -> float:
+    def _get_btc_return(self) -> float:
+        tf = self.config.get("scanner", {}).get("timeframe", "15m")
         try:
-            df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=3)
+            df = self.feed.fetch_ohlcv("BTC/USDT", tf, limit=3)
             if df is not None and len(df) >= 2:
                 return float(df["close"].pct_change().iloc[-1])
         except Exception:
@@ -527,12 +559,13 @@ class BaseBot:
         regime  = (regime_ctx or {}).get("hmm_regime", "RANGING")
         balance = self.get_usdt_balance()
 
-        # 1h price for momentum context (use BTC as proxy for market direction)
-        price_1h_ago = 0.0
+        # Price for momentum context (use BTC as proxy for market direction)
+        price_ago = 0.0
         try:
-            btc_df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=3)
+            tf = self.config.get("scanner", {}).get("timeframe", "15m")
+            btc_df = self.feed.fetch_ohlcv("BTC/USDT", tf, limit=3)
             if btc_df is not None and len(btc_df) >= 2:
-                price_1h_ago = float(btc_df["close"].iloc[-2])
+                price_ago = float(btc_df["close"].iloc[-2])
         except Exception:
             pass
 
@@ -557,7 +590,7 @@ class BaseBot:
                     current_price = current_price,
                     atr           = atr,
                     regime        = regime,
-                    price_1h_ago  = price_1h_ago,
+                    price_ago  = price_ago,
                 )
 
                 if action == "HOLD":
@@ -615,20 +648,25 @@ class BaseBot:
         IDENTICAL logic for spot and futures; subclasses only differ at order placement.
         """
         try:
-            dfs = self.feed.fetch_multi_timeframe(symbol)
-            if not dfs or "1h" not in dfs:
+            tf = (self.config.get("ml", {}).get("timeframe")
+                  or self.config.get("scanner", {}).get("timeframe", "15m"))
+            multi_tfs = [("1h", 300), ("4h", 200), ("1d", 100)]
+            if tf not in [t[0] for t in multi_tfs]:
+                multi_tfs.insert(0, (tf, 500))
+            dfs = self.feed.fetch_multi_timeframe(symbol, timeframes=multi_tfs)
+            if not dfs or tf not in dfs:
                 return
 
-            df_1h = dfs["1h"]
-            self.ai.ingest_new_data(symbol, df_1h)
+            df_tf = dfs[tf]
+            self.ai.ingest_new_data(symbol, df_tf)
 
             # ══ SIGNAL LAYER ═════════════════════════════════════════════════
             # ML models output direction + confidence; agent coordinator refines.
             hmm_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
-            ml_signal  = self.ai.predict(df_1h, symbol, regime=hmm_regime)
+            ml_signal  = self.ai.predict(df_tf, symbol, regime=hmm_regime)
             all_agree  = (ml_signal.get("indicators", {}).get("buy_votes", 0) == 3 or
                           ml_signal.get("indicators", {}).get("sell_votes", 0) == 3)
-            signal     = self.agents.analyze(symbol, df_1h, ml_signal)
+            signal     = self.agents.analyze(symbol, df_tf, ml_signal)
 
             action = signal["action"]
             conf   = signal["confidence"]
@@ -738,10 +776,11 @@ class BaseBot:
                     pass
 
             price = self.get_price(symbol)
-            if not price:
+            if price is None or price <= 0:
                 return
 
             # Step 10: Trade filters — require vol spike + ATR expansion before entry
+            df_1h = dfs.get("1h", df_tf)
             if not self._passes_trade_filters(df_1h, symbol):
                 return
 
@@ -787,7 +826,7 @@ class BaseBot:
                 sl_id = ""
                 if self.MODE == "futures":
                     atr = self.get_atr(symbol)
-                    side_for_sl = "buy" if action == "BUY" else "sell"
+                    side_for_sl = "long" if action == "BUY" else "short"
                     sl_id = self._place_exchange_stop_loss(
                         symbol, side_for_sl, amount, fill_price, atr
                     )
@@ -1105,7 +1144,7 @@ class BaseBot:
 
         regime_ctx = self.risk.detect_market_regime(self.feed, symbols)
 
-        btc_1h_return = self._get_btc_1h_return()
+        btc_1h_return = self._get_btc_return()
 
         # HMM overlay: adjusts thresholds only, never overrides signal direction
         try:

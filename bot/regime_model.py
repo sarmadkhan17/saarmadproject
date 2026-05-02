@@ -116,9 +116,11 @@ class HMMRegimeModel:
         covars = self.model.covars_   # (N, 2, 2) regardless of covariance_type in hmmlearn 0.3+
 
         # Variance of log-return (first feature) per state — safe for any covariance shape
-        try:
-            ret_var = np.array([float(covars[i][0, 0]) for i in range(self.N_STATES)])
-        except (IndexError, TypeError):
+        if covars.ndim == 3:
+            ret_var = np.array([float(covars[i, 0, 0]) for i in range(self.N_STATES)])
+        elif covars.ndim == 2:
+            ret_var = np.array([float(covars[i, 0]) for i in range(self.N_STATES)])
+        else:
             ret_var = np.ones(self.N_STATES)
 
         remaining = set(range(self.N_STATES))

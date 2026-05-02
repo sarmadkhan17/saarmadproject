@@ -39,7 +39,7 @@ class AgentPerformanceTracker:
         if agent not in self.data:
             self.data[agent] = {"correct": 0, "total": 0}
         self.data[agent]["total"] += 1
-        if (action == "BUY" and pnl > 0) or (action == "SELL" and pnl < 0):
+        if (action == "BUY" and pnl > 0) or (action == "SELL" and pnl > 0):
             self.data[agent]["correct"] += 1
         self._save()
 
@@ -86,7 +86,7 @@ class TokenBudgetManager:
 
     def can_call(self):
         self._load()
-        return self.used_today + self.COST_PER_CALL < self.DAILY_LIMIT
+        return self.used_today + self.COST_PER_CALL <= self.DAILY_LIMIT
 
     def record_call(self):
         self.used_today += self.COST_PER_CALL

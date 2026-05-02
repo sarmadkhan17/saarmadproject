@@ -8,7 +8,8 @@
       "Bash(awk '{print $5, $9}')",
       "Bash(sort -k2)",
       "Bash(ssh *)",
-      "Bash(rsync *)"
+      "Bash(rsync *)",
+      "Read(//home/sarmad/.ssh/**)"
     ]
   }
 }

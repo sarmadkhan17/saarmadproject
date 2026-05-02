@@ -1055,7 +1055,7 @@ td {
     <div class="strategy-config-grid">
       <div class="cfg-field">
         <label>Forward Bars</label>
-        <input type="number" id="cfgForwardBars" min="1" max="10" value="3">
+        <input type="number" id="cfgForwardBars" min="1" max="10" value="1">
         <small>Prediction horizon (1-10 bars)</small>
       </div>
       <div class="cfg-field">
@@ -1218,7 +1218,7 @@ function loadMode() {
 /* ─── STRATEGY CONFIG ─── */
 function loadStrategyConfig() {
   get('/api/strategy_config', function(d) {
-    document.getElementById('cfgForwardBars').value = d.forward_bars || 3;
+    document.getElementById('cfgForwardBars').value = d.forward_bars || 1;
     document.getElementById('cfgTimeframe').value = d.timeframe || '1h';
     document.getElementById('cfgMinConfidence').value = d.min_confidence || 0.42;
     document.getElementById('cfgMinVotes').value = d.min_votes || 2;

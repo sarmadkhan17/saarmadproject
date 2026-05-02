@@ -425,7 +425,7 @@ def detailed_health():
     })
 
 
-ENV_PATH = Path("/root/cryptobot_v3/.env")
+ENV_PATH = Path.home() / "cryptobot_v3" / ".env"
 SERVICE_PATH = Path("/etc/systemd/system/cryptobot-futures.service")
 
 
@@ -467,7 +467,7 @@ def _write_env_var(key, value):
 def _has_open_trades():
     """Check if there are any open trades in the current mode's state file."""
     mode = _read_env_var("BOT_MODE")
-    state_file = DATA / f"{mode}_state.json"
+    state_file = DATA / ("state.json" if mode == "spot" else f"{mode}_state.json")
     if not state_file.exists():
         return False
     try:
@@ -520,7 +520,7 @@ def set_mode():
 
     # Restart bot service
     try:
-        subprocess.run(["systemctl", "restart", "cryptobot-futures"], timeout=10)
+        subprocess.run(["systemctl", "restart", f"cryptobot-{mode}"], timeout=10)
     except Exception:
         pass
 
@@ -563,7 +563,7 @@ def get_strategy_config():
                 strat = cfg.get("strategy", {})
                 ml    = cfg.get("ml", {})
                 return jsonify({
-                    "forward_bars":    ml.get("forward_bars", 3),
+                    "forward_bars":    ml.get("forward_bars", 1),
                     "timeframe":       ml.get("timeframe", "1h"),
                     "min_confidence":  strat.get("min_confidence", 0.42),
                     "min_votes":       strat.get("min_votes", 2),
@@ -572,7 +572,7 @@ def get_strategy_config():
             except (yaml.YAMLError, OSError):
                 pass
     return jsonify({
-        "forward_bars": 3, "timeframe": "1h",
+        "forward_bars": 1, "timeframe": "1h",
         "min_confidence": 0.42, "min_votes": 2,
         "htf_filter_mode": "strict",
     })
@@ -587,28 +587,31 @@ def set_strategy_config():
     data = request.get_json(force=True) or {}
 
     # Input validation
-    if "forward_bars" in data:
-        v = int(data["forward_bars"])
-        if not (1 <= v <= 10):
-            return jsonify({"error": "forward_bars must be 1–10"}), 400
-        data["forward_bars"] = v
+    try:
+        if "forward_bars" in data:
+            v = int(data["forward_bars"])
+            if not (1 <= v <= 10):
+                return jsonify({"error": "forward_bars must be 1–10"}), 400
+            data["forward_bars"] = v
 
-    if "timeframe" in data:
-        if str(data["timeframe"]) not in VALID_TFS:
-            return jsonify({"error": f"timeframe must be one of {VALID_TFS}"}), 400
-        data["timeframe"] = str(data["timeframe"])
+        if "timeframe" in data:
+            if str(data["timeframe"]) not in VALID_TFS:
+                return jsonify({"error": f"timeframe must be one of {VALID_TFS}"}), 400
+            data["timeframe"] = str(data["timeframe"])
 
-    if "min_confidence" in data:
-        v = float(data["min_confidence"])
-        if not (0.30 <= v <= 0.95):
-            return jsonify({"error": "min_confidence must be 0.30–0.95"}), 400
-        data["min_confidence"] = round(v, 4)
+        if "min_confidence" in data:
+            v = float(data["min_confidence"])
+            if not (0.30 <= v <= 0.95):
+                return jsonify({"error": "min_confidence must be 0.30–0.95"}), 400
+            data["min_confidence"] = round(v, 4)
 
-    if "min_votes" in data:
-        v = int(data["min_votes"])
-        if not (1 <= v <= 3):
-            return jsonify({"error": "min_votes must be 1–3"}), 400
-        data["min_votes"] = v
+        if "min_votes" in data:
+            v = int(data["min_votes"])
+            if not (1 <= v <= 3):
+                return jsonify({"error": "min_votes must be 1–3"}), 400
+            data["min_votes"] = v
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Invalid value: {e}"}), 400
 
     saved = {}
     for cfg_path in (CFG_SPOT, CFG_FUT):
@@ -627,7 +630,7 @@ def set_strategy_config():
                 _write_config_safe(cfg_path, cfg)
                 # Return what was actually written
                 saved = {
-                    "forward_bars":    cfg.get("ml", {}).get("forward_bars", 3),
+                    "forward_bars":    cfg.get("ml", {}).get("forward_bars", 1),
                     "timeframe":       cfg.get("ml", {}).get("timeframe", "1h"),
                     "min_confidence":  cfg.get("strategy", {}).get("min_confidence", 0.42),
                     "min_votes":       cfg.get("strategy", {}).get("min_votes", 2),

@@ -1,0 +1,229 @@
+================================================================================
+                    CRYPTOBOT_v3 — COMPREHENSIVE BUG REPORT
+================================================================================
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL (2 bugs) — Runtime crashes or financial losses
+═══════════════════════════════════════════════════════════════════════════════
+
+1. [CRITICAL] base_bot.py:780,785 — df_1h undefined (NameError crash)
+   ─────────────────────────────────────────────────────────────────────────
+   _passes_trade_filters(df_1h, symbol) and get_position_size(..., df=df_1h, ...)
+   reference `df_1h` which is never extracted from the `dfs` dict returned by
+   fetch_multi_timeframe(). dfs contains keys like "1h", "4h", "1d" but no
+   variable df_1h is assigned. Every BUY/SELL entry signal crashes at the
+   filter/sizing step.
+   FIX: Add `df_1h = dfs.get("1h", df_tf)` before line 780.
+
+2. [CRITICAL] base_bot.py:825-827 | futures_bot.py:115 — Stop-loss side inversion
+   ─────────────────────────────────────────────────────────────────────────
+   side_for_sl = "buy" if action == "BUY" else "sell"  (line 825)
+   is passed to _place_exchange_stop_loss(), which checks `if side == "long"`
+   (futures_bot.py:115). Since "buy" != "long" and "sell" != "long", the else
+   branch ALWAYS runs, placing SL at entry_price + atr*mult.
+   For BUY (long) positions → SL placed ABOVE entry instead of below entry.
+   For SELL (short) positions → SL placed ABOVE entry (happens to be correct).
+   FIX: Change to side_for_sl = "long" if action == "BUY" else "short"
+        OR change _place_exchange_stop_loss to accept "buy"/"sell".
+
+═══════════════════════════════════════════════════════════════════════════════
+HIGH (5 bugs) — Data corruption, bot startup failure, wrong decisions
+═══════════════════════════════════════════════════════════════════════════════
+
+3. [HIGH] agents.py:42 — SELL accuracy tracking INVERTED
+   ─────────────────────────────────────────────────────────────────────────
+   if (action == "BUY" and pnl > 0) or (action == "SELL" and pnl < 0):
+       self.data[agent]["correct"] += 1
+   A winning SELL (short profit, pnl > 0 for short) counts as INCORRECT.
+   A losing SELL (pnl < 0) counts as CORRECT.
+   Over time, agents giving bad SELL signals appear to have HIGH accuracy,
+   corrupting the entire performance tracking and learning system.
+   FIX: Change pnl < 0 → pnl > 0 for SELL: `(action == "SELL" and pnl > 0)`
+
+4. [HIGH] self_learner.py:13 — Module-level groq import with NO try/except
+   ─────────────────────────────────────────────────────────────────────────
+   from groq import Groq  (line 13)
+   If the groq SDK is not installed (pip install groq), this crashes the
+   import chain: self_learner → base_bot → EVERYTHING. Both SpotBot and
+   FuturesBot fail to start. No fallback exists.
+   FIX: Wrap in try/except:
+        try: from groq import Groq; _GROQ_AVAILABLE = True
+        except: _GROQ_AVAILABLE = False
+
+5. [HIGH] notifier.py:285-297 — _check_open_trades() reads WRONG state file
+   ─────────────────────────────────────────────────────────────────────────
+   state_file = DATA / f"{mode}_state.json"
+   For spot mode → "spot_state.json" (which doesn't exist)
+   base_bot.py:230 stores spot state in "state.json" (no prefix)
+   _check_open_trades() ALWAYS returns False for spot → allows mode switching
+   even when spot trades are open → orphaned positions.
+   FIX: Map spot to "state.json": state_file = DATA / ("state.json" if mode == "spot" else f"{mode}_state.json")
+
+6. [HIGH] dashboard/server.py:467-479 — _has_open_trades() SAME bug
+   ─────────────────────────────────────────────────────────────────────────
+   Identical to bug #5 but in the dashboard. Also reads wrong file for spot.
+   Dashboard API /api/set_mode cannot detect open spot trades.
+
+7. [HIGH] notifier.py:577,591 — /restart and /stop always target cryptobot-futures
+   ─────────────────────────────────────────────────────────────────────────
+   subprocess.run(["systemctl", "restart", "cryptobot-futures"], timeout=10)
+   Hardcoded service name, ignores BOT_MODE. If bot is running in spot mode,
+   /restart and /stop affect the WRONG service.
+   Also: no Docker check (unlike /switch_spot which handles Docker via
+   _is_docker()). In Docker, systemctl doesn't exist → command fails silently.
+   FIX: Read BOT_MODE and use appropriate service name, or add Docker path.
+
+═══════════════════════════════════════════════════════════════════════════════
+MEDIUM (12 bugs) — Statistical errors, degraded learning, configuration issues
+═══════════════════════════════════════════════════════════════════════════════
+
+8. [MEDIUM] base_bot.py:174-183 — partial_close_trade() never increments losses
+   ─────────────────────────────────────────────────────────────────────────
+   if pnl > 0:
+       self.state["stats"]["wins"] += 1
+   break
+   No else branch. Partial closures that lose money are never counted,
+   skewing win-rate calculations for all downstream learning.
+   FIX: Add `else: self.state["stats"]["losses"] += 1` after line 181.
+
+9. [MEDIUM] base_bot.py:358-369 | ai_strategy.py:948-976 — Pre-computed context arrays DISCARDED
+   ─────────────────────────────────────────────────────────────────────────
+   _train() builds per-symbol context features (boundary-safe), passes them as
+   ctx_arrays to train_all(). train_all() ACCEPTS ctx_arrays but NEVER uses it.
+   _train_meta() at line 1130 recomputes context from concatenated DataFrame,
+   causing cross-coin EMA contamination at boundaries. Pre-computed arrays are
+   wasted computation and the boundary-safe version is lost.
+
+10. [MEDIUM] ai_strategy.py:356-368 (RF), 504-511 (LGBM), 662-675 (LSTM) — Dead code
+    ─────────────────────────────────────────────────────────────────────────
+    Champion/challenger logic has three sequential checks:
+    (1) Same config + 2% drop → keep old
+    (2) ANY 8% drop → keep old        ← catches everything >= 8%
+    (3) ANY 15% drop → keep old       ← UNREACHABLE (caught by check 2)
+    Check 3 (15% catastrophic floor for config changes) is dead code in all
+    three models. A 9% drop from config change is blocked by check 2, making
+    the intended 15% floor useless. Fix: reorder checks (15% first) or make
+    them mutually exclusive.
+
+11. [MEDIUM] rl_agent.py:290 — Regime context LOST in state transitions
+    ─────────────────────────────────────────────────────────────────────────
+    record_step() calls build_state(trade_ctx, next_price, next_atr) without
+    a regime parameter → defaults to "RANGING". trade_ctx is dict(trade) with
+    no regime info. RL agent always trains on "RANGING" regime, degrading
+    regime-dependent learning capabilities.
+    FIX: Store regime alongside the pending state tuple.
+
+12. [MEDIUM] risk_manager.py:477 — Simplified ATR (range-only, NOT True Range)
+    ─────────────────────────────────────────────────────────────────────────
+    atr = df["high"].sub(df["low"]).rolling(14).mean().iloc[-1]
+    Uses price range (high-low) only, ignoring overnight gaps.
+    DataFeed.get_atr() (data_feed.py:353) correctly computes True Range
+    including |high-prev_close| and |low-prev_close|. These two ATR values
+    disagree, causing position sizing to use a different volatility metric
+    than the trailing stop. Fix: use DataFeed.get_atr() or replicate TR calc.
+
+13. [MEDIUM] base_bot.py:649 vs dashboard/server.py:566,622 — Timeframe config mismatch
+    ─────────────────────────────────────────────────────────────────────────
+    Dashboard writes timeframe to config["ml"]["timeframe"].
+    _train() reads ml.timeframe (correct).
+    But analyze_symbol() reads self.config.get("scanner", {}).get("timeframe", "15m").
+    YAML configs have NO scanner.timeframe key → ALWAYS defaults to "15m".
+    Dashboard timeframe changes have NO EFFECT on live trading analysis.
+    Fix: Either read ml.timeframe in analyze_symbol() or sync both paths.
+
+14. [MEDIUM] notifier.py:299-335 — Dead code (duplicate method definitions)
+    ─────────────────────────────────────────────────────────────────────────
+    _cmd_switch_spot() defined at line 299 AND line 515.
+    _cmd_switch_futures() defined at line 318 AND line 542.
+    Second definitions override first. Lines 299-335 are dead code.
+    Fix: Remove first (non-Docker-aware) definitions.
+
+15. [MEDIUM] data_feed.py:125-147 — OHLCVCache missing thread safety
+    ─────────────────────────────────────────────────────────────────────────
+    _cache and _times dicts are read/written from multiple threads
+    (main bot + ThreadPoolExecutor workers in fetch_multi_timeframe).
+    get() + set() operations are NOT atomic → race condition on cache.
+    Fix: Add threading.Lock() to protect cache access.
+
+16. [MEDIUM] futures_bot.py:46-47 — Leverage setup BEFORE scanner has coins
+    ─────────────────────────────────────────────────────────────────────────
+    self._setup_leverage_for_symbols() called in __init__() after super().
+    scanner.get_coins() may trigger a full scan during construction. If scan
+    fails (first run, no cache), leverage isn't set for any symbols.
+    Fix: Move leverage setup to after first scan in run() or make it lazy.
+
+17. [MEDIUM] dashboard/server.py:428 — ENV_PATH hardcoded to /root/...
+    ─────────────────────────────────────────────────────────────────────────
+    ENV_PATH = Path("/root/cryptobot_v3/.env")
+    env_config.py uses BOT_ROOT = Path.home() / "cryptobot_v3".
+    Mismatch if running as non-root user → mode reading/writing silently fails.
+    Fix: Use BOT_ROOT / ".env" consistently.
+
+18. [MEDIUM] dashboard/server.py:523 — set_mode always restarts cryptobot-futures
+    ─────────────────────────────────────────────────────────────────────────
+    Same bug as #7 but in dashboard. subprocess.run(["systemctl", "restart",
+    "cryptobot-futures"]) is hardcoded, ignoring current BOT_MODE.
+
+19. [MEDIUM] notifier.py:507-542,569-594 — Docker detection inconsistency
+    ─────────────────────────────────────────────────────────────────────────
+    /switch_spot and /switch_futures check _is_docker() and handle gracefully.
+    /restart and /stop do NOT check Docker → systemctl commands fail silently
+    in containerized environments.
+
+═══════════════════════════════════════════════════════════════════════════════
+LOW (10 bugs) — Minor issues, edge cases, code quality
+═══════════════════════════════════════════════════════════════════════════════
+
+20. config_spot.yaml — Missing take_profit_atr_multiplier (present in futures)
+    spot config lacks the key. RiskManager falls back to default 2.5.
+
+21. ai_strategy.py:52 — import ta inside make_features() on hot path
+    Repeated import on every predict/training fold call. Move to module level.
+
+22. ai_strategy.py:107-108 — stoch.stoch() computed TWICE
+    f["stoch_k"] = stoch.stoch()
+    f["stoch_diff"] = stoch.stoch() - stoch.stoch_signal()
+    Doubles computation. Reuse the first call.
+
+23. ai_strategy.py:906-907 — Falsy check on n_meta_features
+    if self.metadata.get("n_meta_features") or getattr(self.model, "n_features_in_", None)
+    0 is falsy → treated as None. Should use `is not None` check.
+
+24. data_feed.py:188 — Falsy check on ticker price
+    if ticker.get("last") → treats valid price 0.0 as missing data.
+    Use `is not None` check.
+
+25. rl_agent.py:194-195 — Replay buffer saves only every 50 steps
+    Up to 49 transitions lost on crash. Save on every close or on shutdown.
+
+26. regime_model.py:115-120 — covars_ shape mismatch with covariance_type="diag"
+    With diag covariance, covars_ is (N, 2) not (N, 2, 2). covars[i][0,0] fails.
+    try/except returns np.ones(...) as fallback but silently degrades labeling.
+
+27. start.sh:32-34 — pkill regex patterns overly broad
+    pkill -f "cryptobot_v3.*launcher.py" could match backup paths.
+
+28. dashboard/server.py:591,602,608 — No try/except on input type conversions
+    int(data["forward_bars"]), float(data["min_confidence"]), int(data["min_votes"])
+    Non-numeric strings raise unhandled ValueError → 500 error instead of 400.
+
+29. self_learner.py:122-131 — Config writes WITHOUT file locking
+    Direct open(cfg_path, "w") without fcntl locking. Race condition with
+    dashboard /api/strategy_config which uses _write_config_safe() with locks.
+
+30. agents.py:89 — TokenBudgetManager uses strict < at limit
+    used_today + COST_PER_CALL < DAILY_LIMIT uses strict <, wastes ~200 tokens.
+    Use <=.
+
+================================================================================
+SUMMARY
+================================================================================
+CRITICAL: 2    | NameError crash (df_1h) + SL above entry for longs
+HIGH:     5    | Agent accuracy inverted, groq import crash, wrong state files,
+               | restart/stop targets wrong service
+MEDIUM:   12   | Loss tracking, context arrays discarded, dead 15% floor,
+               | regime lost in RL, ATR simplified, timeframe mismatch,
+               | thread-unsafe cache, duplicate dead code, hardcoded paths
+LOW:      10   | Missing config key, repeated imports/computation, falsy checks,
+               | buffer persistence, file locking races, validation gaps
+================================================================================

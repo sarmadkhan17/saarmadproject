@@ -12,6 +12,7 @@ import logging
 import shutil
 import warnings
 warnings.filterwarnings("ignore")
+import ta
 from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -49,7 +50,6 @@ UNCERTAINTY_THRESHOLD = 0.06  # combined uncertainty → force HOLD
 
 
 def make_features(df):
-    import ta
     close = df["close"]
     high  = df["high"]
     low   = df["low"]
@@ -104,8 +104,9 @@ def make_features(df):
     f["vol_spike"] = (f["vol_ratio"] > 2.0).astype(int)
 
     stoch = ta.momentum.StochasticOscillator(high, low, close)
-    f["stoch_k"]    = stoch.stoch()
-    f["stoch_diff"] = stoch.stoch() - stoch.stoch_signal()
+    stoch_k         = stoch.stoch()
+    f["stoch_k"]    = stoch_k
+    f["stoch_diff"] = stoch_k - stoch.stoch_signal()
 
     f["cci"]        = ta.trend.CCIIndicator(high, low, close, 20).cci() / 100
     f["williams_r"] = ta.momentum.WilliamsRIndicator(high, low, close, 14).williams_r() / 100
@@ -174,7 +175,7 @@ def make_features(df):
     return f.dropna()
 
 
-def make_labels(df, forward_bars=3, atr_multiplier=1.0):
+def make_labels(df, forward_bars=1, atr_multiplier=1.0):
     """
     ATR-based dynamic threshold labels.
     threshold = (ATR/close) * atr_multiplier, clipped [0.001, 0.02].
@@ -290,14 +291,16 @@ class RandomForestStrategy:
                 log.warning(f"RF load failed (will retrain): {e}")
                 self.is_trained = False
 
-    def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None):
+    def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None,
+              forward_bars: int = 1, timeframe: str = "15m",
+              min_confidence: float = 0.52, min_votes: int = 2):
         log.info("Training Random Forest (walk-forward)...")
         if feat_df is not None and labels_s is not None:
             feat   = feat_df
             labels = labels_s
         else:
             feat   = make_features(df)
-            labels = make_labels(df).reindex(feat.index).dropna()
+            labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
         if len(feat) < 300:
             return {"error": "need 300+ bars"}
@@ -342,10 +345,23 @@ class RandomForestStrategy:
         new_model.fit(Xtr, y[:split], sample_weight=sw_tr)
         new_acc = new_model.score(Xte, y[split:])
 
-        # Champion/challenger — only deploy if better
-        if self.is_trained and self.metadata.get("test_accuracy", 0) > new_acc + 0.02:
+        # Champion/challenger: same config → strict 2% tolerance; different config → 15% catastrophic floor
+        stored_acc = self.metadata.get("test_accuracy", 0)
+        stored_cfg = (
+            self.metadata.get("forward_bars"),
+            self.metadata.get("timeframe"),
+            self.metadata.get("min_confidence"),
+            self.metadata.get("min_votes"),
+        )
+        new_cfg = (forward_bars, timeframe, min_confidence, min_votes)
+        if stored_cfg == new_cfg and stored_acc > new_acc + 0.02:
             log.warning(f"RF new model ({new_acc:.2%}) worse — keeping old")
             self._load()  # restore in-memory state to match saved files
+            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "kept_old"}
+        # Catastrophic regression floor — reject regardless of config change
+        if self.is_trained and self.metadata.get("test_accuracy", 0) > new_acc + 0.15:
+            log.warning(f"RF new ({new_acc:.2%}) catastrophic drop from {self.metadata.get('test_accuracy',0):.2%} — keeping old")
+            self._load()
             return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "kept_old"}
 
         self.model      = new_model
@@ -354,6 +370,10 @@ class RandomForestStrategy:
             "accuracy":     round(new_acc, 4),
             "wf_accuracy":  round(float(wf_acc), 4),
             "test_accuracy":round(new_acc, 4),
+            "forward_bars": forward_bars,
+            "timeframe":    timeframe,
+            "min_confidence": min_confidence,
+            "min_votes":    min_votes,
             "trained_at":   datetime.now(timezone.utc).isoformat(),
             "n_samples":    len(X),
         }
@@ -410,14 +430,16 @@ class LightGBMStrategy:
                 log.warning(f"LightGBM load failed (will retrain): {e}")
                 self.is_trained = False
 
-    def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None):
+    def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None,
+              forward_bars: int = 1, timeframe: str = "15m",
+              min_confidence: float = 0.52, min_votes: int = 2):
         log.info("Training LightGBM (walk-forward)...")
         if feat_df is not None and labels_s is not None:
             feat   = feat_df
             labels = labels_s
         else:
             feat   = make_features(df)
-            labels = make_labels(df).reindex(feat.index).dropna()
+            labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
         if len(feat) < 300:
             return {"error": "need 300+ bars"}
@@ -467,7 +489,16 @@ class LightGBMStrategy:
                                  lgb.log_evaluation(period=-1)])
         new_acc = new_model.score(Xte, y[sp:])
 
-        if self.is_trained and self.metadata.get("test_accuracy", 0) > new_acc + 0.02:
+        # Champion/challenger: same config → strict 2% tolerance; different config → 15% catastrophic floor
+        stored_acc = self.metadata.get("test_accuracy", 0)
+        stored_cfg = (
+            self.metadata.get("forward_bars"),
+            self.metadata.get("timeframe"),
+            self.metadata.get("min_confidence"),
+            self.metadata.get("min_votes"),
+        )
+        new_cfg = (forward_bars, timeframe, min_confidence, min_votes)
+        if stored_cfg == new_cfg and stored_acc > new_acc + 0.02:
             log.warning(f"LightGBM new ({new_acc:.2%}) worse — keeping old")
             self._load()  # restore in-memory state to match saved files
             return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "kept_old"}
@@ -478,6 +509,10 @@ class LightGBMStrategy:
             "accuracy":      round(new_acc, 4),
             "wf_accuracy":   round(wf_acc, 4),
             "test_accuracy": round(new_acc, 4),
+            "forward_bars":  forward_bars,
+            "timeframe":     timeframe,
+            "min_confidence": min_confidence,
+            "min_votes":     min_votes,
             "trained_at":    datetime.now(timezone.utc).isoformat(),
             "n_samples":     len(X),
         }
@@ -561,10 +596,11 @@ class LSTMStrategy:
         except Exception as e:
             log.warning(f"LSTM backup failed: {e}")
 
-    def train(self, df):
+    def train(self, df, forward_bars: int = 1, timeframe: str = "15m",
+              min_confidence: float = 0.52, min_votes: int = 2):
         log.info("Training LSTM...")
         feat   = make_features(df)
-        labels = make_labels(df).reindex(feat.index).dropna()
+        labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
         feat   = feat.loc[labels.index]
         if len(feat) < self.SEQ_LEN + 200:
             return {"error": "need more data for LSTM"}
@@ -615,9 +651,16 @@ class LSTMStrategy:
                 "status":       "below_floor",
             }
 
-        # Champion/challenger: metadata is authoritative regardless of is_trained flag
+        # Champion/challenger: same config → strict 2% tolerance; different config → 15% catastrophic floor
         stored_acc = self.metadata.get("test_accuracy", 0)
-        if stored_acc > test_acc + 0.02:
+        stored_cfg = (
+            self.metadata.get("forward_bars"),
+            self.metadata.get("timeframe"),
+            self.metadata.get("min_confidence"),
+            self.metadata.get("min_votes"),
+        )
+        new_cfg = (forward_bars, timeframe, min_confidence, min_votes)
+        if stored_cfg == new_cfg and stored_acc > test_acc + 0.02:
             log.warning(f"LSTM new ({test_acc:.2%}) worse — keeping old")
             return {"accuracy": stored_acc, "status": "kept_old"}
 
@@ -640,6 +683,10 @@ class LSTMStrategy:
             "accuracy":     round(float(test_acc), 4),
             "test_accuracy": round(float(test_acc), 4),
             "epochs":       epochs_ran,
+            "forward_bars": forward_bars,
+            "timeframe":    timeframe,
+            "min_confidence": min_confidence,
+            "min_votes":    min_votes,
             "trained_at":   datetime.now(timezone.utc).isoformat(),
         }
         with open(self.meta_path, "w") as f:
@@ -770,7 +817,9 @@ class MetaModel:
                 log.warning(f"MetaModel load failed: {e}")
                 self.is_trained = False
 
-    def train(self, meta_X: np.ndarray, y: np.ndarray):
+    def train(self, meta_X: np.ndarray, y: np.ndarray,
+              forward_bars: int = 1, timeframe: str = "15m",
+              min_confidence: float = 0.52, min_votes: int = 2):
         """Train stacker on OOF meta-features + labels."""
         mask   = ~(np.isnan(meta_X).any(axis=1) | np.isinf(meta_X).any(axis=1))
         meta_X = meta_X[mask]
@@ -800,8 +849,15 @@ class MetaModel:
         new_acc = (new_model.score(X_sc[split:], y[split:])
                    if split < len(y) else new_model.score(X_sc, y))
 
-        if self.is_trained and self.metadata.get("accuracy", 0) > new_acc + 0.02:
+        if self.is_trained and self.metadata.get("accuracy", 0) > new_acc + 0.02 and \
+                (self.metadata.get("forward_bars"), self.metadata.get("timeframe"),
+                 self.metadata.get("min_confidence"), self.metadata.get("min_votes")) == \
+                (forward_bars, timeframe, min_confidence, min_votes):
             log.warning(f"MetaModel new ({new_acc:.2%}) worse — keeping old")
+            return {"accuracy": self.metadata.get("accuracy", 0), "status": "kept_old"}
+        # Catastrophic drop floor — reject regardless of config change
+        if self.is_trained and self.metadata.get("accuracy", 0) > new_acc + 0.08:
+            log.warning(f"MetaModel new ({new_acc:.2%}) catastrophic drop from {self.metadata.get('accuracy',0):.2%} — keeping old")
             return {"accuracy": self.metadata.get("accuracy", 0), "status": "kept_old"}
 
         self.model      = new_model
@@ -810,6 +866,10 @@ class MetaModel:
             "accuracy":        round(float(new_acc), 4),
             "n_samples":       int(len(y)),
             "n_meta_features": int(meta_X.shape[1]),
+            "forward_bars":    forward_bars,
+            "timeframe":       timeframe,
+            "min_confidence":  min_confidence,
+            "min_votes":       min_votes,
             "trained_at":      datetime.now(timezone.utc).isoformat(),
         }
         joblib.dump(self.model,  self.model_path)
@@ -833,8 +893,9 @@ class MetaModel:
 
             # Feature-count guard: use model's ground-truth n_features_in_ so stale
             # metadata (missing n_meta_features key) doesn't bypass the check.
-            expected = (self.metadata.get("n_meta_features")
-                        or getattr(self.model, "n_features_in_", None))
+            _meta_n  = self.metadata.get("n_meta_features")
+            expected = (_meta_n if _meta_n is not None
+                        else getattr(self.model, "n_features_in_", None))
             if expected is not None and row.shape[1] != expected:
                 log.warning(
                     f"MetaModel feature mismatch ({row.shape[1]} vs {expected}) "
@@ -875,15 +936,28 @@ class AIStrategyEngine:
             with open(p) as f:
                 self.performance_log = json.load(f)
 
-    def train_all(self, df, feat_df=None, labels_s=None, ctx_arrays=None, use_decay_weights: bool = False, btc_rows: int = 0):
+    def train_all(self, df, feat_df=None, labels_s=None, ctx_arrays=None,
+                  use_decay_weights: bool = False, btc_rows: int = 0,
+                  forward_bars: int = 1, timeframe: str = "15m",
+                  min_confidence: float = 0.52, min_votes: int = 2):
         r = {}
-        r["rf"]   = self.rf.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights)
-        r["lgbm"] = self.lgbm.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights)
+        r["rf"]   = self.rf.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights,
+                                   forward_bars=forward_bars, timeframe=timeframe,
+                                   min_confidence=min_confidence, min_votes=min_votes)
+        r["lgbm"] = self.lgbm.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights,
+                                     forward_bars=forward_bars, timeframe=timeframe,
+                                     min_confidence=min_confidence, min_votes=min_votes)
         lstm_data = df.iloc[:btc_rows] if btc_rows > 0 else df.iloc[:1000]
-        r["lstm"] = self.lstm.train(lstm_data)
+        r["lstm"] = self.lstm.train(lstm_data, forward_bars=forward_bars,
+                                     timeframe=timeframe, min_confidence=min_confidence,
+                                     min_votes=min_votes)
         if self.tft is not None:
-            r["tft"] = self.tft.train(lstm_data)
-        r["meta"] = self._train_meta(df)
+            r["tft"] = self.tft.train(lstm_data, forward_bars=forward_bars,
+                                       timeframe=timeframe, min_confidence=min_confidence,
+                                       min_votes=min_votes)
+        r["meta"] = self._train_meta(df, ctx_arrays=ctx_arrays,
+                                      forward_bars=forward_bars, timeframe=timeframe,
+                                      min_confidence=min_confidence, min_votes=min_votes)
         log.info(
             f"All models trained! RF={r['rf'].get('accuracy','?')} "
             f"LGBM={r['lgbm'].get('accuracy','?')} "
@@ -907,12 +981,14 @@ class AIStrategyEngine:
         vol_ratio      = vol.values / (vol_ma + 1e-9)
         return volatility, trend_strength, vol_ratio
 
-    def _train_meta(self, df):
+    def _train_meta(self, df, ctx_arrays=None,
+                    forward_bars: int = 1, timeframe: str = "15m",
+                    min_confidence: float = 0.52, min_votes: int = 2):
         """5-fold TimeSeriesSplit OOF — fresh base models per fold, no data leakage."""
         log.info("Training MetaModel (5-fold OOF, no leakage)...")
         try:
             feat   = make_features(df)
-            labels = make_labels(df).reindex(feat.index).dropna()
+            labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
             if len(feat) < 400:
                 log.warning("MetaModel OOF: need 400+ rows")
@@ -1043,7 +1119,10 @@ class AIStrategyEngine:
                     tft_probs = None
 
             # ── Context features ──────────────────────────────────────────────
-            ctx_vol, ctx_trend, ctx_vratio = self._compute_context_features(df_aligned)
+            if ctx_arrays is not None:
+                ctx_vol, ctx_trend, ctx_vratio = ctx_arrays
+            else:
+                ctx_vol, ctx_trend, ctx_vratio = self._compute_context_features(df_aligned)
             ctx_vol    = np.nan_to_num(ctx_vol)
             ctx_trend  = np.nan_to_num(ctx_trend)
             ctx_vratio = np.nan_to_num(ctx_vratio, nan=1.0)
@@ -1062,7 +1141,9 @@ class AIStrategyEngine:
             if n_valid < 50:
                 return {"error": f"too few OOF rows: {n_valid}"}
 
-            result = self.meta.train(meta_X[oof_mask], y[oof_mask])
+            result = self.meta.train(meta_X[oof_mask], y[oof_mask],
+                                     forward_bars=forward_bars, timeframe=timeframe,
+                                     min_confidence=min_confidence, min_votes=min_votes)
             log.info(f"MetaModel 5-fold OOF: {result}")
             return result
 

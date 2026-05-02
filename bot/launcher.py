@@ -47,6 +47,22 @@ def _send_telegram_alert(text: str):
         pass
 
 
+def _write_bot_mode_to_env(mode: str):
+    env_path = Path.home() / "cryptobot_v3" / ".env"
+    if not env_path.exists():
+        return
+    lines = env_path.read_text().splitlines(keepends=True)
+    found = False
+    for i, line in enumerate(lines):
+        if line.startswith("BOT_MODE="):
+            lines[i] = f'BOT_MODE="{mode}"\n'
+            found = True
+            break
+    if not found:
+        lines.append(f'BOT_MODE="{mode}"\n')
+    env_path.write_text("".join(lines))
+
+
 def _alert_crash(mode: str, error: str, crash_count: int):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     _send_telegram_alert(
@@ -91,6 +107,8 @@ def main():
         print("=" * 50)
         choice = input("  Enter choice (1 or 2): ").strip()
         mode = "futures" if choice == "2" else "spot"
+
+    _write_bot_mode_to_env(mode)
 
     restart_delay     = 30
     max_delay         = 300
