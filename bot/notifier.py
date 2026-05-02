@@ -5,6 +5,8 @@ Telegram Notifier v3
 - Commands: /status /agents /pnl /trades /health /help
 """
 
+import os
+import signal
 import requests
 import logging
 import json
@@ -439,9 +441,12 @@ class TelegramNotifier:
         except Exception as e:
             self.send(f"Health error: {e}")
 
+    @staticmethod
+    def _is_docker() -> bool:
+        return Path("/.dockerenv").exists()
+
     def _get_current_mode(self):
         """Detect current bot mode from running processes."""
-        import os
         # First check our own process environment (fastest path)
         env_mode = os.environ.get("BOT_MODE", "").lower()
         if env_mode in ("spot", "futures"):
@@ -480,6 +485,9 @@ class TelegramNotifier:
         self.send(f"{icons.get(mode, '⚪')} <b>Current Mode: {mode.upper()}</b>")
 
     def _cmd_switch_spot(self):
+        if self._is_docker():
+            self.send("ℹ️ <b>Docker mode</b>: both SPOT and FUTURES run as separate containers simultaneously.\nUse <code>docker compose stop futures-bot</code> on the server if you want only spot.")
+            return
         current = self._get_current_mode()
         if current == "spot":
             self.send("ℹ️ Already running in SPOT mode")
@@ -488,13 +496,11 @@ class TelegramNotifier:
         self.send("🔄 <b>Switching to SPOT mode...</b>\nThis will take ~30 seconds")
         try:
             home = str(Path.home())
-            # Stop futures bot — kill specific screen session to avoid affecting spot
             subprocess.run(["screen", "-S", "cryptobot_v3_futures", "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", "futures_bot.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
-            # Start spot bot
             subprocess.Popen([
                 "screen", "-dmS", "cryptobot_v3_spot",
                 "bash", "-c",
@@ -506,6 +512,9 @@ class TelegramNotifier:
             self.send(f"❌ Switch failed: {e}")
 
     def _cmd_switch_futures(self):
+        if self._is_docker():
+            self.send("ℹ️ <b>Docker mode</b>: both SPOT and FUTURES run as separate containers simultaneously.\nUse <code>docker compose stop spot-bot</code> on the server if you want only futures.")
+            return
         current = self._get_current_mode()
         if current == "futures":
             self.send("ℹ️ Already running in FUTURES mode")
@@ -514,13 +523,11 @@ class TelegramNotifier:
         self.send("🔄 <b>Switching to FUTURES mode...</b>\nThis will take ~30 seconds")
         try:
             home = str(Path.home())
-            # Stop spot bot — kill specific screen session to avoid affecting futures
             subprocess.run(["screen", "-S", "cryptobot_v3_spot", "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", "spot_bot.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
-            # Start futures bot
             subprocess.Popen([
                 "screen", "-dmS", "cryptobot_v3_futures",
                 "bash", "-c",
@@ -533,6 +540,15 @@ class TelegramNotifier:
 
     def _cmd_restart(self):
         current = self._get_current_mode()
+        if self._is_docker():
+            self.send(f"🔄 <b>Restarting {current.upper()} bot...</b>\nContainer will be back in ~10 seconds")
+            try:
+                time.sleep(1)
+                os.kill(os.getpid(), signal.SIGTERM)
+            except Exception as e:
+                self.send(f"❌ Restart failed: {e}")
+            return
+
         if current == "unknown":
             self.send("⚠️ No bot is running. Use /switch_spot or /switch_futures")
             return
@@ -541,7 +557,6 @@ class TelegramNotifier:
         try:
             home = str(Path.home())
             screen_name = f"cryptobot_v3_{current}"
-            # Kill specific screen session only
             subprocess.run(["screen", "-S", screen_name, "-X", "quit"], timeout=10)
             subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
             time.sleep(3)
@@ -559,6 +574,10 @@ class TelegramNotifier:
 
     def _cmd_stop(self):
         current = self._get_current_mode()
+        if self._is_docker():
+            self.send(f"⏹ <b>Docker mode</b>: to stop {current.upper()} bot run on server:\n<code>docker compose stop {current}-bot</code>\nTo stop all: <code>docker compose down</code>")
+            return
+
         if current == "unknown":
             self.send("ℹ️ Bot is not running")
             return

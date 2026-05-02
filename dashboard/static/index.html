@@ -673,6 +673,103 @@ td {
 .hv-warn    { color: var(--gold); }
 .hv-bad     { color: var(--red); }
 
+/* ─── STRATEGY CONFIG ─── */
+.strategy-config-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 20px;
+  padding: 20px;
+}
+
+.cfg-field { display: flex; flex-direction: column; }
+.cfg-field label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text2);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.cfg-field input,
+.cfg-field select {
+  background: #0a0e1a;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text1);
+  font-family: var(--mono);
+  font-size: 16px;
+  font-weight: 600;
+  padding: 12px 14px;
+  width: 100%;
+  box-sizing: border-box;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.cfg-field input:focus,
+.cfg-field select:focus { border-color: var(--blue); }
+.cfg-field small {
+  font-size: 10px;
+  color: var(--text2);
+  margin-top: 6px;
+  line-height: 1.3;
+}
+
+.cfg-actions {
+  display: flex;
+  gap: 12px;
+  padding: 0 20px 20px;
+  justify-content: flex-end;
+}
+
+.btn {
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 10px 20px;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+}
+.btn:hover { background: #5a9cf6; }
+.btn:active { transform: scale(0.97); }
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text2);
+}
+.btn-ghost:hover {
+  background: var(--border);
+  color: var(--text1);
+}
+
+.retrain-status {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-family: var(--mono);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.retrain-status .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text2);
+}
+.retrain-status .dot.idle { background: var(--text2); }
+.retrain-status .dot.running { background: var(--gold); animation: pulse 1.5s infinite; }
+.retrain-status .dot.completed { background: var(--green); }
+.retrain-status .dot.error { background: var(--red); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
 /* ─── LOGS ─── */
 .log-body {
   padding: 12px 16px;
@@ -964,6 +1061,47 @@ td {
     </div>
   </div>
 
+  <div class="section-label">Strategy Configuration</div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Live Strategy Parameters</span>
+      <span class="panel-badge">Editable</span>
+    </div>
+    <div class="strategy-config-grid">
+      <div class="cfg-field">
+        <label>Forward Bars</label>
+        <input type="number" id="cfgForwardBars" min="1" max="10" value="3">
+        <small>Prediction horizon (1-10 bars)</small>
+      </div>
+      <div class="cfg-field">
+        <label>Timeframe</label>
+        <select id="cfgTimeframe">
+          <option value="5m">5m</option>
+          <option value="15m">15m</option>
+          <option value="1h" selected>1h</option>
+          <option value="4h">4h</option>
+          <option value="1d">1d</option>
+        </select>
+        <small>Candle interval</small>
+      </div>
+      <div class="cfg-field">
+        <label>Min Confidence</label>
+        <input type="number" id="cfgMinConfidence" min="0.3" max="0.9" step="0.01" value="0.42">
+        <small>Threshold for trade entry (0.30-0.90)</small>
+      </div>
+      <div class="cfg-field">
+        <label>Min Model Votes</label>
+        <input type="number" id="cfgMinVotes" min="1" max="3" value="2">
+        <small>Required base model agreement (1-3)</small>
+      </div>
+    </div>
+    <div class="cfg-actions">
+      <button class="btn" id="btnSaveConfig" onclick="saveStrategyConfig()">Save, Apply & Retrain</button>
+      <button class="btn btn-ghost" onclick="loadStrategyConfig()">Reset to Saved</button>
+    </div>
+    <div class="retrain-status" id="retrainStatus"></div>
+  </div>
+
   <div class="section-label">System Logs</div>
   <div class="panel">
     <div class="panel-header">
@@ -1065,6 +1203,91 @@ function updateHtfButtons(mode) {
 
 function loadHtfMode() {
   get('/api/htf_mode', function(d) { updateHtfButtons(d.htf_filter_mode || 'strict'); });
+}
+
+/* ─── STRATEGY CONFIG ─── */
+function loadStrategyConfig() {
+  get('/api/strategy_config', function(d) {
+    document.getElementById('cfgForwardBars').value = d.forward_bars || 3;
+    document.getElementById('cfgTimeframe').value = d.timeframe || '1h';
+    document.getElementById('cfgMinConfidence').value = d.min_confidence || 0.42;
+    document.getElementById('cfgMinVotes').value = d.min_votes || 2;
+  });
+}
+
+function saveStrategyConfig() {
+  var payload = {
+    forward_bars: parseInt(document.getElementById('cfgForwardBars').value),
+    timeframe: document.getElementById('cfgTimeframe').value,
+    min_confidence: parseFloat(document.getElementById('cfgMinConfidence').value),
+    min_votes: parseInt(document.getElementById('cfgMinVotes').value)
+  };
+  var btn = document.getElementById('btnSaveConfig');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  fetch(API + '/api/strategy_config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      showNotif('Strategy config updated', 'ok');
+      return fetch(API + '/api/retrain', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: 'dashboard', reason: 'config_change' })
+      }).then(function(r) { return r.json(); });
+    })
+    .then(function(d) {
+      showNotif('Retraining started...', 'ok');
+      loadStrategyConfig();
+      pollRetrainStatus();
+    })
+    .catch(function() { showNotif('Failed to save config', 'err'); })
+    .finally(function() {
+      btn.disabled = false;
+      btn.textContent = 'Save, Apply & Retrain';
+    });
+}
+
+var retrainPollInterval = null;
+function pollRetrainStatus() {
+  if (retrainPollInterval) clearInterval(retrainPollInterval);
+  updateRetrainStatus();
+  retrainPollInterval = setInterval(updateRetrainStatus, 3000);
+  setTimeout(function() {
+    if (retrainPollInterval) {
+      clearInterval(retrainPollInterval);
+      retrainPollInterval = null;
+    }
+  }, 600000);
+}
+
+function updateRetrainStatus() {
+  get('/api/retrain_status', function(d) {
+    var el = document.getElementById('retrainStatus');
+    var status = d.status || 'idle';
+    var html = '<span class="dot ' + status + '"></span>';
+    if (status === 'idle') {
+      html += 'No retraining pending';
+    } else if (status === 'running') {
+      html += 'Retraining models... (' + (d.started ? new Date(d.started).toLocaleTimeString() : '') + ')';
+    } else if (status === 'completed') {
+      html += 'Retrain completed in ' + (d.duration_seconds || '?') + 's (' + (d.completed ? new Date(d.completed).toLocaleTimeString() : '') + ')';
+      if (retrainPollInterval) {
+        clearInterval(retrainPollInterval);
+        retrainPollInterval = null;
+      }
+    } else if (status === 'error') {
+      html += 'Retrain failed: ' + (d.error || 'unknown');
+      if (retrainPollInterval) {
+        clearInterval(retrainPollInterval);
+        retrainPollInterval = null;
+      }
+    }
+    el.innerHTML = html;
+  });
 }
 
 /* ─── CHART ─── */
@@ -1481,6 +1704,8 @@ function refresh() {
   updateModelHealth();
   updateHealth();
   loadHtfMode();
+  loadStrategyConfig();
+  updateRetrainStatus();
 }
 
 initChart();

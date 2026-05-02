@@ -9,10 +9,11 @@ logging:
   backup_count: 5
   max_bytes: 10485760
 ml:
-  forward_bars: 2
+  forward_bars: 4
   min_move: 0.002
   min_trades_to_learn: 10
   retrain_hours: 24
+  timeframe: 1h
 risk:
   max_consecutive_losses: 10
   max_daily_loss_pct: 0.05
@@ -34,5 +35,5 @@ scanner:
   top_n: 15
 strategy:
   htf_filter_mode: soft
-  min_confidence: 0.42
+  min_confidence: 0.55
   min_votes: 2

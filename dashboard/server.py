@@ -379,6 +379,78 @@ def start_trading():
     return jsonify({"status": "running"})
 
 
+@app.route("/api/strategy_config", methods=["GET"])
+def get_strategy_config():
+    cfg_path = CFG_FUT
+    if not cfg_path.exists():
+        cfg_path = CFG_SPOT
+    if not cfg_path.exists():
+        return jsonify({
+            "forward_bars": 3, "timeframe": "1h",
+            "min_confidence": 0.42, "min_votes": 2,
+            "htf_filter_mode": "soft",
+        })
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+    strat = cfg.get("strategy", {})
+    ml = cfg.get("ml", {})
+    return jsonify({
+        "forward_bars":   ml.get("forward_bars", 3),
+        "timeframe":      ml.get("timeframe", "1h"),
+        "min_confidence": strat.get("min_confidence", 0.42),
+        "min_votes":      strat.get("min_votes", 2),
+        "htf_filter_mode": strat.get("htf_filter_mode", "soft"),
+    })
+
+
+@app.route("/api/strategy_config", methods=["POST"])
+def set_strategy_config():
+    data = request.get_json(force=True)
+    for cfg_path in (CFG_SPOT, CFG_FUT):
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f)
+            if "forward_bars" in data:
+                cfg.setdefault("ml", {})["forward_bars"] = int(data["forward_bars"])
+            if "timeframe" in data:
+                cfg.setdefault("ml", {})["timeframe"] = str(data["timeframe"])
+            if "min_confidence" in data:
+                cfg.setdefault("strategy", {})["min_confidence"] = float(data["min_confidence"])
+            if "min_votes" in data:
+                cfg.setdefault("strategy", {})["min_votes"] = int(data["min_votes"])
+            with open(cfg_path, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, sort_keys=True)
+    p = DATA / "strategy_override.json"
+    p.parent.mkdir(exist_ok=True)
+    with open(p, "w") as f:
+        json.dump(data, f, indent=2)
+    return jsonify({"status": "ok", "config": data})
+
+
+@app.route("/api/retrain", methods=["POST"])
+def request_retrain():
+    data = request.get_json(force=True, silent=True) or {}
+    p = DATA / "retrain_requested.json"
+    p.parent.mkdir(exist_ok=True)
+    with open(p, "w") as f:
+        json.dump({
+            "requested": True,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": data.get("source", "dashboard"),
+            "reason": data.get("reason", "manual"),
+        }, f)
+    return jsonify({"status": "requested", "message": "Retrain signal sent to bot"})
+
+
+@app.route("/api/retrain_status", methods=["GET"])
+def get_retrain_status():
+    p = DATA / "retrain_status.json"
+    if p.exists():
+        with open(p) as f:
+            return jsonify(json.load(f))
+    return jsonify({"status": "idle"})
+
+
 @app.route("/")
 def index():
     from flask import make_response

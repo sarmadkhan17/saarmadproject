@@ -245,6 +245,8 @@ class BaseBot:
         self.rl_agent   = RLTradeManager()
         self.gnn_filter = GNNCorrelationFilter()
 
+        self._balance_cache: Optional[float] = None
+
         self._train()
 
     def _setup_exchange(self):
@@ -452,10 +454,11 @@ class BaseBot:
     def get_usdt_balance(self) -> float:
         try:
             bal = self.exchange.fetch_balance()
-            return float(bal["total"].get("USDT", 0.0))
+            value = float(bal["total"].get("USDT", 0.0))
+            return value
         except Exception as e:
             self.log.error(f"Balance error: {e}")
-            return 0.0
+            return self._balance_cache or 0.0
 
     def get_htf_bias(self, dfs) -> str:
         """Higher timeframe bias — prevents trading against major trend."""
@@ -1018,6 +1021,62 @@ class BaseBot:
         self._last_watchlist_hash = new_hash
         self._last_watchlist      = list(new_coins)
 
+    def _check_for_retrain_request(self):
+        """Check if dashboard requested a retrain via signal file."""
+        p = DATA_DIR / "retrain_requested.json"
+        if not p.exists():
+            return
+        try:
+            with open(p) as f:
+                req = json.load(f)
+            if not req.get("requested"):
+                return
+            self.log.info(f"Retrain request detected from {req.get('source', 'unknown')}: {req.get('reason', 'manual')}")
+            try:
+                self.notifier.send(
+                    f"🔄 <b>Retraining requested [{self.MODE.upper()}]</b>\n"
+                    f"Source: {req.get('source', 'dashboard')}\n"
+                    f"Reason: {req.get('reason', 'manual')}"
+                )
+            except Exception:
+                pass
+            # Update status to 'running'
+            status_path = DATA_DIR / "retrain_status.json"
+            with open(status_path, "w") as f:
+                json.dump({
+                    "status": "running",
+                    "started": datetime.now(timezone.utc).isoformat(),
+                    "source": req.get("source", "unknown"),
+                }, f)
+            # Trigger retraining
+            start_time = time.time()
+            self._train()
+            elapsed = time.time() - start_time
+            # Update status to 'complete'
+            with open(status_path, "w") as f:
+                json.dump({
+                    "status": "completed",
+                    "started": req.get("timestamp", ""),
+                    "completed": datetime.now(timezone.utc).isoformat(),
+                    "duration_seconds": round(elapsed, 1),
+                }, f)
+            # Clear the request file
+            p.unlink()
+        except Exception as e:
+            self.log.error(f"Retrain request processing error: {e}", exc_info=True)
+            status_path = DATA_DIR / "retrain_status.json"
+            with open(status_path, "w") as f:
+                json.dump({
+                    "status": "error",
+                    "error": str(e),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }, f)
+            # Clear the request file anyway to avoid infinite loop
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
     def is_trading_paused(self) -> bool:
         """Check if trading has been paused via dashboard."""
         p = DATA / "trading_paused.json"
@@ -1144,6 +1203,8 @@ class BaseBot:
 
                 current_coins = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols)
                 self._retrain_if_watchlist_changed(current_coins)
+
+                self._check_for_retrain_request()
 
                 if self.learner.should_run():
                     self.learner.run_learning_cycle()
