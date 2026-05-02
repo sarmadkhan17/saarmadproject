@@ -444,6 +444,7 @@ nav.tabs {
   padding: 10px 18px;
   border-bottom: 1px solid var(--border);
   transition: background 0.1s;
+  overflow: hidden;
 }
 
 .signal-item:hover { background: rgba(255,255,255,0.02); }
@@ -627,7 +628,11 @@ td {
 /* ─── MODEL HEALTH ─── */
 .model-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0;
+}
+.model-grid .empty {
+  grid-column: 1 / -1;
 }
 
 .model-cell {
@@ -646,7 +651,7 @@ td {
 /* ─── HEALTH GRID ─── */
 .health-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(6, 1fr);
 }
 
 .health-item {
@@ -658,8 +663,8 @@ td {
   border-right: 1px solid var(--border);
 }
 
-.health-item:nth-child(4n) { border-right: none; }
-.health-item:nth-last-child(-n+4) { border-bottom: none; }
+.health-item:nth-child(6n) { border-right: none; }
+.health-item:nth-last-child(-n+6) { border-bottom: none; }
 
 .health-lbl { font-size: 11px; color: var(--text2); font-weight: 500; }
 .health-val { font-family: var(--mono); font-size: 12px; font-weight: 600; }
@@ -788,6 +793,112 @@ td {
 .empty {
   padding: 36px;
   text-align: center;
+}
+
+/* ─── RESPONSIVE ──────────────────────────────────────────────────── */
+
+/* Tablet / small desktop (≤1200px) */
+@media (max-width: 1200px) {
+  .cards-6 { grid-template-columns: repeat(3, 1fr); }
+  .row-7030 { grid-template-columns: 1fr; }
+  .row-7030 .panel:last-child { max-height: 320px; }
+  .strategy-config-grid { grid-template-columns: repeat(2, 1fr); }
+  .model-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .health-grid { grid-template-columns: repeat(2, 1fr); }
+  header { flex-wrap: wrap; height: auto; padding: 8px 16px; }
+  .hright { gap: 6px; flex-wrap: wrap; }
+  .clock { display: none; }
+}
+
+/* Mobile (≤768px) */
+@media (max-width: 768px) {
+  body { font-size: 13px; }
+
+  .cards-6 { grid-template-columns: repeat(2, 1fr); }
+  .cards-2 { grid-template-columns: 1fr; }
+  .row-5050 { grid-template-columns: 1fr; }
+  .row-7030 { grid-template-columns: 1fr; }
+  .trading-split { grid-template-columns: 1fr; }
+  .trading-side:first-child { border-right: none; border-bottom: 1px solid var(--border); }
+
+  .strategy-config-grid { grid-template-columns: 1fr; }
+  .model-grid { grid-template-columns: 1fr !important; }
+  .model-cell { border-right: none; border-bottom: 1px solid var(--border); }
+  .model-cell:last-child { border-bottom: none; }
+  .health-grid { grid-template-columns: 1fr; }
+  .health-item { border-right: none; }
+  .health-item:nth-last-child(-n+6) { border-bottom: 1px solid var(--border); }
+  .health-item:last-child { border-bottom: none; }
+
+  .mini-grid { grid-template-columns: repeat(2, 1fr); }
+
+  header { padding: 8px 12px; gap: 6px; }
+  nav.tabs { order: 3; width: 100%; overflow-x: auto; }
+  .tab { padding: 0 12px; font-size: 12px; white-space: nowrap; }
+  .logo { margin-right: 0; }
+  .logo-text { font-size: 12px; }
+  .logo-sub { display: none; }
+  .hright { gap: 4px; }
+  .badge, .mode-badge { font-size: 8px; padding: 2px 5px; }
+  .ctrl-btn { font-size: 9px; padding: 4px 10px; }
+  .status-pill { font-size: 9px; padding: 3px 8px; }
+  .vdivider { display: none; }
+  .clock { display: none; }
+
+  .tab-panel { padding: 14px 12px; }
+  .section-label { font-size: 9px; letter-spacing: 1.5px; }
+  .card { padding: 12px 14px; }
+  .card-value { font-size: 17px; }
+
+  .panel-header { padding: 10px 14px; }
+  .panel-title { font-size: 11px; }
+  .panel-badge { font-size: 9px; padding: 2px 6px; }
+
+  .signal-item { padding: 8px 12px; gap: 8px; grid-template-columns: 44px 1fr auto; }
+  .signal-action { font-size: 8px; }
+  .signal-symbol { font-size: 12px; }
+  .signal-conf { font-size: 12px; }
+
+  .filter-bar { padding: 6px 10px; gap: 6px; }
+  .filter-bar select, .filter-bar input { font-size: 10px; padding: 3px 6px; }
+
+  th { font-size: 8px; padding: 8px 10px; }
+  td { font-size: 11px; padding: 8px 10px; }
+
+  .cfg-field input, .cfg-field select { font-size: 14px; padding: 10px 12px; }
+  .cfg-actions { flex-direction: column; }
+
+  .table-wrap { max-height: 260px; }
+  .signals-body { max-height: 220px; }
+  .chart-body { height: 200px; padding: 12px; }
+  .model-accuracy { font-size: 22px; }
+  .model-name { font-size: 9px; }
+  .model-date { font-size: 9px; }
+}
+
+/* Small phone (≤480px) */
+@media (max-width: 480px) {
+  .cards-6 { grid-template-columns: 1fr 1fr; }
+  .mini-grid { grid-template-columns: 1fr 1fr; }
+
+  header { padding: 6px 8px; }
+  .logo-mark { width: 24px; height: 24px; font-size: 9px; }
+  .logo-text { font-size: 11px; }
+  .tab { padding: 0 8px; font-size: 11px; }
+
+  .card { padding: 10px 12px; }
+  .card-value { font-size: 15px; }
+  .card-label { font-size: 9px; }
+
+  .signal-action { font-size: 7px; padding: 3px 2px; }
+
+  th { font-size: 7px; padding: 6px 8px; }
+  td { font-size: 10px; padding: 6px 8px; }
+  .td-time { font-size: 9px; }
+
+  .page-btn { padding: 3px 7px; font-size: 10px; min-width: 26px; }
+
+  .notif { top: auto; bottom: 12px; right: 8px; left: 8px; text-align: center; }
 }
 </style>
 </head>
