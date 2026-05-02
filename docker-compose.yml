@@ -1,0 +1,42 @@
+services:
+  spot-bot:
+    build: .
+    image: cryptobot-v3
+    container_name: cryptobot-spot
+    restart: unless-stopped
+    environment:
+      - BOT_MODE=spot
+    volumes:
+      - ./data:/root/cryptobot_v3/data
+      - ./logs:/root/cryptobot_v3/logs
+      - ./.env:/root/cryptobot_v3/.env:ro
+    working_dir: /root/cryptobot_v3/bot
+    command: python3 launcher.py
+
+  futures-bot:
+    build: .
+    image: cryptobot-v3
+    container_name: cryptobot-futures
+    restart: unless-stopped
+    environment:
+      - BOT_MODE=futures
+    volumes:
+      - ./data:/root/cryptobot_v3/data
+      - ./logs:/root/cryptobot_v3/logs
+      - ./.env:/root/cryptobot_v3/.env:ro
+    working_dir: /root/cryptobot_v3/bot
+    command: python3 launcher.py
+
+  dashboard:
+    build: .
+    image: cryptobot-v3
+    container_name: cryptobot-dashboard
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    volumes:
+      - ./data:/root/cryptobot_v3/data
+      - ./logs:/root/cryptobot_v3/logs
+      - ./.env:/root/cryptobot_v3/.env:ro
+    working_dir: /root/cryptobot_v3/dashboard
+    command: python3 server.py

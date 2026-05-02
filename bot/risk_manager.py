@@ -40,6 +40,10 @@ class CorrelationFilter:
             held = sum(1 for s in open_symbols if s in symbols)
             if held >= self.MAX_PER_GROUP.get(group, 2):
                 return False, f"Already holding {held} from {group} (max {self.MAX_PER_GROUP.get(group,2)})"
+        unknown_held = sum(1 for s in open_symbols if not any(s in g for g in self.GROUPS.values()))
+        if not any(symbol in g for g in self.GROUPS.values()):
+            if unknown_held >= 3:
+                return False, f"Already holding {unknown_held} ungrouped tokens (max 3)"
         return True, "OK"
 
 
@@ -209,6 +213,18 @@ class ATRTrailingStop:
             if price > self.peak_prices[trade_id]:
                 self.peak_prices[trade_id] = price
                 self.atr_values[trade_id]  = atr
+        self._dirty = True
+
+    def flush(self):
+        if getattr(self, "_dirty", False):
+            self._save()
+            self._dirty = False
+
+    def cleanup(self, trade_id):
+        self.peak_prices.pop(trade_id, None)
+        self.atr_values.pop(trade_id, None)
+        self.entry_atrs.pop(trade_id, None)
+        self.partial.pop(trade_id, None)
         self._save()
 
     def should_exit(self, trade_id, entry, price, atr, side="long"):
@@ -219,16 +235,14 @@ class ATRTrailingStop:
         partial   = self.partial.get(trade_id, {"tier1": False, "tier2": False})
         gain      = (entry - price) if is_short else (price - entry)
 
-        # Tier 1: +1× entry ATR → take 40%
         if not partial["tier1"] and gain >= entry_atr:
             self.partial[trade_id]["tier1"] = True
-            self._save()
+            self._dirty = True
             return 0.4, "PARTIAL_TP1 +1×ATR"
 
-        # Tier 2: +2× entry ATR → take 50% of remaining (30% of original)
         if partial["tier1"] and not partial["tier2"] and gain >= 2 * entry_atr:
             self.partial[trade_id]["tier2"] = True
-            self._save()
+            self._dirty = True
             return 0.5, "PARTIAL_TP2 +2×ATR"
 
         # ATR trailing stop on remaining position
@@ -247,13 +261,6 @@ class ATRTrailingStop:
             if price <= stop:
                 return 1.0, f"ATR SL ${stop:.4f} (peak ${extreme:.4f})"
         return 0.0, ""
-
-    def cleanup(self, trade_id):
-        self.peak_prices.pop(trade_id, None)
-        self.atr_values.pop(trade_id, None)
-        self.entry_atrs.pop(trade_id, None)
-        self.partial.pop(trade_id, None)
-        self._save()
 
 
 class KellyCriterionSizer:
@@ -329,7 +336,9 @@ class PortfolioHeatTracker:
 
     def can_add_position(self, open_trades, balance, new_usdt, get_price_fn):
         heat     = self.get_heat(open_trades, balance, get_price_fn)
-        new_heat = heat + new_usdt / (balance + 1e-9)
+        exposure = heat * (balance + 1e-9) / (1 - heat + 1e-9)
+        new_exposure = exposure + new_usdt
+        new_heat = new_exposure / (balance + new_exposure + 1e-9)
         if new_heat > self.max_heat:
             return False, f"Portfolio heat {heat*100:.1f}% (max {self.max_heat*100:.0f}%)"
         return True, f"Heat OK ({heat*100:.1f}%)"
@@ -435,7 +444,6 @@ class RiskManager:
                         exits.append((trade, price, f"Fixed TP {self.fallback_tp:.0%}", 1.0))
                         continue
 
-            atr = get_atr_fn(trade["symbol"])
             if atr > 0:
                 fraction, reason = self.trailing.should_exit(trade_id, entry, price, atr, side)
                 if fraction > 0:
@@ -447,6 +455,7 @@ class RiskManager:
                     exits.append((trade, price, "Fixed SL 2.5%", 1.0))
                 elif not is_short and price <= entry * 0.975:
                     exits.append((trade, price, "Fixed SL 2.5%", 1.0))
+        self.trailing.flush()
         return exits
 
     def can_open_trade(self, symbol, open_trades, balance, new_usdt, get_price_fn):
@@ -475,3 +484,6 @@ class RiskManager:
 
     def cleanup_trade(self, trade_id):
         self.trailing.cleanup(trade_id)
+
+    def flush(self):
+        self.trailing.flush()

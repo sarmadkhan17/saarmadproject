@@ -6,7 +6,6 @@ Telegram Notifier v3
 """
 
 import os
-import signal
 import requests
 import logging
 import json
@@ -24,7 +23,8 @@ DATA     = DATA_DIR
 BOT_ROOT = Path.home() / "cryptobot_v3"
 CFG_SPOT = BOT_ROOT / "config_spot.yaml"
 CFG_FUT  = BOT_ROOT / "config_futures.yaml"
-HTF_MODES = ("strict", "soft", "hard")
+ENV_PATH = BOT_ROOT / ".env"
+SERVICE_PATH = Path("/etc/systemd/system/cryptobot-futures.service")
 
 
 class TelegramNotifier:
@@ -112,7 +112,7 @@ class TelegramNotifier:
                 last = last.replace(tzinfo=timezone.utc)
             sig_age = f"{int((datetime.now(timezone.utc)-last).total_seconds())}s ago"
 
-        # Batch fetch all tickers in one call instead of one per position
+        # Batch fetch all tickers in one call
         total_live = 0.0
         lines      = []
         if open_t:
@@ -139,17 +139,35 @@ class TelegramNotifier:
         wr    = f"{stats['wins']/total*100:.1f}%" if total else "N/A"
         now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+        # Token usage
+        token_info = ""
+        p = DATA / "token_budget.json"
+        if p.exists():
+            with open(p) as f:
+                tb = json.load(f)
+            used = tb.get("used_today", 0)
+            limit = tb.get("limit", 90000)
+            pct = round(used / limit * 100, 1)
+            token_info = f"  Groq: {used:,}/{limit:,} ({pct}%)\n"
+
+        mode = self._get_mode_from_env()
+        mode_icon = "🟣" if mode == "futures" else "🔵"
+
         msg = (
-            f"<b>🤖 CryptoBot v3 Report</b>\n<b>{now}</b>\n\n"
+            f"<b>{mode_icon} CryptoBot v3 Report</b>\n"
+            f"<b>{now}</b>\n\n"
             f"<b>STATUS</b>\n"
-            f"  Signal: {sig_age} | Open: {len(open_t)} | Closed: {len(closed)}\n\n"
+            f"  Mode: {mode.upper()} | Signal: {sig_age}\n"
+            f"  Open: {len(open_t)} | Closed: {len(closed)}\n\n"
             f"<b>PERFORMANCE</b>\n"
             f"  WR: {wr} ({stats['wins']}W/{stats['losses']}L)\n"
-            f"  Closed PnL: ${stats['total_pnl']:+.4f}\n"
-            f"<b>Live PnL: ${total_live:+.2f} USDT</b>\n"
+            f"  Closed PnL: <b>${stats['total_pnl']:+.4f}</b>\n"
+            f"  Live PnL: <b>${total_live:+.2f}</b>\n"
         )
         if lines:
-            msg += "\n<b>POSITIONS</b>\n" + "\n".join(lines)
+            msg += f"\n<b>POSITIONS</b>\n" + "\n".join(lines)
+        if token_info:
+            msg += f"\n\n{token_info}"
         return msg
 
     def _poll_commands(self):
@@ -185,7 +203,7 @@ class TelegramNotifier:
                         text = text.split("@")[0]
 
                     if text.startswith("/htf"):
-                        self._cmd_htf(text)
+                        self.send("ℹ️ <b>HTF panel removed.</b> Use dashboard for settings.")
                     else:
                         {
                             "/help":            self._cmd_help,
@@ -214,40 +232,110 @@ class TelegramNotifier:
             "/status  — Bot status check\n"
             "/mode    — Show current mode\n"
             "/agents  — Agent performance + tokens\n"
-            "/pnl     — Current PnL (spot + futures)\n"
+            "/pnl     — Current PnL\n"
             "/trades  — Open positions\n"
             "/health  — Full system health\n\n"
             "<b>⚙️ Control:</b>\n"
             "/switch_spot     — Switch to SPOT mode\n"
             "/switch_futures  — Switch to FUTURES mode\n"
-            "/restart         — Restart current bot\n"
+            "/restart         — Restart bot\n"
             "/stop            — Stop bot\n"
-            "/htf             — Show HTF filter mode\n"
-            "/htf strict      — Force HOLD on HTF conflict\n"
-            "/htf soft        — Reduce conf by 30% on conflict\n"
-            "/htf hard        — Block unless conf >= 0.65\n"
         )
 
     def _cmd_htf(self, text: str):
-        parts = text.strip().split()
-        if len(parts) == 1:
-            mode = "strict"
-            if CFG_SPOT.exists():
-                with open(CFG_SPOT) as f:
-                    cfg = yaml.safe_load(f)
-                mode = cfg.get("strategy", {}).get("htf_filter_mode", "strict")
-            desc = {
-                "strict": "Force HOLD when HTF opposes signal",
-                "soft":   "Keep signal, cut confidence by 30%",
-                "hard":   "Block unless conf >= 0.65",
-            }
-            self.send(
-                f"<b>HTF Filter Mode</b>\n\n"
-                f"Current: <b>{mode.upper()}</b>\n"
-                f"{desc.get(mode,'')}\n\n"
-                f"Change with:\n"
-                f"/htf strict | /htf soft | /htf hard"
-            )
+        self.send("ℹ️ <b>HTF panel removed.</b> Confidence is now dynamic — no manual filter needed.")
+
+    def _get_mode_from_env(self):
+        """Read BOT_MODE from .env file."""
+        if ENV_PATH.exists():
+            with open(ENV_PATH) as f:
+                for line in f:
+                    if line.startswith("BOT_MODE="):
+                        return line.split("=", 1)[1].strip().strip("\"'")
+        return "unknown"
+
+    def _set_mode_and_restart(self, mode):
+        """Update .env, systemd service, and restart."""
+        if not ENV_PATH.exists():
+            return False
+        with open(ENV_PATH) as f:
+            lines = f.readlines()
+        new_lines = []
+        for line in lines:
+            if line.startswith("BOT_MODE="):
+                new_lines.append(f'BOT_MODE="{mode}"\n')
+            else:
+                new_lines.append(line)
+        with open(ENV_PATH, "w") as f:
+            f.writelines(new_lines)
+
+        if SERVICE_PATH.exists():
+            with open(SERVICE_PATH) as f:
+                svc_lines = f.readlines()
+            new_svc = []
+            for line in svc_lines:
+                if "BOT_MODE=" in line:
+                    new_svc.append(f'Environment="BOT_MODE={mode}"\n')
+                else:
+                    new_svc.append(line)
+            with open(SERVICE_PATH, "w") as f:
+                f.writelines(new_svc)
+
+        subprocess.run(["systemctl", "daemon-reload"], timeout=5)
+        subprocess.run(["systemctl", "restart", "cryptobot-futures"], timeout=10)
+        return True
+
+    def _check_open_trades(self):
+        """Check if current mode has open trades."""
+        mode = self._get_mode_from_env()
+        state_file = DATA / f"{mode}_state.json"
+        if not state_file.exists():
+            return False
+        try:
+            with open(state_file) as f:
+                data = json.load(f)
+            opens = [t for t in data.get("trades", []) if t.get("status") == "open"]
+            return len(opens) > 0
+        except Exception:
+            return False
+
+    def _cmd_switch_spot(self):
+        current = self._get_mode_from_env()
+        if current == "spot":
+            self.send("ℹ️ Already running in SPOT mode")
+            return
+        if self._check_open_trades():
+            self.send("❌ <b>Cannot switch — open trades exist.</b>\nClose all trades first, then try again.")
+            return
+
+        self.send("🔄 <b>Switching to SPOT mode...</b>")
+        try:
+            if self._set_mode_and_restart("spot"):
+                time.sleep(5)
+                self.send("✅ <b>Switched to SPOT!</b>\nUse /status to verify.")
+            else:
+                self.send("❌ Switch failed — could not update config")
+        except Exception as e:
+            self.send(f"❌ Switch failed: {e}")
+
+    def _cmd_switch_futures(self):
+        current = self._get_mode_from_env()
+        if current == "futures":
+            self.send("ℹ️ Already running in FUTURES mode")
+            return
+        if self._check_open_trades():
+            self.send("❌ <b>Cannot switch — open trades exist.</b>\nClose all trades first, then try again.")
+            return
+
+        self.send("🔄 <b>Switching to FUTURES mode...</b>")
+        try:
+            if self._set_mode_and_restart("futures"):
+                time.sleep(5)
+                self.send("✅ <b>Switched to FUTURES!</b>\nUse /status to verify.")
+            else:
+                self.send("❌ Switch failed — could not update config")
+        except Exception as e:
+            self.send(f"❌ Switch failed: {e}")
             return
 
         mode = parts[1].lower()
@@ -441,43 +529,9 @@ class TelegramNotifier:
         except Exception as e:
             self.send(f"Health error: {e}")
 
-    @staticmethod
-    def _is_docker() -> bool:
-        return Path("/.dockerenv").exists()
-
-    def _get_current_mode(self):
-        """Detect current bot mode from running processes."""
-        # First check our own process environment (fastest path)
-        env_mode = os.environ.get("BOT_MODE", "").lower()
-        if env_mode in ("spot", "futures"):
-            return env_mode
-        # Fall back to scanning process environments via /proc
-        try:
-            for pid_entry in os.listdir("/proc"):
-                if not pid_entry.isdigit():
-                    continue
-                try:
-                    env_path = f"/proc/{pid_entry}/environ"
-                    with open(env_path, "rb") as f:
-                        env_data = f.read().decode("utf-8", errors="replace")
-                    if "launcher.py" in open(f"/proc/{pid_entry}/cmdline", "rb").read().decode("utf-8", errors="replace"):
-                        for var in env_data.split("\x00"):
-                            if var.startswith("BOT_MODE="):
-                                return var.split("=", 1)[1].lower()
-                except (PermissionError, FileNotFoundError):
-                    continue
-        except Exception:
-            pass
-        # Last resort: check screen session names
-        try:
-            result = subprocess.run(["screen", "-ls"], capture_output=True, text=True)
-            if "cryptobot_v3_futures" in result.stdout:
-                return "futures"
-            if "cryptobot_v3_spot" in result.stdout:
-                return "spot"
-        except Exception:
-            pass
-        return "unknown"
+    def _get_mode_from_env(self):
+        """Detect current bot mode from .env file."""
+        return self._get_mode_from_env()
 
     def _cmd_current_mode(self):
         mode = self._get_current_mode()
@@ -540,33 +594,13 @@ class TelegramNotifier:
 
     def _cmd_restart(self):
         current = self._get_current_mode()
-        if self._is_docker():
-            self.send(f"🔄 <b>Restarting {current.upper()} bot...</b>\nContainer will be back in ~10 seconds")
-            try:
-                time.sleep(1)
-                os.kill(os.getpid(), signal.SIGTERM)
-            except Exception as e:
-                self.send(f"❌ Restart failed: {e}")
-            return
-
         if current == "unknown":
-            self.send("⚠️ No bot is running. Use /switch_spot or /switch_futures")
+            self.send("⚠️ Unknown mode. Try /switch_spot or /switch_futures")
             return
 
         self.send(f"🔄 <b>Restarting {current.upper()} bot...</b>")
         try:
-            home = str(Path.home())
-            screen_name = f"cryptobot_v3_{current}"
-            subprocess.run(["screen", "-S", screen_name, "-X", "quit"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
-            time.sleep(3)
-            subprocess.run(["screen", "-wipe"], timeout=5)
-            time.sleep(2)
-            subprocess.Popen([
-                "screen", "-dmS", screen_name,
-                "bash", "-c",
-                f"cd {home}/cryptobot_v3/bot && BOT_MODE={current} python3 launcher.py"
-            ])
+            subprocess.run(["systemctl", "restart", "cryptobot-futures"], timeout=10)
             time.sleep(3)
             self.send(f"✅ <b>{current.upper()} bot restarted!</b>")
         except Exception as e:
@@ -574,24 +608,16 @@ class TelegramNotifier:
 
     def _cmd_stop(self):
         current = self._get_current_mode()
-        if self._is_docker():
-            self.send(f"⏹ <b>Docker mode</b>: to stop {current.upper()} bot run on server:\n<code>docker compose stop {current}-bot</code>\nTo stop all: <code>docker compose down</code>")
-            return
-
         if current == "unknown":
             self.send("ℹ️ Bot is not running")
             return
 
-        self.send(f"⏹ <b>Stopping {current.upper()} bot...</b>\nWill close after this message")
+        self.send(f"⏹ <b>Stopping {current.upper()} bot...</b>")
         try:
-            screen_name = f"cryptobot_v3_{current}"
-            time.sleep(1)
-            subprocess.run(["screen", "-S", screen_name, "-X", "quit"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
-            time.sleep(2)
-            subprocess.run(["screen", "-wipe"], timeout=5)
+            subprocess.run(["systemctl", "stop", "cryptobot-futures"], timeout=10)
+            self.send(f"✅ <b>{current.upper()} bot stopped.</b>\nStart again with /switch_spot or /switch_futures")
         except Exception as e:
-            log.error(f"Stop failed: {e}")
+            self.send(f"❌ Stop failed: {e}")
 
     def send_error_alert(self, error_msg, context=""):
         """Called by other modules to alert on errors."""

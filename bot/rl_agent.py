@@ -217,7 +217,7 @@ class RLTradeManager:
             state = build_state(trade, current_price, atr, regime, price_1h_ago)
 
             if len(self.buffer) < self.MIN_EXPERIENCES:
-                self._pending[trade["id"]] = (state, 0, current_price)
+                self._pending[trade["id"]] = (state, 0, current_price, dict(trade))
                 log.debug(f"RL {trade.get('symbol','?')}: HOLD (buffer {len(self.buffer)}/{self.MIN_EXPERIENCES})")
                 return "HOLD", 1.0
 
@@ -251,7 +251,7 @@ class RLTradeManager:
                 action     = "HOLD"
                 action_idx = 0
 
-            self._pending[trade["id"]] = (state, action_idx, current_price)
+            self._pending[trade["id"]] = (state, action_idx, current_price, dict(trade))
             log.info(
                 f"RL {trade.get('symbol','?')}: {action} conf={confidence:.2f} "
                 f"eps={self.epsilon:.3f} buf={len(self.buffer)}"
@@ -278,7 +278,7 @@ class RLTradeManager:
         """
         if trade_id not in self._pending:
             return
-        prev_state, action_idx, prev_price = self._pending[trade_id]
+        prev_state, action_idx, prev_price, trade_ctx = self._pending[trade_id]
 
         if done:
             reward     = float(np.clip(final_pnl / 5.0, -2.0, 2.0))
@@ -287,7 +287,8 @@ class RLTradeManager:
         else:
             price_chg  = (next_price - prev_price) / (prev_price + 1e-9)
             reward     = float(np.clip(price_chg * 3, -0.1, 0.1))
-            next_state = np.zeros(STATE_DIM, dtype=np.float32)  # approximate
+            next_state = build_state(trade_ctx, next_price, next_atr)
+            self._pending[trade_id] = (next_state, action_idx, next_price, trade_ctx)
 
         self.buffer.push(prev_state, action_idx, reward, next_state, float(done))
         self.n_steps += 1
@@ -305,7 +306,7 @@ class RLTradeManager:
         Provides terminal reward signal even for non-RL-initiated closes.
         """
         if trade_id in self._pending:
-            prev_state, action_idx, prev_price = self._pending[trade_id]
+            prev_state, action_idx, prev_price, trade_ctx = self._pending[trade_id]
             reward     = float(np.clip(final_pnl / 5.0, -2.0, 2.0))
             next_state = np.zeros(STATE_DIM, dtype=np.float32)
             self.buffer.push(prev_state, action_idx, reward, next_state, 1.0)

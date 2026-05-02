@@ -3,7 +3,12 @@
     "allow": [
       "Bash(python3 -c ' *)",
       "Bash(python3 *)",
-      "Bash(pip3 show *)"
+      "Bash(pip3 show *)",
+      "Bash(xargs ls *)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(sort -k2)",
+      "Bash(ssh *)",
+      "Bash(rsync *)"
     ]
   }
 }

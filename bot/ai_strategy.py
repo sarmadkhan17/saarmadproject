@@ -97,7 +97,7 @@ def make_features(df):
 
     atr = ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
     f["atr_pct"]   = atr / (close + 1e-9)
-    f["atr_ratio"] = atr / (vol_sma.rolling(0).mean() + 1e-9) if False else atr / (atr.rolling(20).mean() + 1e-9)
+    f["atr_ratio"] = atr / (atr.rolling(20).mean() + 1e-9)
 
     f["vol_ratio"] = vol / (vol_sma + 1e-9)
     f["vol_trend"] = vol.rolling(5).mean() / (vol_sma + 1e-9)
@@ -320,7 +320,7 @@ class RandomForestStrategy:
             sw_fold = sw[tr_idx] if sw is not None else None
             m = RandomForestClassifier(n_estimators=200, max_depth=10,
                                        min_samples_leaf=5, class_weight=cw,
-                                       random_state=42, n_jobs=-1)
+                                       random_state=42, n_jobs=4)
             m.fit(Xtr, y[tr_idx], sample_weight=sw_fold)
             wf_scores.append(m.score(Xte, y[te_idx]))
         wf_acc = np.mean(wf_scores)
@@ -337,7 +337,7 @@ class RandomForestStrategy:
         new_model = RandomForestClassifier(
             n_estimators=500, max_depth=8, min_samples_leaf=8,
             min_samples_split=15, max_features="log2",
-            class_weight=cw, random_state=42, n_jobs=-1,
+            class_weight=cw, random_state=42, n_jobs=4,
         )
         new_model.fit(Xtr, y[:split], sample_weight=sw_tr)
         new_acc = new_model.score(Xte, y[split:])
@@ -431,7 +431,7 @@ class LightGBMStrategy:
             subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
             num_leaves=31, min_child_samples=20,
             reg_alpha=0.1, reg_lambda=0.1,
-            class_weight="balanced", random_state=42, verbose=-1, n_jobs=-1,
+            class_weight="balanced", random_state=42, verbose=-1, n_jobs=4,
         )
 
         # Walk-forward validation (same as RF)
@@ -875,13 +875,14 @@ class AIStrategyEngine:
             with open(p) as f:
                 self.performance_log = json.load(f)
 
-    def train_all(self, df, feat_df=None, labels_s=None, ctx_arrays=None, use_decay_weights: bool = False):
+    def train_all(self, df, feat_df=None, labels_s=None, ctx_arrays=None, use_decay_weights: bool = False, btc_rows: int = 0):
         r = {}
         r["rf"]   = self.rf.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights)
         r["lgbm"] = self.lgbm.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights)
-        r["lstm"] = self.lstm.train(df)
+        lstm_data = df.iloc[:btc_rows] if btc_rows > 0 else df.iloc[:1000]
+        r["lstm"] = self.lstm.train(lstm_data)
         if self.tft is not None:
-            r["tft"] = self.tft.train(df)
+            r["tft"] = self.tft.train(lstm_data)
         r["meta"] = self._train_meta(df)
         log.info(
             f"All models trained! RF={r['rf'].get('accuracy','?')} "
@@ -946,7 +947,7 @@ class AIStrategyEngine:
                     m_rf = RandomForestClassifier(
                         n_estimators=200, max_depth=8, min_samples_leaf=8,
                         class_weight=cw_rf,
-                        random_state=42 + fold_i, n_jobs=-1,
+                        random_state=42 + fold_i, n_jobs=4,
                     )
                     m_rf.fit(Xtr_rf, y[tr_idx])
                     raw = m_rf.predict_proba(Xval_rf)
@@ -967,7 +968,7 @@ class AIStrategyEngine:
                         n_estimators=200, max_depth=5, learning_rate=0.05,
                         subsample=0.8, colsample_bytree=0.8, num_leaves=15,
                         class_weight="balanced",
-                        random_state=42 + fold_i, verbose=-1, n_jobs=-1,
+                        random_state=42 + fold_i, verbose=-1, n_jobs=4,
                     )
                     m_lgbm.fit(
                         Xtr_lgbm[:vsp], y[tr_idx[:vsp]],
@@ -1010,11 +1011,12 @@ class AIStrategyEngine:
                                 callbacks=[EarlyStopping(patience=5,
                                            restore_best_weights=True)],
                             )
-                            for vi in val_idx:
-                                if vi >= seq_len:
-                                    seq = X_sc[vi - seq_len:vi].reshape(
-                                        1, seq_len, X.shape[1])
-                                    oof_lstm[vi] = m_lstm.predict(seq, verbose=0)[0]
+                            valid_vis = [vi for vi in val_idx if vi >= seq_len]
+                            if valid_vis:
+                                batch = np.array([X_sc[vi - seq_len:vi] for vi in valid_vis])
+                                preds = m_lstm.predict(batch, verbose=0)
+                                for vi, pred in zip(valid_vis, preds):
+                                    oof_lstm[vi] = pred
                             del m_lstm
                     except Exception as e:
                         log.warning(f"LSTM OOF fold {fold_i+1}: {e}")

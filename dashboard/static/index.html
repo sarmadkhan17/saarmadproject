@@ -151,18 +151,19 @@ nav.tabs {
   flex-shrink: 0;
 }
 
-.htf-group { display: flex; align-items: center; gap: 3px; }
-
-.htf-label {
+.mode-badge {
   font-family: var(--mono);
   font-size: 9px;
   font-weight: 600;
-  color: var(--text2);
-  letter-spacing: 1.5px;
-  margin-right: 4px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  letter-spacing: 1px;
+  border: 1px solid;
 }
+.mode-badge.spot     { color: var(--blue);   border-color: rgba(59,130,246,0.35);  background: rgba(59,130,246,0.08); }
+.mode-badge.futures  { color: var(--purple); border-color: rgba(139,92,246,0.35); background: rgba(139,92,246,0.08); }
 
-.htf-btn {
+.mode-btn {
   font-family: var(--mono);
   font-size: 10px;
   font-weight: 600;
@@ -175,15 +176,8 @@ nav.tabs {
   background: transparent;
   border-radius: 4px;
 }
-
-.htf-btn:hover { border-color: var(--gold); color: var(--gold); }
-
-.htf-btn.active {
-  border-color: var(--gold);
-  color: #0b0d12;
-  background: var(--gold);
-  font-weight: 700;
-}
+.mode-btn:hover { border-color: var(--gold); color: var(--gold); }
+.mode-btn:disabled { opacity: 0.4; cursor: default; }
 
 .ctrl-btn {
   font-family: var(--mono);
@@ -818,20 +812,11 @@ td {
   </nav>
 
   <div class="hright">
-    <div class="badge-group">
-      <span class="badge demo">DEMO</span>
-      <span class="badge spot">SPOT</span>
-      <span class="badge futures">FUTURES</span>
-    </div>
+    <span class="mode-badge spot" id="modeBadge">SPOT</span>
 
     <div class="vdivider"></div>
 
-    <div class="htf-group">
-      <span class="htf-label">HTF</span>
-      <button class="htf-btn" id="htf-strict" onclick="setHtfMode('strict')">STRICT</button>
-      <button class="htf-btn" id="htf-soft"   onclick="setHtfMode('soft')">SOFT</button>
-      <button class="htf-btn" id="htf-hard"   onclick="setHtfMode('hard')">HARD</button>
-    </div>
+    <button class="mode-btn" id="modeBtn" onclick="toggleMode()">Switch to Futures</button>
 
     <div class="vdivider"></div>
 
@@ -1162,47 +1147,72 @@ function toggleTrading() {
   if (tradingToggleInProgress) return;
   tradingToggleInProgress = true;
   var btn = document.getElementById('tradeBtn');
+  btn.disabled = true;
   var endpoint = tradingEnabled ? '/api/stop_trading' : '/api/start_trading';
-  fetch(API + endpoint, { method: 'POST' })
-    .then(function(r) { return r.json(); })
-    .then(function() {
-      tradingEnabled = !tradingEnabled;
-      if (!tradingEnabled) {
-        btn.textContent = 'START TRADING'; btn.className = 'ctrl-btn stopped';
-        showNotif('TRADING PAUSED', 'ok');
-      } else {
-        btn.textContent = 'STOP TRADING'; btn.className = 'ctrl-btn running';
-        showNotif('TRADING RESUMED', 'ok');
-      }
-    })
-    .catch(function() { showNotif('REQUEST FAILED', 'err'); })
-    .finally(function() { tradingToggleInProgress = false; });
-}
-
-/* ─── HTF MODE ─── */
-function setHtfMode(mode) {
-  fetch(API + '/api/htf_mode', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: mode })
-  })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      updateHtfButtons(d.htf_filter_mode);
-      showNotif('HTF: ' + d.htf_filter_mode.toUpperCase(), 'ok');
-    })
-    .catch(function() { showNotif('HTF REQUEST FAILED', 'err'); });
-}
-
-function updateHtfButtons(mode) {
-  ['strict', 'soft', 'hard'].forEach(function(m) {
-    var el = document.getElementById('htf-' + m);
-    if (el) el.className = 'htf-btn' + (m === mode ? ' active' : '');
+  post(endpoint, {}, function(d) {
+    // Trust server response — re-read actual state
+    var paused = d.trading_paused;
+    tradingEnabled = !paused;
+    if (paused) {
+      btn.textContent = 'START TRADING'; btn.className = 'ctrl-btn stopped';
+      showNotif('TRADING PAUSED', 'ok');
+    } else {
+      btn.textContent = 'STOP TRADING'; btn.className = 'ctrl-btn running';
+      showNotif('TRADING RESUMED', 'ok');
+    }
+    tradingToggleInProgress = false;
+    btn.disabled = false;
+  }, function() {
+    tradingToggleInProgress = false;
+    btn.disabled = false;
   });
 }
 
-function loadHtfMode() {
-  get('/api/htf_mode', function(d) { updateHtfButtons(d.htf_filter_mode || 'strict'); });
+/* ─── MODE TOGGLE ─── */
+var currentMode = 'spot';
+var hasOpenTrades = false;
+
+function updateModeBadge(mode, hasOpen) {
+  currentMode   = mode;
+  hasOpenTrades = hasOpen || false;
+  var badge = document.getElementById('modeBadge');
+  var btn   = document.getElementById('modeBtn');
+  if (!badge || !btn) return;
+  badge.textContent = mode.toUpperCase();
+  badge.className   = 'mode-badge ' + mode;
+  btn.textContent   = mode === 'spot' ? 'Switch to Futures' : 'Switch to Spot';
+  if (hasOpenTrades) {
+    btn.disabled    = true;
+    btn.title       = 'Close all open trades before switching mode';
+    btn.textContent = 'Open trades — cannot switch';
+  } else {
+    btn.disabled = false;
+    btn.title    = '';
+  }
+}
+
+function toggleMode() {
+  if (modeToggleInProgress || hasOpenTrades) return;
+  modeToggleInProgress = true;
+  var btn = document.getElementById('modeBtn');
+  btn.disabled    = true;
+  btn.textContent = 'Switching...';
+  var newMode = currentMode === 'spot' ? 'futures' : 'spot';
+  post('/api/set_mode', { mode: newMode }, function(d) {
+    updateModeBadge(d.mode, false);
+    showNotif('Mode switched to ' + d.mode.toUpperCase(), 'ok');
+    modeToggleInProgress = false;
+  }, function() {
+    showNotif('Failed to switch mode', 'err');
+    modeToggleInProgress = false;
+    loadMode();
+  });
+}
+
+var modeToggleInProgress = false;
+
+function loadMode() {
+  get('/api/get_mode', function(d) { updateModeBadge(d.mode || 'spot', d.has_open_trades); });
 }
 
 /* ─── STRATEGY CONFIG ─── */
@@ -1216,39 +1226,51 @@ function loadStrategyConfig() {
 }
 
 function saveStrategyConfig() {
-  var payload = {
-    forward_bars: parseInt(document.getElementById('cfgForwardBars').value),
-    timeframe: document.getElementById('cfgTimeframe').value,
-    min_confidence: parseFloat(document.getElementById('cfgMinConfidence').value),
-    min_votes: parseInt(document.getElementById('cfgMinVotes').value)
-  };
+  // Client-side validation before sending
+  var fb   = parseInt(document.getElementById('cfgForwardBars').value);
+  var tf   = document.getElementById('cfgTimeframe').value;
+  var mc   = parseFloat(document.getElementById('cfgMinConfidence').value);
+  var mv   = parseInt(document.getElementById('cfgMinVotes').value);
+
+  if (isNaN(fb) || fb < 1 || fb > 10)         { showNotif('Forward bars must be 1–10', 'err'); return; }
+  if (isNaN(mc) || mc < 0.30 || mc > 0.95)    { showNotif('Min confidence must be 0.30–0.95', 'err'); return; }
+  if (isNaN(mv) || mv < 1 || mv > 3)          { showNotif('Min votes must be 1–3', 'err'); return; }
+
+  var payload = { forward_bars: fb, timeframe: tf, min_confidence: mc, min_votes: mv };
   var btn = document.getElementById('btnSaveConfig');
-  btn.disabled = true;
+  btn.disabled    = true;
   btn.textContent = 'Saving...';
-  fetch(API + '/api/strategy_config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      showNotif('Strategy config updated', 'ok');
-      return fetch(API + '/api/retrain', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: 'dashboard', reason: 'config_change' })
-      }).then(function(r) { return r.json(); });
-    })
-    .then(function(d) {
+
+  post('/api/strategy_config', payload, function(d) {
+    // Reflect what server actually saved (server returns validated config)
+    if (d.config) {
+      document.getElementById('cfgForwardBars').value   = d.config.forward_bars   || fb;
+      document.getElementById('cfgTimeframe').value     = d.config.timeframe       || tf;
+      document.getElementById('cfgMinConfidence').value = d.config.min_confidence  || mc;
+      document.getElementById('cfgMinVotes').value      = d.config.min_votes       || mv;
+    }
+    showNotif('Config saved', 'ok');
+    btn.disabled    = false;
+    btn.textContent = 'Save, Apply & Retrain';
+
+    // Trigger retrain separately
+    btn.disabled    = true;
+    btn.textContent = 'Requesting retrain...';
+    post('/api/retrain', { source: 'dashboard', reason: 'config_change' }, function() {
       showNotif('Retraining started...', 'ok');
-      loadStrategyConfig();
       pollRetrainStatus();
-    })
-    .catch(function() { showNotif('Failed to save config', 'err'); })
-    .finally(function() {
-      btn.disabled = false;
+      btn.disabled    = false;
+      btn.textContent = 'Save, Apply & Retrain';
+    }, function(e) {
+      // 429 = already running, not an error
+      if (e && e.message === '429') showNotif('Retrain already running', 'ok');
+      btn.disabled    = false;
       btn.textContent = 'Save, Apply & Retrain';
     });
+  }, function() {
+    btn.disabled    = false;
+    btn.textContent = 'Save, Apply & Retrain';
+  });
 }
 
 var retrainPollInterval = null;
@@ -1267,26 +1289,23 @@ function pollRetrainStatus() {
 function updateRetrainStatus() {
   get('/api/retrain_status', function(d) {
     var el = document.getElementById('retrainStatus');
+    if (!el) return;
     var status = d.status || 'idle';
-    var html = '<span class="dot ' + status + '"></span>';
+    var dot    = '<span class="dot ' + status + '"></span>';
+    var msg    = '';
     if (status === 'idle') {
-      html += 'No retraining pending';
+      msg = 'No retraining pending';
     } else if (status === 'running') {
-      html += 'Retraining models... (' + (d.started ? new Date(d.started).toLocaleTimeString() : '') + ')';
+      msg = 'Retraining models... (' + (d.started ? new Date(d.started).toLocaleTimeString() : '') + ')';
     } else if (status === 'completed') {
-      html += 'Retrain completed in ' + (d.duration_seconds || '?') + 's (' + (d.completed ? new Date(d.completed).toLocaleTimeString() : '') + ')';
-      if (retrainPollInterval) {
-        clearInterval(retrainPollInterval);
-        retrainPollInterval = null;
-      }
+      msg = 'Retrain completed in ' + escapeHtml(String(d.duration_seconds || '?')) + 's'
+          + ' (' + (d.completed ? new Date(d.completed).toLocaleTimeString() : '') + ')';
+      if (retrainPollInterval) { clearInterval(retrainPollInterval); retrainPollInterval = null; }
     } else if (status === 'error') {
-      html += 'Retrain failed: ' + (d.error || 'unknown');
-      if (retrainPollInterval) {
-        clearInterval(retrainPollInterval);
-        retrainPollInterval = null;
-      }
+      msg = 'Retrain failed: ' + escapeHtml(d.error || 'unknown');
+      if (retrainPollInterval) { clearInterval(retrainPollInterval); retrainPollInterval = null; }
     }
-    el.innerHTML = html;
+    el.innerHTML = dot + msg;
   });
 }
 
@@ -1327,9 +1346,41 @@ function initChart() {
   });
 }
 
-/* ─── API HELPER ─── */
+/* ─── API HELPERS ─── */
+var _staleTimer = null;
+function _markStale() {
+  clearTimeout(_staleTimer);
+  _staleTimer = setTimeout(function() {
+    var badge = document.getElementById('sb');
+    var text  = document.getElementById('st');
+    if (badge) badge.className = 'status-pill';
+    if (text)  text.textContent = 'STALE';
+  }, 15000);
+}
+
 function get(path, cb) {
-  fetch(API + path).then(function(r) { return r.json(); }).then(cb).catch(function(e) { console.warn(path, e); });
+  fetch(API + path)
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(data) { _markStale(); cb(data); })
+    .catch(function(e) { console.warn(path, e); });
+}
+
+function post(path, payload, cb, errCb) {
+  var headers = { 'Content-Type': 'application/json' };
+  var key = localStorage.getItem('dashboard_key') || '';
+  if (key) headers['X-Dashboard-Key'] = key;
+  fetch(API + path, { method: 'POST', headers: headers, body: JSON.stringify(payload || {}) })
+    .then(function(r) {
+      if (r.status === 401) { showNotif('UNAUTHORIZED — set dashboard_key in localStorage', 'err'); throw new Error('401'); }
+      if (r.status === 429) { showNotif('ALREADY IN PROGRESS', 'err'); throw new Error('429'); }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(cb || function() {})
+    .catch(errCb || function(e) { if (e.message !== '401' && e.message !== '429') showNotif('REQUEST FAILED', 'err'); });
 }
 
 function pnlStr(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(4) + ' USDT'; }
@@ -1426,14 +1477,14 @@ function updateSignals() {
     if (!sigs.length) { el.innerHTML = "<div class='empty'>Awaiting signals...</div>"; return; }
     var h = '';
     for (var i = 0; i < sigs.length; i++) {
-      var s = sigs[i];
-      var pct = Math.round((s.confidence || 0) * 100);
+      var s      = sigs[i];
+      var pct    = Math.round((s.confidence || 0) * 100);
       var action = s.action || 'HOLD';
-      var cc = (action === 'BUY' || action === 'LONG') ? 'buy' : (action === 'SELL' || action === 'SHORT') ? 'sell' : 'hold';
+      var cc     = (action === 'BUY' || action === 'LONG') ? 'buy' : (action === 'SELL' || action === 'SHORT') ? 'sell' : 'hold';
       h += "<div class='signal-item'>" +
-        "<div class='signal-action " + action + "'>" + action + "</div>" +
-        "<div><div class='signal-symbol'>" + (s.symbol || '') + "</div>" +
-        "<div class='signal-strategy'>" + (s.strategy || '').slice(0, 30) + "</div></div>" +
+        "<div class='signal-action " + escapeHtml(action) + "'>" + escapeHtml(action) + "</div>" +
+        "<div><div class='signal-symbol'>"    + escapeHtml(s.symbol || '') + "</div>" +
+        "<div class='signal-strategy'>"       + escapeHtml((s.strategy || '').slice(0, 30)) + "</div></div>" +
         "<div class='signal-conf " + cc + "'>" + pct + "%</div>" +
         "</div>";
     }
@@ -1528,23 +1579,26 @@ function renderPagedTrades(mode) {
 
   var h = '';
   for (var i = 0; i < slice.length; i++) {
-    var t = slice[i];
-    var pnl = t.pnl || 0;
-    var lev = (t.leverage || 1) > 1 ? "<span class='lev-badge'>" + t.leverage + "x</span>" : '';
-    var pnlCell = t.status === 'open'
+    var t        = slice[i];
+    var pnl      = t.pnl || 0;
+    var safeLev  = Number(t.leverage || 1);
+    var lev      = safeLev > 1 ? "<span class='lev-badge'>" + safeLev + "x</span>" : '';
+    var pnlCell  = t.status === 'open'
       ? "<span class='td-open'>OPEN</span>"
-      : "<span class='" + (pnl >= 0 ? 'td-pos' : 'td-neg') + "'>" + (pnl >= 0 ? '+' : '') + pnl.toFixed(6) + "</span>";
-    var sideClass = (t.side === 'long' || t.side === 'buy') ? 'td-buy' : 'td-sell';
-    var ts = t.timestamp ? t.timestamp.slice(11, 16) + ' ' + t.timestamp.slice(5, 10) : '—';
+      : "<span class='" + (pnl >= 0 ? 'td-pos' : 'td-neg') + "'>" + (pnl >= 0 ? '+' : '') + Number(pnl).toFixed(6) + "</span>";
+    var safeSide   = escapeHtml((t.side || '').toLowerCase());
+    var sideClass  = (safeSide === 'long' || safeSide === 'buy') ? 'td-buy' : 'td-sell';
+    var safeStatus = escapeHtml(t.status || 'unknown');
+    var ts         = t.timestamp ? t.timestamp.slice(11, 16) + ' ' + t.timestamp.slice(5, 10) : '—';
     h += "<tr>" +
-      "<td class='td-time'>" + ts + "</td>" +
-      "<td class='td-sym'>" + (t.symbol || '') + "</td>" +
+      "<td class='td-time'>" + escapeHtml(ts) + "</td>" +
+      "<td class='td-sym'>"  + escapeHtml(t.symbol || '') + "</td>" +
       "<td class='td-type'>Market</td>" +
-      "<td class='" + sideClass + "'>" + (t.side || '').toUpperCase() + lev + "</td>" +
+      "<td class='" + sideClass + "'>" + escapeHtml((t.side || '').toUpperCase()) + lev + "</td>" +
       "<td>" + Number(t.price  || 0).toFixed(4) + "</td>" +
       "<td>" + Number(t.amount || 0).toFixed(4) + "</td>" +
       "<td>" + pnlCell + "</td>" +
-      "<td><span class='sdot " + t.status + "'></span>" + (t.status || '') + "</td>" +
+      "<td><span class='sdot " + safeStatus + "'></span>" + safeStatus + "</td>" +
       "</tr>";
   }
   tb.innerHTML = h;
@@ -1619,17 +1673,19 @@ function updateStatus() {
 /* ─── MODEL HEALTH ─── */
 function updateModelHealth() {
   get('/api/model_health', function(models) {
-    var el = document.getElementById('modelGrid');
+    var el    = document.getElementById('modelGrid');
     var names = { rf: 'Random Forest', lgbm: 'LightGBM', lstm: 'LSTM', tft: 'TFT' };
-    var h = '';
+    var h     = '';
     for (var key in models) {
-      var m = models[key];
+      var m   = models[key];
       var acc = m.loaded ? (m.accuracy * 100).toFixed(1) + '%' : 'N/A';
-      var cls = (m.loaded && m.accuracy >= 0.35) ? 'good' : 'warn';
+      // Threshold 0.40: random baseline for 3-class is 33%, meaningful signal starts at ~40%
+      var cls = (m.loaded && m.accuracy >= 0.40) ? 'good' : 'warn';
+      var trainedAt = m.trained_at ? escapeHtml(m.trained_at.slice(0, 10)) : '—';
       h += "<div class='model-cell'>" +
-        "<div class='model-name'>" + (names[key] || key) + "</div>" +
+        "<div class='model-name'>" + escapeHtml(names[key] || key) + "</div>" +
         "<div class='model-accuracy " + cls + "'>" + acc + "</div>" +
-        "<div class='model-date'>" + (m.trained_at ? m.trained_at.slice(0, 10) : '—') + "</div>" +
+        "<div class='model-date'>" + trainedAt + "</div>" +
         "</div>";
     }
     var count = Object.keys(models).length;
@@ -1694,7 +1750,10 @@ function updateLogs() {
 }
 
 /* ─── REFRESH ─── */
+var _refreshInProgress = false;
 function refresh() {
+  if (_refreshInProgress) return;
+  _refreshInProgress = true;
   updateStats();
   updateChart();
   updateSignals();
@@ -1703,9 +1762,11 @@ function refresh() {
   updateStatus();
   updateModelHealth();
   updateHealth();
-  loadHtfMode();
+  loadMode();
   loadStrategyConfig();
-  updateRetrainStatus();
+  // Only poll retrain status if no dedicated poll interval running
+  if (!retrainPollInterval) updateRetrainStatus();
+  _refreshInProgress = false;
 }
 
 initChart();

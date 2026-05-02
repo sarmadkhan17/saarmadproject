@@ -284,9 +284,12 @@ class BaseBot:
                     if c not in train_symbols:
                         train_symbols.append(c)
             raw_dfs = []
+            btc_limit = 10000
+            alt_limit = 5000
             for sym in train_symbols:
                 try:
-                    df = self.feed.fetch_ohlcv(sym, "1h", limit=1000)
+                    limit = btc_limit if sym == "BTC/USDT" else alt_limit
+                    df = self.feed.fetch_ohlcv(sym, "1h", limit=limit)
                     if df is not None and len(df) > 100:
                         raw_dfs.append(df)
                         self.log.info(f"Training data: {sym} ({len(df)} bars)")
@@ -294,7 +297,7 @@ class BaseBot:
                     self.log.warning(f"Could not fetch {sym}: {e}")
             if not raw_dfs:
                 self.log.warning("No training data — using BTC fallback")
-                df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=1000)
+                df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=btc_limit)
                 if df is not None:
                     raw_dfs = [df]
             if not raw_dfs:
@@ -334,15 +337,17 @@ class BaseBot:
                 np.concatenate(ctx_vratio_parts),
             )
             combined = pd.concat(raw_dfs, ignore_index=True)
+            btc_rows = len(raw_dfs[0]) if raw_dfs else 0
             self.log.info(
                 f"Training on {len(combined_feats)} clean rows "
-                f"from {len(feat_parts)} coins (forward_bars={fb})"
+                f"from {len(feat_parts)} coins (forward_bars={fb}, BTC={btc_rows} bars)"
             )
             results = self.ai.train_all(
                 combined,
                 feat_df=combined_feats,
                 labels_s=combined_labels,
                 ctx_arrays=combined_ctx,
+                btc_rows=btc_rows,
             )
             self.log.info(f"Training complete: {results}")
             self._check_model_health(results)
@@ -365,27 +370,18 @@ class BaseBot:
                 pass
 
     def _check_model_health(self, results: dict):
-        """Alert if any model trained with suspiciously low accuracy."""
-        issues = []
+        """Log if any model trained with suspiciously low accuracy. No Telegram alerts for expected events."""
         lstm_r = results.get("lstm", {})
         lstm_acc = lstm_r.get("accuracy", None)
         lstm_status = lstm_r.get("status", "")
 
         if lstm_status == "below_floor":
             new_acc = lstm_r.get("new_accuracy", 0)
-            issues.append(
-                f"LSTM new training ({new_acc:.1%}) was below floor — discarded, keeping old"
+            self.log.warning(
+                f"Model health: LSTM new training ({new_acc:.1%}) was below floor — discarded, keeping old"
             )
         elif lstm_acc is not None and lstm_acc < 0.40 and lstm_status not in ("kept_old", "below_floor"):
-            issues.append(f"LSTM accuracy {lstm_acc:.1%} is low — check training data")
-
-        if issues:
-            msg = f"⚠️ <b>Model Health Warning [{self.MODE.upper()}]</b>\n" + "\n".join(f"• {i}" for i in issues)
-            self.log.warning(f"Model health: {'; '.join(issues)}")
-            try:
-                self.notifier.send(msg)
-            except Exception:
-                pass
+            self.log.warning(f"Model health: LSTM accuracy {lstm_acc:.1%} is low — check training data")
 
     def place_order_with_confirmation(
         self, symbol, side, amount, params=None, max_retries=3
@@ -613,7 +609,7 @@ class BaseBot:
             except Exception as e:
                 self.log.error(f"RL manage error {trade.get('symbol','?')}: {e}")
 
-    def analyze_symbol(self, symbol, balance, open_trades, regime_ctx=None):
+    def analyze_symbol(self, symbol, balance, open_trades, regime_ctx=None, btc_1h_return=None):
         """
         Decision hierarchy: Signal → Context → Execution → Risk.
         IDENTICAL logic for spot and futures; subclasses only differ at order placement.
@@ -661,7 +657,7 @@ class BaseBot:
 
             # BTC momentum modifier
             if symbol != "BTC/USDT" and action in ("BUY", "SELL"):
-                btc_ret = self._get_btc_1h_return()
+                btc_ret = btc_1h_return if btc_1h_return is not None else 0.0
                 if action == "BUY" and btc_ret < -0.015:
                     conf = round(conf * 0.85, 4)
                 elif action == "SELL" and btc_ret > 0.015:
@@ -708,12 +704,15 @@ class BaseBot:
                     self._cancel_exchange_stop_loss(
                         symbol, holding.get("sl_order_id", "")
                     )
+                    self.rl_agent.record_external_close(holding["id"], pnl)
                     self.log.info(f"AI CLOSE {symbol} | PnL={pnl:+.4f}")
                     self.notifier.send_alert(f"AI CLOSE {symbol}\nPnL: ${pnl:+.4f}")
                 return
 
             # No open position to manage → evaluate new entry
             if action not in ("BUY", "SELL"):
+                return
+            if action == "SELL" and self.MODE == "spot" and not holding:
                 return
             eff_conf = max(
                 self.min_conf,
@@ -746,11 +745,13 @@ class BaseBot:
             if not self._passes_trade_filters(df_1h, symbol):
                 return
 
-            _, est_usdt = self.risk.get_position_size(
+            amount, est_usdt = self.risk.get_position_size(
                 confidence=conf, balance=balance, price=price,
                 df=df_1h, recent_trades=self.state.get_all_trades(),
                 regime_ctx=regime_ctx, all_agree=all_agree,
             )
+            if est_usdt < 10:
+                return
 
             # ══ RISK LAYER ═══════════════════════════════════════════════════
             # ONLY enforces: max trades, portfolio heat, circuit breaker.
@@ -771,14 +772,6 @@ class BaseBot:
                 self.log.info(f"GNN SKIP {symbol}: {gnn_msg}")
                 return
 
-            amount, usdt = self.risk.get_position_size(
-                confidence=conf, balance=balance, price=price,
-                df=df_1h, recent_trades=self.state.get_all_trades(),
-                regime_ctx=regime_ctx, all_agree=all_agree,
-            )
-            if usdt < 10:
-                return
-
             # Place order — subclass handles direction
             if action == "BUY":
                 order = self._place_buy(symbol, amount)
@@ -791,36 +784,35 @@ class BaseBot:
                 fill_price = float(
                     order.get("average") or order.get("price") or price
                 )
+                sl_id = ""
+                if self.MODE == "futures":
+                    atr = self.get_atr(symbol)
+                    side_for_sl = "buy" if action == "BUY" else "sell"
+                    sl_id = self._place_exchange_stop_loss(
+                        symbol, side_for_sl, amount, fill_price, atr
+                    )
                 trade = Trade(
-                    id        = order.get("id", f"t_{int(time.time())}"),
-                    symbol    = symbol,
-                    side      = side,
-                    amount    = amount,
-                    price     = fill_price,
-                    timestamp = datetime.now(timezone.utc).isoformat(),
-                    strategy  = strat,
-                    timeframe = f"AUTO-{self.MODE}",
-                    status    = "open",
-                    mode      = self.MODE,
-                    leverage  = self._get_leverage(),
+                    id          = order.get("id", f"t_{int(time.time())}"),
+                    symbol      = symbol,
+                    side        = side,
+                    amount      = amount,
+                    price       = fill_price,
+                    timestamp   = datetime.now(timezone.utc).isoformat(),
+                    strategy    = strat,
+                    timeframe   = f"AUTO-{self.MODE}",
+                    status      = "open",
+                    mode        = self.MODE,
+                    leverage    = self._get_leverage(),
+                    sl_order_id = sl_id,
                 )
                 self.state.add_trade(trade)
 
-                if self.MODE == "futures":
-                    atr = self.get_atr(symbol)
-                    sl_id = self._place_exchange_stop_loss(
-                        symbol, side, amount, fill_price, atr
-                    )
-                    if sl_id:
-                        trade.sl_order_id = sl_id
-                        self.state.save()
-
                 self.log.info(
-                    f"{side.upper()} {symbol} | ${usdt:.2f} | conf={conf:.2f}"
+                    f"{side.upper()} {symbol} | ${est_usdt:.2f} | conf={conf:.2f}"
                 )
                 self.notifier.send_alert(
                     f"{side.upper()} {symbol}\n"
-                    f"Amount: ${usdt:.2f} USDT\n"
+                    f"Amount: ${est_usdt:.2f} USDT\n"
                     f"Price: ${fill_price:.4f}\n"
                     f"Confidence: {conf:.0%}\n"
                     f"HTF: {htf_bias}\n"
@@ -943,6 +935,7 @@ class BaseBot:
                         "status":          "open",
                         "mode":            self.MODE,
                         "leverage":        pos.get("leverage", 5),
+                        "sl_order_id":     "",
                         "pnl":             0.0,
                         "close_price":     0.0,
                         "close_timestamp": ""
@@ -1112,6 +1105,8 @@ class BaseBot:
 
         regime_ctx = self.risk.detect_market_regime(self.feed, symbols)
 
+        btc_1h_return = self._get_btc_1h_return()
+
         # HMM overlay: adjusts thresholds only, never overrides signal direction
         try:
             btc_df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=150)
@@ -1179,7 +1174,7 @@ class BaseBot:
                     pass
                 continue
 
-            self.analyze_symbol(symbol, balance, open_trades, regime_ctx)
+            self.analyze_symbol(symbol, balance, open_trades, regime_ctx, btc_1h_return)
 
 
     def run(self):

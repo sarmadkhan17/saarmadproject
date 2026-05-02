@@ -135,10 +135,7 @@ class BinanceDemoClient:
     def fetch_ticker(self, symbol: str) -> dict:
         """Get current price for a symbol."""
         sym = self._normalize_symbol(symbol)
-        if self.mode == "spot":
-            data = self._public_get("/ticker/24hr", {"symbol": sym})
-        else:
-            data = self._public_get("/ticker/24hr", {"symbol": sym})
+        data = self._public_get("/ticker/24hr", {"symbol": sym})
         return {
             "symbol":      symbol,
             "last":        float(data["lastPrice"]),
