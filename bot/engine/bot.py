@@ -30,18 +30,25 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from env_config   import get_exchange_config, DATA_DIR, LOGS_DIR, BOT_ROOT
-from data_feed    import DataFeed, TrainingFeed, TrainingDataStore
-from data_feed_ws import BinanceWSPriceFeed
-from ai_strategy  import AIStrategyEngine
-from regime_model import HMMRegimeModel
-from rl_agent    import RLTradeManager
-from gnn_model   import GNNCorrelationFilter
-from agents       import AgentCoordinator
-from risk_manager import RiskManager
-from self_learner import SelfLearner
-from notifier     import TelegramNotifier
-from coin_scanner import CoinScanner
+from core.config   import get_exchange_config, DATA_DIR, LOGS_DIR, BOT_ROOT
+from data.feed    import DataFeed, TrainingFeed, TrainingDataStore
+from data.ws_feed import BinanceWSPriceFeed
+from models.ai_strategy  import AIStrategyEngine
+from models.hmm import HMMRegimeModel
+from models.rl_agent    import RLTradeManager
+from models.gnn   import GNNCorrelationFilter
+from agents.coordinator       import AgentCoordinator
+from risk.manager import RiskManager
+from tuning.learner import SelfLearner
+from notify.telegram     import TelegramNotifier
+from tuning.scanner import CoinScanner
+
+# v5: New 4-layer architecture
+from engine.profiles       import TradingProfile
+from engine.smc_agent      import SMCAgent
+from engine.ensemble       import EnsembleEngine
+from engine.risk_agent     import RiskDecisionAgent
+from engine.execution_engine import ExecutionEngine
 
 DATA = DATA_DIR
 
@@ -111,13 +118,17 @@ class StateManager:
 
     def _periodic_flush(self):
         while not self._stop_flushing.wait(self._FLUSH_INTERVAL):
-            if self._dirty:
-                self._do_save()
+            with self._lock:
+                if self._dirty:
+                    self._dirty = False
+                    self._do_save_locked()
 
     def shutdown(self):
         self._stop_flushing.set()
-        if self._dirty:
-            self._do_save()
+        with self._lock:
+            if self._dirty:
+                self._dirty = False
+                self._do_save_locked()
         if self._flush_thread:
             self._flush_thread.join(timeout=5)
 
@@ -135,22 +146,25 @@ class StateManager:
                 },
             }
 
-    def save(self):
+    def save(self, immediate: bool = False):
+        """Mark state dirty for async flush. Set immediate=True to force write now."""
         with self._lock:
             self._dirty = True
+            if immediate:
+                self._dirty = False
+                self._do_save_locked()
 
-    def _do_save(self):
-        with self._lock:
-            if not self._dirty:
-                return
-            with open(self.path, "w") as f:
-                json.dump(self.state, f, indent=2, default=str)
-            try:
-                shutil.copy2(str(self.path),
-                             str(self.path.with_suffix(".backup.json")))
-            except Exception:
-                pass
-            self._dirty = False
+    def _do_save_locked(self):
+        """Write state to disk. Caller must hold self._lock."""
+        tmp_path = self.path.with_suffix(".tmp.json")
+        with open(tmp_path, "w") as f:
+            json.dump(self.state, f, indent=2, default=str)
+        tmp_path.replace(self.path)
+        try:
+            shutil.copy2(str(self.path),
+                         str(self.path.with_suffix(".backup.json")))
+        except Exception:
+            pass
             self._last_flush = time.time()
 
     def add_trade(self, trade: Trade):
@@ -251,7 +265,52 @@ class BaseBot:
 
         self._balance_cache: Optional[float] = None
 
-        self._train()
+        # ── v5: Four-layer architecture ──────────────────────────────────────
+        self.profile = TradingProfile.from_config(self.config)
+        self.log.info(f"Trading profile: {self.profile.name} | "
+                      f"min_conf={self.profile.min_confidence} | "
+                      f"agents={self.profile.min_agent_agreement}/3 | "
+                      f"net_threshold={self.profile.net_score_threshold}")
+
+        self.smc_agent   = SMCAgent()
+        self.ensemble    = EnsembleEngine(self.smc_agent, None)  # tech_agent set below
+        # Wire technical agent (ML models) into ensemble
+        from engine.smc_agent import AgentSignal
+        class MLTechnicalAgent:
+            """Bridge: existing AIStrategyEngine → Ensemble AgentSignal."""
+            def __init__(self, ai):
+                self.ai = ai
+            def analyze(self, df, profile):
+                try:
+                    ml = self.ai.predict(df, "UNKNOWN", regime="RANGING")
+                    buy_votes  = ml.get("indicators", {}).get("buy_votes", 0)
+                    sell_votes = ml.get("indicators", {}).get("sell_votes", 0)
+                    buy_score  = max(0.0, buy_votes / 3 * 0.8)
+                    sell_score = max(0.0, sell_votes / 3 * 0.8)
+                    ml_action  = ml.get("action", "HOLD")
+                    ml_conf    = ml.get("confidence", 0.50)
+                    if ml_action == "BUY":
+                        buy_score = max(buy_score, ml_conf * 0.9)
+                    elif ml_action == "SELL":
+                        sell_score = max(sell_score, ml_conf * 0.9)
+                    net_score  = buy_score - sell_score
+                    return AgentSignal(
+                        agent="technical", buy_score=buy_score, sell_score=sell_score,
+                        net_score=net_score, confidence=ml_conf,
+                        reasoning=f"ML:{ml_action} votes={buy_votes}B/{sell_votes}S",
+                    )
+                except Exception as e:
+                    return AgentSignal("technical", 0, 0, 0, 0, reasoning=f"error:{e}")
+        self.ensemble = EnsembleEngine(
+            self.smc_agent, MLTechnicalAgent(self.ai), None  # Macro/Flow deferred
+        )
+        self.risk_agent  = RiskDecisionAgent(self.risk, self.gnn_filter, self.hmm_regime)
+        self.execution   = ExecutionEngine(
+            self.exchange, self.state, self.notifier, self.MODE,
+            get_leverage_fn=self._get_leverage,
+        )
+
+        self._train(quick=True)
 
     def _setup_exchange(self):
         """Override in subclass to set spot or futures."""
@@ -273,6 +332,9 @@ class BaseBot:
         """Override in subclass. Spot=simple, Futures=leveraged."""
         raise NotImplementedError
 
+    def _post_scan(self, symbols):
+        """Override in subclass. Called after scanner returns new watchlist."""
+
     def _reload_config(self):
         """Reload strategy config from YAML. Called before each retrain so dashboard changes apply."""
         try:
@@ -290,16 +352,125 @@ class BaseBot:
         except Exception as e:
             self.log.warning(f"Config reload failed: {e}")
 
-    def _train(self):
+    def _train_with_pipeline(self, quick: bool = False):
+        """v5 training: build unified multi-timeframe dataset, then train models
+        using make_features() / make_labels() per symbol for predict() compatibility."""
+        import pandas as pd
+        from features.pipeline import build_training_dataset, load_dataset
+        from models.ai_strategy import make_features, make_labels
+
+        training_cfg = self.config.get("training", {})
+        ml_cfg       = self.config.get("ml", {})
+        tf           = ml_cfg.get("timeframe", "15m")
+        fb           = ml_cfg.get("forward_bars", 2)
+        mc           = self.config.get("strategy", {}).get("min_confidence", 0.52)
+        mv           = self.config.get("strategy", {}).get("min_votes", 1)
+
+        # Clear stale feature_cols cache — fresh per-symbol features this run
+        mode_dir = DATA_DIR / self.MODE
+        for feat_path in (mode_dir / "rf_features.pkl", mode_dir / "lgbm_features.pkl"):
+            try:
+                feat_path.unlink(missing_ok=True)
+                self.log.info(f"Cleared stale feature cols: {feat_path.name}")
+            except OSError:
+                pass
+
+        # Build pipeline dataset from real Binance (cached to parquet)
+        symbols = training_cfg.get("symbols", [])
+        if self.scanner.top_coins:
+            extra = [c for c in self.scanner.top_coins[:training_cfg.get("top_n", 10)] if c not in symbols]
+            symbols = symbols + extra
+
+        dataset_stats = build_training_dataset(
+            self.training_feed, self.config, symbols=symbols,
+        )
+        if "error" in dataset_stats:
+            raise RuntimeError(f"Dataset build failed: {dataset_stats}")
+
+        self.log.info(
+            f"v5 dataset: {dataset_stats['n_rows']} rows, "
+            f"{dataset_stats['n_features']} features, "
+            f"{dataset_stats['n_symbols']} symbols, "
+            f"{dataset_stats['build_time_sec']}s build, "
+            f"{dataset_stats['memory_mb']} MB"
+        )
+
+        # Fetch per-symbol OHLCV and extract features/labels using make_features()
+        # (same as legacy path) so that predict() matches training columns
+        primary_tf = training_cfg.get("primary_timeframe", "1h")
+        self.log.info(f"Fetching per-symbol OHLCV for training (timeframe={primary_tf})...")
+        raw_dfs = []
+        for sym in dataset_stats["symbols"]:
+            df = self.training_feed.fetch_ohlcv(sym, primary_tf, limit=5000)
+            if df is not None and len(df) >= 100:
+                raw_dfs.append(df)
+                self.log.info(f"  {sym}: {len(df)} bars @ {primary_tf}")
+
+        if not raw_dfs:
+            raise RuntimeError("No valid OHLCV data for any symbol")
+
+        feat_parts, label_parts = [], []
+        for sym_df in raw_dfs:
+            try:
+                f = make_features(sym_df)
+                l = make_labels(sym_df, forward_bars=fb).reindex(f.index).dropna()
+                f = f.loc[l.index]
+                if len(f) < 50:
+                    self.log.warning(f"Feature skip: {len(f)} clean rows (<50)")
+                    continue
+                feat_parts.append(f.reset_index(drop=True))
+                label_parts.append(l.reset_index(drop=True))
+            except Exception as e:
+                self.log.warning(f"Feature/label error: {e}")
+
+        if not feat_parts:
+            raise RuntimeError("No clean feature rows — training aborted")
+
+        combined_feats  = pd.concat(feat_parts,  ignore_index=True)
+        combined_labels = pd.concat(label_parts, ignore_index=True)
+
+        self.log.info(
+            f"Training on {len(combined_feats)} clean rows from {len(feat_parts)} coins "
+            f"(forward_bars={fb}, source=real Binance)"
+        )
+
+        results = self.ai.train_all(
+            combined_feats,
+            feat_df=combined_feats,
+            labels_s=combined_labels,
+            btc_rows=0,
+            forward_bars=fb,
+            timeframe=tf,
+            min_confidence=mc,
+            min_votes=mv,
+            quick=quick,
+        )
+        self.log.info(f"Training complete: {results}")
+        self._check_model_health(results)
+        self.agents.invalidate_cache()
+
+    def _train(self, quick: bool = False):
         self._reload_config()
+        training_type = "QUICK (RF+LGBM only)" if quick else "FULL (all models)"
         self.log.info("=" * 50)
-        self.log.info(f"TRAINING AI MODELS v4 [{self.MODE.upper()} MODE]...")
+        self.log.info(f"TRAINING AI MODELS v4 [{self.MODE.upper()}] — {training_type}")
         self.log.info("Training source: real Binance public API (api.binance.com)")
         self.log.info("=" * 50)
+
+        training_cfg = self.config.get("training", {})
+
+        # ── v5 pipeline: unified multi-timeframe dataset ──────────────────────
+        if training_cfg.get("use_dataset_pipeline"):
+            try:
+                self._train_with_pipeline(quick)
+                return
+            except Exception as e:
+                self.log.warning(f"Dataset pipeline failed: {e} — falling back to legacy training")
+                # Fall through to legacy pipeline below
+
         try:
             import pandas as pd
-            import numpy as np
-            from ai_strategy import make_features, make_labels, AIStrategyEngine
+            from models.ai_strategy import make_features, make_labels
 
             train_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
                              "XRP/USDT", "DOGE/USDT", "ADA/USDT", "LINK/USDT"]
@@ -330,7 +501,6 @@ class BaseBot:
                 return
 
             feat_parts, label_parts = [], []
-            ctx_vol_parts, ctx_trend_parts, ctx_vratio_parts = [], [], []
             fb = self.config.get("ml", {}).get("forward_bars", 2)
             mc = self.config.get("strategy", {}).get("min_confidence", 0.52)
             mv = self.config.get("strategy", {}).get("min_votes", 2)
@@ -344,10 +514,6 @@ class BaseBot:
                     if len(f) < 50:
                         self.log.warning(f"Feature skip: coin had {len(sym_df)} bars, {len(f)} clean rows (<50)")
                         continue
-                    ctx_v, ctx_t, ctx_r = AIStrategyEngine._compute_context_features(sym_reset)
-                    ctx_vol_parts.append(ctx_v[f.index.values])
-                    ctx_trend_parts.append(ctx_t[f.index.values])
-                    ctx_vratio_parts.append(ctx_r[f.index.values])
                     feat_parts.append(f.reset_index(drop=True))
                     label_parts.append(l.reset_index(drop=True))
                 except Exception as e:
@@ -359,11 +525,6 @@ class BaseBot:
 
             combined_feats  = pd.concat(feat_parts,  ignore_index=True)
             combined_labels = pd.concat(label_parts, ignore_index=True)
-            combined_ctx    = (
-                np.concatenate(ctx_vol_parts),
-                np.concatenate(ctx_trend_parts),
-                np.concatenate(ctx_vratio_parts),
-            )
             combined = pd.concat(raw_dfs, ignore_index=True)
 
             self.log.info(
@@ -375,15 +536,16 @@ class BaseBot:
                 combined,
                 feat_df=combined_feats,
                 labels_s=combined_labels,
-                ctx_arrays=combined_ctx,
                 btc_rows=btc_bars if btc_bars > 0 else len(raw_dfs[0]) if raw_dfs else 0,
                 forward_bars=fb,
                 timeframe=tf,
                 min_confidence=mc,
                 min_votes=mv,
+                quick=quick,
             )
             self.log.info(f"Training complete: {results}")
             self._check_model_health(results)
+            self.agents.invalidate_cache()
 
             try:
                 btc_df = fetched.get("BTC/USDT") or self.training_feed.fetch_training_data(
@@ -410,18 +572,18 @@ class BaseBot:
                 pass
 
     def _check_model_health(self, results: dict):
-        """Log if any model trained with suspiciously low accuracy. No Telegram alerts for expected events."""
-        lstm_r = results.get("lstm", {})
-        lstm_acc = lstm_r.get("accuracy", None)
-        lstm_status = lstm_r.get("status", "")
-
-        if lstm_status == "below_floor":
-            new_acc = lstm_r.get("new_accuracy", 0)
-            self.log.warning(
-                f"Model health: LSTM new training ({new_acc:.1%}) was below floor — discarded, keeping old"
-            )
-        elif lstm_acc is not None and lstm_acc < 0.40 and lstm_status not in ("kept_old", "below_floor"):
-            self.log.warning(f"Model health: LSTM accuracy {lstm_acc:.1%} is low — check training data")
+        """Log if any model trained with suspiciously low accuracy."""
+        for model_key in ("rf", "lgbm", "lstm"):
+            r = results.get(model_key, {})
+            acc = r.get("accuracy", None)
+            status = r.get("status", "")
+            if status == "below_floor":
+                new_acc = r.get("new_accuracy", 0)
+                self.log.warning(
+                    f"Model health: {model_key.upper()} new training ({new_acc:.1%}) was below floor — keeping old"
+                )
+            elif acc is not None and acc < 0.40 and status not in ("kept_old", "below_floor"):
+                self.log.warning(f"Model health: {model_key.upper()} accuracy {acc:.1%} is low — check training data")
 
     def place_order_with_confirmation(
         self, symbol, side, amount, params=None, max_retries=3
@@ -478,16 +640,6 @@ class BaseBot:
     def get_atr(self, symbol) -> float:
         tf = self.config.get("scanner", {}).get("timeframe", "15m")
         return self.feed.get_atr(symbol, tf, 14)
-
-    def _get_btc_return(self) -> float:
-        tf = self.config.get("scanner", {}).get("timeframe", "15m")
-        try:
-            df = self.feed.fetch_ohlcv("BTC/USDT", tf, limit=3)
-            if df is not None and len(df) >= 2:
-                return float(df["close"].pct_change().iloc[-1])
-        except Exception:
-            pass
-        return 0.0
 
     def get_usdt_balance(self) -> float:
         try:
@@ -564,7 +716,10 @@ class BaseBot:
         """
         open_trades = self.state.get_open_trades()
         if not open_trades:
+            self.rl_agent.prune_pending([])
             return
+
+        self.rl_agent.prune_pending([t["id"] for t in open_trades])
 
         regime  = (regime_ctx or {}).get("hmm_regime", "RANGING")
         balance = self.get_usdt_balance()
@@ -600,7 +755,7 @@ class BaseBot:
                     current_price = current_price,
                     atr           = atr,
                     regime        = regime,
-                    price_ago  = price_ago,
+                    price_1h_ago  = price_ago,
                 )
 
                 if action == "HOLD":
@@ -653,220 +808,117 @@ class BaseBot:
                 self.log.error(f"RL manage error {trade.get('symbol','?')}: {e}")
 
     def analyze_symbol(self, symbol, balance, open_trades, regime_ctx=None, btc_1h_return=None):
-        """
-        Decision hierarchy: Signal → Context → Execution → Risk.
-        IDENTICAL logic for spot and futures; subclasses only differ at order placement.
-        """
+        """Decision pipeline: Ensemble → Risk Agent → Execution. v5 layered architecture."""
         try:
+            # Fetch data using training config timeframes for consistency
             tf = (self.config.get("ml", {}).get("timeframe")
                   or self.config.get("scanner", {}).get("timeframe", "15m"))
-            multi_tfs = [("1h", 300), ("4h", 200), ("1d", 100)]
-            if tf not in [t[0] for t in multi_tfs]:
-                multi_tfs.insert(0, (tf, 500))
+            train_tfs = self.config.get("training", {}).get("timeframes", ["1h", "4h", "1d"])
+            multi_tfs = [(t, 500 if t == tf else (300 if t in ("1h","30m") else 200)) for t in train_tfs]
             dfs = self.feed.fetch_multi_timeframe(symbol, timeframes=multi_tfs)
             if not dfs or tf not in dfs:
                 return
 
             df_tf = dfs[tf]
+            df_1h = dfs.get("1h", df_tf)
             self.ai.ingest_new_data(symbol, df_tf)
 
-            # ══ SIGNAL LAYER ═════════════════════════════════════════════════
-            # ML models output direction + confidence; agent coordinator refines.
+            # ── Layer 1: Ensemble (SMC + Technical + Macro/Flow) ─────────
             hmm_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
-            ml_signal  = self.ai.predict(df_tf, symbol, regime=hmm_regime)
-            all_agree  = (ml_signal.get("indicators", {}).get("buy_votes", 0) == 3 or
-                          ml_signal.get("indicators", {}).get("sell_votes", 0) == 3)
-            signal     = self.agents.analyze(symbol, df_tf, ml_signal)
+            ensemble = self.ensemble.run(symbol, df_1h, self.profile)
 
-            action = signal["action"]
-            conf   = signal["confidence"]
-            strat  = signal["strategy"]
+            # Log signals for dashboard
+            for s in ensemble.signals:
+                self.log.info(f"AGENT {symbol} | {s.agent}: net={s.net_score:+.3f} buy={s.buy_score:.2f} sell={s.sell_score:.2f} | {s.reasoning[:90]}")
+            self.log.info(f"ENSEMBLE {symbol} | action={ensemble.action} net={ensemble.net_score:+.3f} conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total}")
 
-            # ══ CONTEXT LAYER ════════════════════════════════════════════════
-            # Adjusts confidence / direction — never enforces portfolio constraints.
+            if ensemble.action == "HOLD":
+                self.state.add_signal({
+                    "symbol": symbol, "action": "HOLD", "confidence": ensemble.confidence,
+                    "strategy": f"ensemble:{ensemble.net_score:+.3f}",
+                    "timeframe": "AUTO",
+                    "indicators": {"buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
+                                   "agents_agree": ensemble.agents_agreeing},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                self.log.info(f"{symbol} | HOLD | conv={ensemble.confidence:.2f} | "
+                              f"net={ensemble.net_score:+.3f} | "
+                              f"agree={ensemble.agents_agreeing}/{ensemble.agents_total} | "
+                              f"regime={hmm_regime}")
+                return
 
-            # HTF bias filter
-            htf_bias     = self.get_htf_bias(dfs)
-            htf_conflict = (action == "BUY" and htf_bias == "SELL") or \
-                           (action == "SELL" and htf_bias == "BUY")
-            if htf_conflict:
-                if self.htf_filter_mode == "soft":
-                    conf = round(conf * 0.70, 4)
-                    self.log.info(f"{symbol} {action} softened by HTF {htf_bias} → conf={conf:.2f}")
-                elif self.htf_filter_mode == "hard":
-                    if conf < 0.65:
-                        action = "HOLD"
-                        self.log.info(f"{symbol} {action} hard-blocked by HTF {htf_bias} (conf={conf:.2f} < 0.65)")
-                    else:
-                        self.log.info(f"{symbol} {action} passed hard HTF gate (conf={conf:.2f} >= 0.65)")
-                else:  # strict (default)
-                    action = "HOLD"
-                    self.log.info(f"{symbol} {action} blocked by HTF {htf_bias} (strict)")
+            # HTF bias for risk agent
+            htf_bias = self.get_htf_bias(dfs)
+            price = self.get_price(symbol)
 
-            # BTC momentum modifier
-            if symbol != "BTC/USDT" and action in ("BUY", "SELL"):
-                btc_ret = btc_1h_return if btc_1h_return is not None else 0.0
-                if action == "BUY" and btc_ret < -0.015:
-                    conf = round(conf * 0.85, 4)
-                elif action == "SELL" and btc_ret > 0.015:
-                    conf = round(conf * 0.85, 4)
-                elif action == "BUY" and btc_ret > 0.015:
-                    conf = min(round(conf + 0.04, 4), 0.95)
+            # ── Layer 2: Risk Decision ──────────────────────────────────
+            decision = self.risk_agent.evaluate(
+                ensemble=ensemble, symbol=symbol, df_1h=df_1h,
+                profile=self.profile, regime_ctx=regime_ctx,
+                btc_return=btc_1h_return or 0.0,
+                open_trades=open_trades, balance=balance,
+                get_price_fn=self.get_price, get_atr_fn=self.get_atr,
+                htf_bias=htf_bias,
+            )
 
-            # Regime gate (context — blocks direction, not portfolio)
-            if regime_ctx and action in ("BUY", "SELL"):
-                if not regime_ctx.get("gate", True):
-                    self.log.info(f"{symbol} {action} blocked: regime={regime_ctx['regime']}")
-                    action = "HOLD"
-                elif action == "BUY" and not regime_ctx.get("allow_longs", True):
-                    self.log.info(f"{symbol} BUY blocked — longs off in {regime_ctx['regime']}")
-                    action = "HOLD"
-                elif action == "SELL" and not regime_ctx.get("allow_shorts", True):
-                    self.log.info(f"{symbol} SELL blocked — shorts off in {regime_ctx['regime']}")
-                    action = "HOLD"
-
+            # Log signal regardless of decision
             self.state.add_signal({
-                "symbol": symbol, "action": action, "confidence": conf,
-                "strategy": f"HTF:{htf_bias}+{strat}", "timeframe": "AUTO",
-                "indicators": signal.get("indicators", {}),
-                "timestamp":  datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "action": ensemble.action if decision.approved else "HOLD",
+                "confidence": decision.adjusted_conf if decision.approved else ensemble.confidence,
+                "strategy": f"ensemble:{ensemble.net_score:+.3f}",
+                "timeframe": "AUTO",
+                "indicators": {
+                    "buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
+                    "agents_agree": ensemble.agents_agreeing,
+                    "profile": self.profile.name, "reasons": decision.reasons,
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            self.log.info(f"{symbol} | {action} | conf={conf:.2f} | HTF={htf_bias} | regime={hmm_regime}")
 
-            # ══ EXECUTION LAYER ══════════════════════════════════════════════
-            # Decide whether to close, open, or wait. Handles position sizing.
+            if not decision.approved:
+                self.log.info(f"{symbol} | REJECTED {ensemble.action} | "
+                              f"conf={ensemble.confidence:.2f} | "
+                              f"{' | '.join(decision.reasons)}")
+                return
 
+            # ── Layer 3: Execution ─────────────────────────────────────
+            if not price or price <= 0:
+                return
+
+            # Close opposing position first (if any)
             holding = self._find_position(symbol, open_trades)
-
-            # Close existing position on SELL signal
-            if action == "SELL" and holding and conf >= self.min_conf:
+            opp_side = {"BUY": "long", "SELL": "short"}.get(ensemble.action)
+            if holding and holding["side"] != opp_side:
                 order = self._place_close(symbol, holding["amount"], holding["side"])
                 if order:
-                    price = self.get_price(symbol)
-                    pnl   = self._calc_pnl(holding, price)
-                    self.state.close_trade(holding["id"], price, pnl)
+                    close_price = self.get_price(symbol) or price
+                    pnl = self._calc_pnl(holding, close_price)
+                    self.state.close_trade(holding["id"], close_price, pnl)
                     self.ai.record_trade_result(symbol, pnl)
                     self.agents.record_trade_result(symbol, pnl)
                     self.risk.record_trade_result(pnl, balance)
                     self.risk.cleanup_trade(holding["id"])
-                    self._cancel_exchange_stop_loss(
-                        symbol, holding.get("sl_order_id", "")
-                    )
+                    self._cancel_exchange_stop_loss(symbol, holding.get("sl_order_id", ""))
                     self.rl_agent.record_external_close(holding["id"], pnl)
-                    self.log.info(f"AI CLOSE {symbol} | PnL={pnl:+.4f}")
-                    self.notifier.send_alert(f"AI CLOSE {symbol}\nPnL: ${pnl:+.4f}")
+                    self.log.info(f"CLOSE OPPOSITE {symbol} | PnL={pnl:+.4f}")
+                    self.notifier.send_alert(f"CLOSE OPPOSITE {symbol}\nPnL: ${pnl:+.4f}")
+                # Re-check open trades after close
+                open_trades = self.state.get_open_trades()
+
+            # Dedup: don't open if already holding same side
+            holding = self._find_position(symbol, open_trades)
+            if holding and holding["side"] == opp_side:
+                self.log.info(f"SKIP {symbol}: already open {holding['side']}")
+                return
+            if ensemble.action == "SELL" and self.MODE == "spot" and not holding:
                 return
 
-            # No open position to manage → evaluate new entry
-            if action not in ("BUY", "SELL"):
-                return
-            if action == "SELL" and self.MODE == "spot" and not holding:
-                return
-            eff_conf = max(
-                self.min_conf,
-                regime_ctx.get("min_conf", self.min_conf) if regime_ctx else self.min_conf,
+            trade = self.execution.execute_entry(
+                decision=decision, symbol=symbol, action=ensemble.action,
+                price=price, get_atr_fn=self.get_atr,
+                place_buy_fn=self._place_buy, place_sell_fn=self._place_sell,
+                strat=f"ensemble:{ensemble.net_score:+.3f}",
             )
-            if conf < eff_conf:
-                self.log.info(
-                    f"{symbol} conf={conf:.2f} < eff_min={eff_conf:.2f}"
-                    f" ({hmm_regime})"
-                )
-                return
-            if holding:
-                return
-
-            # Dedup check for futures
-            if self.MODE == "futures":
-                try:
-                    positions = self.exchange.get_position()
-                    if any(p["symbol"] == symbol for p in positions):
-                        self.log.info(f"SKIP {symbol}: position already exists on exchange")
-                        return
-                except Exception:
-                    pass
-
-            price = self.get_price(symbol)
-            if price is None or price <= 0:
-                return
-
-            # Step 10: Trade filters — require vol spike + ATR expansion before entry
-            df_1h = dfs.get("1h", df_tf)
-            if not self._passes_trade_filters(df_1h, symbol):
-                return
-
-            amount, est_usdt = self.risk.get_position_size(
-                confidence=conf, balance=balance, price=price,
-                df=df_1h, recent_trades=self.state.get_all_trades(),
-                regime_ctx=regime_ctx, all_agree=all_agree,
-            )
-            if est_usdt < 10:
-                return
-
-            # ══ RISK LAYER ═══════════════════════════════════════════════════
-            # ONLY enforces: max trades, portfolio heat, circuit breaker.
-            # Does NOT override signal direction or confidence.
-            ok, reason = self.risk.can_open_trade(
-                symbol=symbol, open_trades=open_trades,
-                balance=balance, new_usdt=est_usdt,
-                get_price_fn=self.get_price,
-            )
-            if not ok:
-                self.log.info(f"RISK SKIP {symbol}: {reason}")
-                return
-
-            # GNN correlation filter (context-level, not risk-level)
-            open_syms = [t["symbol"] for t in open_trades]
-            gnn_ok, gnn_msg, gnn_score = self.gnn_filter.check(symbol, open_syms)
-            if not gnn_ok:
-                self.log.info(f"GNN SKIP {symbol}: {gnn_msg}")
-                return
-
-            # Place order — subclass handles direction
-            if action == "BUY":
-                order = self._place_buy(symbol, amount)
-                side  = "buy" if self.MODE == "spot" else "long"
-            else:
-                order = self._place_sell(symbol, amount)
-                side  = "sell" if self.MODE == "spot" else "short"
-
-            if order:
-                fill_price = float(
-                    order.get("average") or order.get("price") or price
-                )
-                sl_id = ""
-                if self.MODE == "futures":
-                    atr = self.get_atr(symbol)
-                    side_for_sl = "long" if action == "BUY" else "short"
-                    sl_id = self._place_exchange_stop_loss(
-                        symbol, side_for_sl, amount, fill_price, atr
-                    )
-                trade = Trade(
-                    id          = order.get("id", f"t_{int(time.time())}"),
-                    symbol      = symbol,
-                    side        = side,
-                    amount      = amount,
-                    price       = fill_price,
-                    timestamp   = datetime.now(timezone.utc).isoformat(),
-                    strategy    = strat,
-                    timeframe   = f"AUTO-{self.MODE}",
-                    status      = "open",
-                    mode        = self.MODE,
-                    leverage    = self._get_leverage(),
-                    sl_order_id = sl_id,
-                )
-                self.state.add_trade(trade)
-
-                self.log.info(
-                    f"{side.upper()} {symbol} | ${est_usdt:.2f} | conf={conf:.2f}"
-                )
-                self.notifier.send_alert(
-                    f"{side.upper()} {symbol}\n"
-                    f"Amount: ${est_usdt:.2f} USDT\n"
-                    f"Price: ${fill_price:.4f}\n"
-                    f"Confidence: {conf:.0%}\n"
-                    f"HTF: {htf_bias}\n"
-                    f"Mode: {self.MODE.upper()}"
-                )
 
         except Exception as e:
             self.log.error(f"Error analyzing {symbol}: {e}", exc_info=True)
@@ -933,14 +985,19 @@ class BaseBot:
         pass
 
     def sync_with_exchange(self):
-        """Sync state with real exchange positions."""
-        if self.MODE != "futures":
-            return
+        """Sync state with exchange. Closes local trades not found on exchange per mode."""
+        if self.MODE == "futures":
+            self._sync_futures()
+        elif self.MODE == "spot":
+            self._sync_spot()
+
+    def _sync_futures(self):
+        """Position-based sync for futures mode."""
         try:
             self.log.info("Sync running — mode=futures")
             try:
                 positions = self.exchange.get_position()
-                self.log.info(f"Sync step 2: got {len(positions) if positions else 0} positions")
+                self.log.info(f"Sync: got {len(positions) if positions else 0} positions")
             except Exception as pe:
                 self.log.warning(f"get_position failed: {pe}")
                 positions = []
@@ -955,35 +1012,204 @@ class BaseBot:
             binance_syms = {p["symbol"] for p in positions}
             our_syms = set(our_open.keys())
 
-            for pos in positions:
-                sym = pos["symbol"]
-                if sym in our_syms:
-                    for t in d["trades"]:
-                        if t["symbol"] == sym and t["status"] == "open":
-                            t["amount"]    = pos["amount"]
-                            t["price"]     = pos["entry_price"]
-                            t["leverage"]  = pos.get("leverage", 5)
-                            t["live_pnl"]  = round(pos["pnl"], 6)
-                            t["mark_price"]= pos.get("mark_price", 0)
+            with self.state._lock:
+                for pos in positions:
+                    sym = pos["symbol"]
+                    if sym in our_syms:
+                        for t in d["trades"]:
+                            if t["symbol"] == sym and t["status"] == "open":
+                                t["amount"]    = pos["amount"]
+                                t["price"]     = pos["entry_price"]
+                                t["leverage"]  = pos.get("leverage", 5)
+                                t["live_pnl"]  = round(pos["pnl"], 6)
+                                t["mark_price"]= pos.get("mark_price", 0)
 
-            import time as _time
-            for pos in positions:
-                sym = pos["symbol"]
-                if sym not in our_syms:
+                import time as _time
+                for pos in positions:
+                    sym = pos["symbol"]
+                    if sym not in our_syms:
+                        trade = {
+                            "id":              f"sync_{sym.replace('/','_')}_{int(_time.time())}",
+                            "symbol":          sym,
+                            "side":            pos["side"],
+                            "amount":          pos["amount"],
+                            "price":           pos["entry_price"],
+                            "mark_price":      pos.get("mark_price", 0),
+                            "live_pnl":        round(pos["pnl"], 6),
+                            "timestamp":       datetime.now(timezone.utc).isoformat(),
+                            "strategy":        "synced_from_exchange",
+                            "timeframe":       f"AUTO-{self.MODE}",
+                            "status":          "open",
+                            "mode":            self.MODE,
+                            "leverage":        pos.get("leverage", 5),
+                            "sl_order_id":     "",
+                            "pnl":             0.0,
+                            "close_price":     0.0,
+                            "close_timestamp": ""
+                        }
+                        d["trades"].append(trade)
+                        d["stats"]["total_trades"] += 1
+                        self.log.info(f"Sync: added {sym} {pos['side']}")
+
+                for t in d["trades"]:
+                    if t["status"] == "open" and t["symbol"] not in binance_syms:
+                        ts_str = t.get("timestamp", "")
+                        recent_entry = False
+                        try:
+                            if ts_str:
+                                opened = datetime.fromisoformat(ts_str)
+                                if opened.tzinfo is None:
+                                    opened = opened.replace(tzinfo=timezone.utc)
+                                if (datetime.now(timezone.utc) - opened).total_seconds() < 120:
+                                    recent_entry = True
+                        except (ValueError, TypeError):
+                            pass
+                        if recent_entry:
+                            self.log.debug(f"Sync: skipping orphan check for {t['symbol']} (entered <120s ago)")
+                            continue
+                        try:
+                            last_price = self.exchange.fetch_ticker(t["symbol"])["last"]
+                            entry  = float(t["price"])
+                            amount = float(t["amount"])
+                            side   = t.get("side", "long")
+                            pnl    = (last_price - entry) * amount if side == "long" else (entry - last_price) * amount
+                        except Exception:
+                            last_price = float(t["price"])
+                            pnl        = 0.0
+                        t["status"]          = "cancelled"
+                        t["close_price"]     = last_price
+                        t["pnl"]             = round(pnl, 6)
+                        t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
+                        d["stats"]["total_pnl"] += round(pnl, 6)
+                        if pnl > 0:
+                            d["stats"]["wins"]   += 1
+                        elif pnl < 0:
+                            d["stats"]["losses"] += 1
+                        self.log.info(f"Sync: cancelled orphan {t['symbol']} pnl={pnl:+.4f}")
+                        self._cancel_exchange_stop_loss(
+                            t["symbol"], t.get("sl_order_id", "")
+                        )
+                        try:
+                            self.risk.record_trade_result(pnl, usdt)
+                        except Exception:
+                            pass
+                        try:
+                            self.ai.record_trade_result(t.get("symbol", "unknown"), pnl)
+                        except Exception:
+                            pass
+
+            live_pnl = round(sum(p["pnl"] for p in positions), 4)
+            self.log.info(f"Sync saving balance=${usdt:.2f} live_pnl={live_pnl:.4f}")
+            self.state.state["stats"]["balance"]        = round(usdt, 2)
+            self.state.state["stats"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
+            self.state.state["stats"]["total_live_pnl"] = live_pnl
+        except Exception as e:
+            import traceback
+            self.log.warning(f"Sync error: {e}")
+            self.log.warning(traceback.format_exc())
+        finally:
+            self.state.save(immediate=True)
+
+    def _sync_spot(self):
+        """Balance-based sync for spot mode."""
+        try:
+            self.log.info("Sync running — mode=spot")
+            bal = self.exchange.fetch_balance()
+            totals = bal.get("total", {})
+
+            d = self.state.state
+            our_open = {t["symbol"]: t for t in d["trades"] if t["status"] == "open"}
+            our_syms = set(our_open.keys())
+            all_syms = {t["symbol"] for t in d["trades"]}
+
+            with self.state._lock:
+                # RULE 1: Trade in bot, NOT on exchange → cancel it
+                for t in d["trades"]:
+                    if t["status"] != "open":
+                        continue
+                    ts_str = t.get("timestamp", "")
+                    recent_entry = False
+                    try:
+                        if ts_str:
+                            opened = datetime.fromisoformat(ts_str)
+                            if opened.tzinfo is None:
+                                opened = opened.replace(tzinfo=timezone.utc)
+                            if (datetime.now(timezone.utc) - opened).total_seconds() < 120:
+                                recent_entry = True
+                    except (ValueError, TypeError):
+                        pass
+                    if recent_entry:
+                        self.log.debug(f"Sync: skipping orphan check for {t['symbol']} (entered <120s ago)")
+                        continue
+                    asset = t["symbol"].split("/")[0]
+                    held = float(totals.get(asset, 0))
+                    min_held = float(t["amount"]) * 0.1
+                    trade_value = float(t["amount"]) * float(t["price"])
+                    if held < min_held or trade_value < 1.0:
+                        try:
+                            last_price = self.exchange.fetch_ticker(t["symbol"])["last"]
+                            entry  = float(t["price"])
+                            amount = float(t["amount"])
+                            pnl    = (last_price - entry) * amount
+                        except Exception:
+                            last_price = float(t["price"])
+                            pnl        = 0.0
+                        t["status"]          = "cancelled"
+                        t["close_price"]     = last_price
+                        t["pnl"]             = round(pnl, 6)
+                        t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
+                        d["stats"]["total_pnl"] += round(pnl, 6)
+                        if pnl > 0:
+                            d["stats"]["wins"]   += 1
+                        elif pnl < 0:
+                            d["stats"]["losses"] += 1
+                        self.log.info(f"Sync: cancelled {t['symbol']} (asset {asset} balance={held:.6f}) pnl={pnl:+.4f}")
+                        try:
+                            self.risk.record_trade_result(pnl, 5000)
+                        except Exception:
+                            pass
+                        try:
+                            self.ai.record_trade_result(t.get("symbol", "unknown"), pnl)
+                        except Exception:
+                            pass
+
+                # RULE 2: Asset on exchange, NOT in bot → add it (buy-only for spot)
+                for asset, free_val in bal.get("free", {}).items():
+                    free = float(free_val)
+                    if free <= 0:
+                        continue
+                    # Only add USDT-paired assets (skip stablecoins)
+                    sym = f"{asset}/USDT"
+                    if asset in ("USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD"):
+                        continue
+                    if sym in all_syms:
+                        continue
+                    try:
+                        ticker = self.exchange.fetch_ticker(sym)
+                        price = float(ticker.get("last", 0))
+                    except Exception:
+                        continue
+                    if price <= 0:
+                        continue
+                    # Skip dust balances (less than $1 USDT value)
+                    if free * price < 1.0:
+                        self.log.debug(f"Sync: skipping dust {sym} (${free * price:.4f})")
+                        continue
+                    import time as _time
                     trade = {
                         "id":              f"sync_{sym.replace('/','_')}_{int(_time.time())}",
                         "symbol":          sym,
-                        "side":            pos["side"],
-                        "amount":          pos["amount"],
-                        "price":           pos["entry_price"],
-                        "mark_price":      pos.get("mark_price", 0),
-                        "live_pnl":        round(pos["pnl"], 6),
+                        "side":            "buy",
+                        "amount":          round(free, 8),
+                        "price":           price,
+                        "mark_price":      price,
+                        "live_pnl":        0.0,
                         "timestamp":       datetime.now(timezone.utc).isoformat(),
                         "strategy":        "synced_from_exchange",
                         "timeframe":       f"AUTO-{self.MODE}",
                         "status":          "open",
                         "mode":            self.MODE,
-                        "leverage":        pos.get("leverage", 5),
+                        "leverage":        1,
                         "sl_order_id":     "",
                         "pnl":             0.0,
                         "close_price":     0.0,
@@ -991,49 +1217,19 @@ class BaseBot:
                     }
                     d["trades"].append(trade)
                     d["stats"]["total_trades"] += 1
-                    self.log.info(f"Sync: added {sym} {pos['side']}")
+                    self.log.info(f"Sync: added {sym} buy {free}")
 
-
-            for t in d["trades"]:
-                if t["status"] == "open" and t["symbol"] not in binance_syms:
-                    try:
-                        last_price = self.exchange.fetch_ticker(t["symbol"])["last"]
-                        entry  = float(t["price"])
-                        amount = float(t["amount"])
-                        side   = t.get("side", "long")
-                        pnl    = (last_price - entry) * amount if side == "long" else (entry - last_price) * amount
-                    except Exception:
-                        last_price = float(t["price"])
-                        pnl        = 0.0
-                    t["status"]          = "closed"
-                    t["close_price"]     = last_price
-                    t["pnl"]             = round(pnl, 6)
-                    t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
-                    self.log.info(f"Sync: closed orphan {t['symbol']} pnl={pnl:+.4f}")
-                    self._cancel_exchange_stop_loss(
-                        t["symbol"], t.get("sl_order_id", "")
-                    )
-                    # Feed orphan close back to risk and AI systems
-                    try:
-                        self.risk.record_trade_result(pnl, usdt)
-                    except Exception:
-                        pass
-                    try:
-                        self.ai.record_trade_result(t.get("symbol", "unknown"), pnl)
-                    except Exception:
-                        pass
-
-            live_pnl = round(sum(p["pnl"] for p in positions), 4)
-            self.log.info(f"Sync saving balance=${usdt:.2f} live_pnl={live_pnl:.4f}")
-            self.state.state["stats"]["balance"]        = round(usdt, 2)
-            self.state.state["stats"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
-            self.state.state["stats"]["total_live_pnl"] = live_pnl
-            self.state.save()
-
+            usdt = float(totals.get("USDT", 0))
+            self.log.info(f"Sync saving balance=${usdt:.2f}")
+            self.state.state["stats"]["balance"]   = round(usdt, 2)
+            self.state.state["stats"]["last_sync"] = datetime.now(timezone.utc).isoformat()
+            self.state.state["stats"]["total_live_pnl"] = 0.0
         except Exception as e:
             import traceback
             self.log.warning(f"Sync error: {e}")
             self.log.warning(traceback.format_exc())
+        finally:
+            self.state.save(immediate=True)
 
     def _get_watchlist_hash(self, coins):
         return hash(tuple(sorted(coins)))
@@ -1059,61 +1255,78 @@ class BaseBot:
                 # Retrain without deleting existing models:
                 # champion/challenger in each model's train() will decide
                 # whether to keep the old or save the new.
-                self._train()
+                self._train(quick=True)
         self._last_watchlist_hash = new_hash
         self._last_watchlist      = list(new_coins)
 
     def _check_for_retrain_request(self):
         """Check if dashboard requested a retrain via signal file."""
-        p = DATA_DIR / "retrain_requested.json"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        p = DATA_DIR / f"retrain_requested_{self.MODE}.json"
+        status_path = DATA_DIR / f"retrain_status_{self.MODE}.json"
         if not p.exists():
             return
-        try:
-            with open(p) as f:
-                req = json.load(f)
-            if not req.get("requested"):
-                return
-            self.log.info(f"Retrain request detected from {req.get('source', 'unknown')}: {req.get('reason', 'manual')}")
+
+        req = None
+        for attempt in range(3):
             try:
-                self.notifier.send(
-                    f"🔄 <b>Retraining requested [{self.MODE.upper()}]</b>\n"
-                    f"Source: {req.get('source', 'dashboard')}\n"
-                    f"Reason: {req.get('reason', 'manual')}"
-                )
-            except Exception:
-                pass
-            # Update status to 'running'
-            status_path = DATA_DIR / "retrain_status.json"
+                with open(p) as f:
+                    req = json.load(f)
+                break
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                if attempt < 2:
+                    time.sleep(0.5)
+                else:
+                    return
+
+        if not req or not req.get("requested"):
+            return
+
+        self.log.info(f"Retrain request detected from {req.get('source', 'unknown')}: {req.get('reason', 'manual')}")
+        try:
+            self.notifier.send(
+                f"🔄 <b>Retraining requested [{self.MODE.upper()}]</b>\n"
+                f"Source: {req.get('source', 'dashboard')}\n"
+                f"Reason: {req.get('reason', 'manual')}"
+            )
+        except Exception:
+            pass
+
+        try:
             with open(status_path, "w") as f:
                 json.dump({
                     "status": "running",
                     "started": datetime.now(timezone.utc).isoformat(),
                     "source": req.get("source", "unknown"),
                 }, f)
-            # Trigger retraining
+        except OSError:
+            pass
+
+        try:
             start_time = time.time()
-            self._train()
+            self._train(quick=False)
             elapsed = time.time() - start_time
-            # Update status to 'complete'
-            with open(status_path, "w") as f:
-                json.dump({
-                    "status": "completed",
-                    "started": req.get("timestamp", ""),
-                    "completed": datetime.now(timezone.utc).isoformat(),
-                    "duration_seconds": round(elapsed, 1),
-                }, f)
-            # Clear the request file
-            p.unlink()
+            try:
+                with open(status_path, "w") as f:
+                    json.dump({
+                        "status": "completed",
+                        "started": req.get("timestamp", ""),
+                        "completed": datetime.now(timezone.utc).isoformat(),
+                        "duration_seconds": round(elapsed, 1),
+                    }, f)
+            except OSError:
+                pass
         except Exception as e:
-            self.log.error(f"Retrain request processing error: {e}", exc_info=True)
-            status_path = DATA_DIR / "retrain_status.json"
-            with open(status_path, "w") as f:
-                json.dump({
-                    "status": "error",
-                    "error": str(e),
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }, f)
-            # Clear the request file anyway to avoid infinite loop
+            self.log.error(f"Retrain processing error: {e}", exc_info=True)
+            try:
+                self.notifier.send_error_alert(str(e), context=f"Retrain failed [{self.MODE.upper()}]")
+            except Exception:
+                pass
+            try:
+                status_path.unlink()
+            except Exception:
+                pass
+        finally:
             try:
                 p.unlink()
             except Exception:
@@ -1149,22 +1362,25 @@ class BaseBot:
 
         max_reached = len(open_trades) >= self.max_open
         symbols     = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols)
+        self._post_scan(symbols)
         self.feed.subscribe_many(symbols)   # ensure WS + REST monitor tracking
         self.log.info(f"[{self.MODE.upper()}] Watching: {symbols}")
 
         regime_ctx = self.risk.detect_market_regime(self.feed, symbols)
 
-        btc_1h_return = self._get_btc_return()
-
-        # HMM overlay: adjusts thresholds only, never overrides signal direction
+        # HMM overlay + BTC 1h return: single fetch from real Binance
+        btc_1h_return = 0.0
         try:
-            btc_df = self.feed.fetch_ohlcv("BTC/USDT", "1h", limit=150)
+            btc_df = self.training_feed.fetch_ohlcv("BTC/USDT", "1h", limit=150)
+            if btc_df is not None and len(btc_df) >= 2:
+                btc_1h_return = float(btc_df["close"].pct_change().iloc[-1])
             if btc_df is not None and len(btc_df) >= 50:
                 hmm_regime, hmm_adj = self.hmm_regime.get_regime_and_adjustments(btc_df)
             else:
                 hmm_regime, hmm_adj = self.hmm_regime.predict_fallback(btc_df)
                 self.log.info(f"HMM fallback (no BTC data): regime={hmm_regime}")
             if regime_ctx:
+                regime_ctx = dict(regime_ctx)  # shallow copy — prevent cache pollution
                 old_min_conf  = regime_ctx.get("min_conf", self.min_conf)
                 old_size_mult = regime_ctx.get("size_mult", 1.0)
                 regime_ctx["min_conf"]   = round(old_min_conf  + hmm_adj["min_conf_delta"], 4)
@@ -1175,6 +1391,21 @@ class BaseBot:
                 f"min_conf_delta={hmm_adj['min_conf_delta']:+.2f} "
                 f"size_mult={hmm_adj['size_mult']:.2f}"
             )
+            # Publish live strategy parameters for dashboard
+            self.state.state["live_strategy"] = {
+                "eff_min_conf":       regime_ctx.get("min_conf", self.min_conf) if regime_ctx else self.min_conf,
+                "eff_size_mult":      regime_ctx.get("size_mult", 1.0) if regime_ctx else 1.0,
+                "market_regime":      regime_ctx.get("regime", "UNKNOWN") if regime_ctx else "UNKNOWN",
+                "hmm_regime":         hmm_regime,
+                "profile":            self.profile.name,
+                "base_min_conf":      self.min_conf,
+                "htf_filter_mode":    self.htf_filter_mode,
+                "timeframe":          self.config.get("ml", {}).get("timeframe", "15m"),
+                "forward_bars":       self.config.get("ml", {}).get("forward_bars", 2),
+                "min_votes":          self.config.get("strategy", {}).get("min_votes", 1),
+                "updated_at":         datetime.now(timezone.utc).isoformat(),
+            }
+            self.state.save()
         except Exception as e:
             self.log.warning(f"HMM overlay failed: {e}")
 
@@ -1231,21 +1462,17 @@ class BaseBot:
 
     def run(self):
         self.log.info("=" * 50)
-        self.log.info(f"CRYPTOBOT v3 STARTED — MODE: {self.MODE.upper()}")
+        self.log.info(f"CRYPTOBOT v4 STARTED — MODE: {self.MODE.upper()}")
         self.log.info("=" * 50)
 
-        self.notifier.send_alert(
-            f"CryptoBot v3 Started\n"
-            f"Mode: {self.MODE.upper()}"
-        )
-
         last_train = datetime.now(timezone.utc).date()
+        alert_sent = False
 
         while True:
             try:
                 today = datetime.now(timezone.utc).date()
                 if today != last_train:
-                    self._train()
+                    self._train(quick=False)  # full daily retrain
                     last_train = today
 
                 current_coins = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols)
@@ -1256,7 +1483,26 @@ class BaseBot:
                 if self.learner.should_run():
                     self.learner.run_learning_cycle()
 
+                # Heartbeat: write liveness flag for dashboard detection
+                self._write_heartbeat()
+
+                # Check for command-file from dashboard (fallback when Docker socket unavailable)
+                if self._check_bot_control():
+                    self.log.info("Bot control stop signal received, shutting down...")
+                    self.notifier.send_alert(
+                        f"CryptoBot v4 Stopped (dashboard command)\n"
+                        f"Mode: {self.MODE.upper()}"
+                    )
+                    break
+
                 self.run_once()
+                # Send startup alert only after first successful cycle — prevents spam during deploys
+                if not alert_sent:
+                    alert_sent = True
+                    self.notifier.send_alert(
+                        f"CryptoBot v4 Started\n"
+                        f"Mode: {self.MODE.upper()}"
+                    )
                 self.notifier.exchange = self.exchange
                 self.notifier.send_report(self.exchange)
 
@@ -1265,3 +1511,32 @@ class BaseBot:
 
             self.log.info(f"Sleeping {self.scan_interval}s...")
             time.sleep(self.scan_interval)
+
+    def _write_heartbeat(self):
+        """Write heartbeat file for dashboard liveness detection."""
+        hb = DATA_DIR / f"bot_heartbeat_{self.MODE}.json"
+        try:
+            with open(hb, "w") as f:
+                json.dump({"timestamp": datetime.now(timezone.utc).isoformat()}, f)
+        except OSError:
+            pass
+
+    def _check_bot_control(self) -> bool:
+        """Check for control commands from dashboard. Returns True if should stop."""
+        p = DATA_DIR / "bot_control.json"
+        if not p.exists():
+            return False
+        try:
+            with open(p) as f:
+                cmd = json.load(f)
+            target = cmd.get("mode", "all")
+            if target not in (self.MODE, "all"):
+                return False
+            action = cmd.get("command", "")
+            if action == "stop":
+                p.unlink(missing_ok=True)
+                return True
+            p.unlink(missing_ok=True)
+            return False
+        except (json.JSONDecodeError, OSError):
+            return False

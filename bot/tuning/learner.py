@@ -7,6 +7,8 @@ Requires minimum 10 closed trades for statistical significance.
 import json
 import logging
 import re
+import fcntl
+import yaml
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -15,7 +17,7 @@ try:
     _GROQ_AVAILABLE = True
 except ImportError:
     _GROQ_AVAILABLE = False
-from env_config import get_groq_key, DATA_DIR, BOT_ROOT
+from core.config import get_groq_key, DATA_DIR, BOT_ROOT
 
 log  = logging.getLogger("SelfLearner")
 DATA = DATA_DIR
@@ -132,7 +134,6 @@ JSON only:
                 config["strategy"]["min_confidence"] = new
                 changed.append(f"{cfg_file}: confidence {old}→{new}")
 
-            import fcntl
             tmp_path = cfg_path.with_suffix(".tmp.yaml")
             with open(tmp_path, "w") as f:
                 fcntl.flock(f, fcntl.LOCK_EX)
@@ -201,8 +202,7 @@ JSON only:
         already_changed_conf = any("confidence" in c for c in existing_changes)
         if not already_changed_conf:
             try:
-                import yaml, fcntl
-                for cfg_file in ["config_futures.yaml"]:
+                for cfg_file in ["config_spot.yaml", "config_futures.yaml"]:
                     cfg_path = BOT_ROOT / cfg_file
                     if not cfg_path.exists():
                         continue
@@ -226,8 +226,7 @@ JSON only:
             already_changed_stop = any("stop" in c for c in existing_changes)
             if not already_changed_stop:
                 try:
-                    import yaml, fcntl
-                    for cfg_file in ["config_futures.yaml"]:
+                    for cfg_file in ["config_spot.yaml", "config_futures.yaml"]:
                         cfg_path = BOT_ROOT / cfg_file
                         if not cfg_path.exists():
                             continue

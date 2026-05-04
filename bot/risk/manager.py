@@ -11,13 +11,15 @@ import numpy as np
 import pandas as pd
 import logging
 import json
+import os
 from pathlib import Path
 from datetime import datetime, date, timezone
 from typing import List, Tuple, Optional
-from env_config import DATA_DIR
+from core.config import DATA_DIR
 
 log  = logging.getLogger("RiskManager")
 DATA = DATA_DIR
+BOT_MODE = os.environ.get("BOT_MODE", "spot")
 
 
 class CorrelationFilter:
@@ -178,12 +180,12 @@ class ATRTrailingStop:
         self.atr_values  = {}
         self.entry_atrs  = {}
         self.partial     = {}
+        self._file = DATA / f"trailing_stops_{BOT_MODE}.json"
         self._load()
 
     def _load(self):
-        p = DATA / "trailing_stops.json"
-        if p.exists():
-            with open(p) as f:
+        if self._file.exists():
+            with open(self._file) as f:
                 d = json.load(f)
                 self.peak_prices = d.get("peaks", {})
                 self.atr_values  = d.get("atrs", {})
@@ -191,7 +193,7 @@ class ATRTrailingStop:
                 self.partial     = d.get("partial", {})
 
     def _save(self):
-        with open(DATA / "trailing_stops.json", "w") as f:
+        with open(self._file, "w") as f:
             json.dump({
                 "peaks":      self.peak_prices,
                 "atrs":       self.atr_values,
@@ -350,6 +352,7 @@ class CircuitBreaker:
     def __init__(self, config):
         self.max_daily_loss  = config.get("max_daily_loss_pct", 0.05)
         self.max_consec_loss = config.get("max_consecutive_losses", 4)
+        self._initial_balance = None
         self._load()
 
     def _load(self):
@@ -359,9 +362,11 @@ class CircuitBreaker:
                 d = json.load(f)
                 self.pnl_history   = d.get("pnl_history", {})
                 self.consec_losses = d.get("consec_losses", 0)
+                self._initial_balance = d.get("initial_balance")
         else:
             self.pnl_history   = {}
             self.consec_losses = 0
+            self._initial_balance = None
 
     def _save(self):
         from datetime import timedelta
@@ -369,7 +374,8 @@ class CircuitBreaker:
         self.pnl_history = {k: v for k, v in self.pnl_history.items() if k >= cutoff}
         with open(DATA / "circuit_breaker.json", "w") as f:
             json.dump({"pnl_history": self.pnl_history,
-                       "consec_losses": self.consec_losses}, f)
+                       "consec_losses": self.consec_losses,
+                       "initial_balance": self._initial_balance}, f)
 
     def _get_rolling_loss(self):
         from datetime import timedelta
@@ -383,6 +389,8 @@ class CircuitBreaker:
         return total
 
     def record_trade(self, pnl, balance):
+        if self._initial_balance is None and balance > 0:
+            self._initial_balance = balance
         today_str = str(date.today())
         self.pnl_history[today_str] = self.pnl_history.get(today_str, 0.0) + pnl
         self.consec_losses = self.consec_losses + 1 if pnl < 0 else 0
@@ -390,7 +398,8 @@ class CircuitBreaker:
 
     def can_trade(self, balance):
         rolling_loss = self._get_rolling_loss()
-        threshold = balance * self.max_daily_loss * self.WINDOW_DAYS
+        ref_balance = self._initial_balance or balance
+        threshold = ref_balance * self.max_daily_loss * self.WINDOW_DAYS
         if rolling_loss < -threshold:
             return False, f"Rolling {self.WINDOW_DAYS}-day loss ${rolling_loss:.2f} (limit -${threshold:.2f})"
         if self.consec_losses >= self.max_consec_loss:

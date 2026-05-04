@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from env_config import DATA_DIR
+from core.config import DATA_DIR
 
 log  = logging.getLogger("Scanner")
 DATA = DATA_DIR

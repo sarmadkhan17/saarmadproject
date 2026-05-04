@@ -9,8 +9,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from env_config import create_demo_exchange
-from base_bot   import BaseBot
+from core.config import create_demo_exchange
+from engine.bot   import BaseBot
 
 log = logging.getLogger("SpotBot")
 

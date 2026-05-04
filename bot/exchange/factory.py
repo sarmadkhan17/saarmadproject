@@ -46,8 +46,8 @@ class ExchangeRouter:
         self._init_execution()
 
     def _init_execution(self):
-        from env_config import get_exchange_config, create_demo_exchange
-        from binance_demo import DemoExchangeAdapter
+        from core.config import get_exchange_config, create_demo_exchange
+        from exchange.demo_api import DemoExchangeAdapter
 
         cfg = get_exchange_config()
 
@@ -77,7 +77,7 @@ class ExchangeRouter:
         return self.mode.upper()
 
     def can_switch_to_live(self) -> bool:
-        from env_config import get_exchange_config
+        from core.config import get_exchange_config
         cfg = get_exchange_config()
         return bool(cfg.get("api_key") and cfg.get("api_secret"))
 
@@ -104,5 +104,5 @@ def create_execution_exchange(mode: str = "futures"):
         exec_ex = router.execution
         exec_ex.options["defaultType"] = "future" if mode == "futures" else "spot"
         return exec_ex
-    from env_config import create_demo_exchange
+    from core.config import create_demo_exchange
     return create_demo_exchange(mode)

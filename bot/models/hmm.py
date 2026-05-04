@@ -23,7 +23,7 @@ except ImportError:
     _HMM_AVAILABLE = False
     log.warning("hmmlearn not installed — HMM regime disabled")
 
-from env_config import DATA_DIR
+from core.config import DATA_DIR
 
 DATA = DATA_DIR
 

@@ -3,13 +3,14 @@ services:
     build: .
     image: cryptobot-v3
     container_name: cryptobot-spot
-    restart: unless-stopped
+    restart: "no"
+    profiles: ["trading"]
     environment:
       - BOT_MODE=spot
     volumes:
       - ./data:/root/cryptobot_v3/data
       - ./logs:/root/cryptobot_v3/logs
-      - ./.env:/root/cryptobot_v3/.env:ro
+      - ./.env:/root/cryptobot_v3/.env
     working_dir: /root/cryptobot_v3/bot
     command: python3 launcher.py
 
@@ -17,13 +18,14 @@ services:
     build: .
     image: cryptobot-v3
     container_name: cryptobot-futures
-    restart: unless-stopped
+    restart: "no"
+    profiles: ["trading"]
     environment:
       - BOT_MODE=futures
     volumes:
       - ./data:/root/cryptobot_v3/data
       - ./logs:/root/cryptobot_v3/logs
-      - ./.env:/root/cryptobot_v3/.env:ro
+      - ./.env:/root/cryptobot_v3/.env
     working_dir: /root/cryptobot_v3/bot
     command: python3 launcher.py
 
@@ -37,6 +39,7 @@ services:
     volumes:
       - ./data:/root/cryptobot_v3/data
       - ./logs:/root/cryptobot_v3/logs
-      - ./.env:/root/cryptobot_v3/.env:ro
+      - ./.env:/root/cryptobot_v3/.env
+      - /var/run/docker.sock:/var/run/docker.sock
     working_dir: /root/cryptobot_v3/dashboard
     command: python3 server.py

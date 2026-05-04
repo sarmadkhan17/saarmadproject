@@ -1,5 +1,5 @@
 """
-Dashboard Server v3
+Dashboard Server v4
 Same as v2 but with separate Spot & Futures sections
 """
 
@@ -88,14 +88,14 @@ def load_combined():
 
 def _write_config_safe(cfg_path: Path, cfg: dict):
     """Atomic read-modify-write on a YAML config with exclusive file lock."""
-    cfg_path.parent.mkdir(exist_ok=True)
-    # Write to temp file then rename for atomicity
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cfg_path.with_suffix(".tmp.yaml")
-    with open(tmp, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=True)
-        fcntl.flock(f, fcntl.LOCK_UN)
-    tmp.replace(cfg_path)
+    with open(cfg_path, "a") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        with open(tmp, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=True)
+        tmp.replace(cfg_path)
+        fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
@@ -261,42 +261,79 @@ def logs():
 
 @app.route("/api/model_health")
 def model_health():
+    active_mode = _detect_active_mode()
+    base = DATA / active_mode if active_mode else DATA
     models = {
-        "rf":   ("rf_model.pkl",    "rf_meta.json",   0.35),
-        "lgbm": ("lgbm_model.pkl",  "lgbm_meta.json", 0.50),
-        "lstm": ("lstm_model.keras","lstm_meta.json", 0.00),
-        "tft":  ("tft_model.pt",    "tft_meta.json",  0.15),
+        "rf":    ("rf_model.pkl",     "rf_meta.json",    "Direction vote (BUY/SELL/HOLD)"),
+        "lgbm":  ("lgbm_model.pkl",   "lgbm_meta.json",  "Direction vote (BUY/SELL/HOLD)"),
     }
     result = {}
-    for name, (mf, meta_f, weight) in models.items():
-        best_meta = {}
-        loaded    = False
-        for subdir in ["spot", "futures", ""]:
-            base  = DATA / subdir if subdir else DATA
-            mpath = base / mf
-            if mpath.exists():
-                loaded = True
-                meta_p = base / meta_f
-                if meta_p.exists():
-                    try:
-                        with open(meta_p) as f:
-                            m = json.load(f)
-                        if m.get("accuracy", 0) > best_meta.get("accuracy", 0):
-                            best_meta = m
-                    except (json.JSONDecodeError, OSError):
-                        pass
-        in_ensemble = weight > 0
+    for name, (mf, meta_f, usage) in models.items():
+        loaded = False
+        meta   = {}
+        mpath = base / mf
+        if mpath.exists():
+            loaded = True
+            meta_p = base / meta_f
+            if meta_p.exists():
+                try:
+                    with open(meta_p) as f:
+                        meta = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
         result[name] = {
-            "loaded":       loaded,
-            "accuracy":     best_meta.get("accuracy", 0),
-            "wf_accuracy":  best_meta.get("wf_accuracy", 0),
-            "trained_at":   best_meta.get("trained_at", "never"),
-            "epochs":       best_meta.get("epochs", 0),
-            "in_ensemble":  in_ensemble,
-            "weight":       weight,
-            "status":       "active" if in_ensemble else "archived",
+            "loaded":      loaded,
+            "accuracy":    meta.get("accuracy", 0),
+            "wf_accuracy": meta.get("wf_accuracy", 0),
+            "trained_at":  meta.get("trained_at", "never"),
+            "status":      "active" if loaded else "missing",
+            "usage":       usage,
         }
+
+    # HMM regime model
+    result["hmm"] = {
+        "loaded":      (base / "hmm_model.pkl").exists(),
+        "accuracy":    0,
+        "wf_accuracy": 0,
+        "trained_at":  "runtime",
+        "status":      "active" if (base / "hmm_model.pkl").exists() else "fallback",
+        "usage":       "Regime detection (RANGING/TRENDING/CRASH/HIGH_VOL)",
+    }
+
+    # DQN RL agent
+    result["rl_agent"] = {
+        "loaded":      (base / "rl_agent.pt").exists(),
+        "accuracy":    0,
+        "wf_accuracy": 0,
+        "trained_at":  "runtime",
+        "status":      "active" if (base / "rl_agent.pt").exists() else "untrained",
+        "usage":       "Position management (SCALE/HOLD/CLOSE)",
+    }
+
     return jsonify(result)
+
+
+def _detect_active_mode():
+    """Detect which bot mode is actively running from heartbeat or state file freshness."""
+    now = datetime.now(timezone.utc).timestamp()
+    for mode in ("futures", "spot"):
+        hb = DATA / f"bot_heartbeat_{mode}.json"
+        if hb.exists() and (now - hb.stat().st_mtime) < 30:
+            return mode
+    # Fallback to state file
+    futures_state = DATA / "futures_state.json"
+    spot_state = DATA / "state.json"
+    futures_active = futures_state.exists() and (now - futures_state.stat().st_mtime) < 300
+    spot_active = spot_state.exists() and (now - spot_state.stat().st_mtime) < 300
+    if futures_active:
+        return "futures"
+    if spot_active:
+        return "spot"
+    if (DATA / "futures").is_dir():
+        return "futures"
+    if (DATA / "spot").is_dir():
+        return "spot"
+    return ""
 
 
 @app.route("/api/agent_performance")
@@ -412,16 +449,18 @@ def detailed_health():
         except (ValueError, TypeError):
             pass
 
-    try:
-        result = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=5)
-        lines  = result.stdout.split("\n")
-        bots   = [l for l in lines
-                  if ("launcher.py" in l or "spot_bot.py" in l or "futures_bot.py" in l)
-                  and "grep" not in l and "SCREEN" not in l]
-        dashes = [l for l in lines
-                  if "server.py" in l and "grep" not in l and "SCREEN" not in l]
-    except Exception:
-        bots, dashes = [], []
+    # Check bot/dash liveness via state file freshness (works in Docker too)
+    now = datetime.now(timezone.utc).timestamp()
+    bot_count = 0
+    dash_count = 0
+    for sf, mode in [("state.json", "spot"), ("futures_state.json", "futures")]:
+        sp = DATA / sf
+        if sp.exists() and (now - sp.stat().st_mtime) < 120:
+            bot_count += 1
+    # Dashboard is running if we're serving this request
+    dash_count = 1
+    bots = list(range(bot_count))
+    dashes = list(range(dash_count))
 
     open_t = sum(1 for t in trades if t.get("status") == "open")
     closed = sum(1 for t in trades if t.get("status") == "closed")
@@ -437,7 +476,6 @@ def detailed_health():
     models_ok = all([
         _model_exists("rf_model.pkl"),
         _model_exists("lgbm_model.pkl"),
-        _model_exists("lstm_model.keras"),
     ])
 
     reviews   = 0
@@ -471,13 +509,29 @@ def detailed_health():
                     exec_mode = line.split("=", 1)[1].strip().strip("\"'").lower()
                     break
 
+    # Profile info from bot state
+    profile_name = "BALANCED"
+    live_regime = "UNKNOWN"
+    for state_name in ("futures_state.json", "spot_state.json"):
+        sp = DATA / state_name
+        if sp.exists():
+            try:
+                with open(sp) as f:
+                    st = json.load(f)
+                live = st.get("live_strategy", {})
+                if live:
+                    profile_name = live.get("profile", "BALANCED")
+                    live_regime = live.get("market_regime", "UNKNOWN")
+                    break
+            except (json.JSONDecodeError, OSError):
+                pass
+
     return jsonify({
         "bot_running":      len(bots) >= 1,
         "bot_instances":    len(bots),
         "dash_running":     len(dashes) >= 1,
         "rf_model":         _model_exists("rf_model.pkl"),
-        "xgb_model":        _model_exists("lgbm_model.pkl"),
-        "lstm_model":       _model_exists("lstm_model.keras"),
+        "lgbm_model":       _model_exists("lgbm_model.pkl"),
         "models_ok":        models_ok,
         "signal_age":       sig_age,
         "open_trades":      open_t,
@@ -490,12 +544,15 @@ def detailed_health():
         "exchange_mode":    exec_mode,
         "training_source":  "api.binance.com",
         "ensemble_v4":      True,
-        "lstm_archived":    True,
+        "profile":          profile_name,
+        "live_regime":      live_regime,
+        "smc_agent":        True,
+        "macro_flow_agent": False,
     })
 
 
 ENV_PATH = Path.home() / "cryptobot_v3" / ".env"
-SERVICE_PATH = Path("/etc/systemd/system/cryptobot-futures.service")
+BOT_ROOT_PATH = Path.home() / "cryptobot_v3"
 
 
 def _read_env_var(key):
@@ -504,38 +561,80 @@ def _read_env_var(key):
             for line in f:
                 if line.startswith(key + "="):
                     return line.split("=", 1)[1].strip().strip("\"'")
-    # Fall back to systemd service file
-    if SERVICE_PATH.exists():
-        with open(SERVICE_PATH) as f:
-            for line in f:
-                if f'BOT_MODE=' in line:
-                    return line.split('BOT_MODE=', 1)[1].strip().strip("\"'")
     return "spot"
 
 
 def _write_env_var(key, value):
-    if not ENV_PATH.exists():
-        return False
-    with open(ENV_PATH) as f:
-        lines = f.readlines()
-    new_lines = []
-    found = False
-    for line in lines:
-        if line.startswith(key + "="):
-            new_lines.append(f'{key}="{value}"\n')
-            found = True
+    try:
+        ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if ENV_PATH.exists():
+            with open(ENV_PATH) as f:
+                lines = f.readlines()
         else:
-            new_lines.append(line)
-    if not found:
-        new_lines.append(f'{key}="{value}"\n')
-    with open(ENV_PATH, "w") as f:
-        f.writelines(new_lines)
-    return True
+            lines = []
+        new_lines = []
+        found = False
+        for line in lines:
+            if line.startswith(key + "="):
+                new_lines.append(f'{key}="{value}"\n')
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f'{key}="{value}"\n')
+        with open(ENV_PATH, "w") as f:
+            f.writelines(new_lines)
+        return True
+    except (OSError, IOError):
+        return False
 
 
-def _has_open_trades():
-    """Check if there are any open trades in the current mode's state file."""
-    mode = _read_env_var("BOT_MODE")
+def _is_bot_running(mode: str) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    hb = DATA / f"bot_heartbeat_{mode}.json"
+    if hb.exists() and (now - hb.stat().st_mtime) < 45:
+        return True
+    return False
+
+
+def _write_bot_command(mode: str, command: str):
+    """Write a command file to the shared data volume. The bot reads this each cycle."""
+    p = DATA / "bot_control.json"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump({
+                "command": command,
+                "mode": mode,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }, f)
+        return True
+    except OSError:
+        return False
+
+
+def _get_running_mode() -> str:
+    if _is_bot_running("futures"):
+        return "futures"
+    if _is_bot_running("spot"):
+        return "spot"
+    return "none"
+
+
+def _trading_paused() -> bool:
+    p = DATA / "trading_paused.json"
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f).get("paused", False)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return False
+
+
+def _has_open_trades(mode: str = None) -> bool:
+    if mode is None:
+        mode = _read_env_var("BOT_MODE")
     state_file = DATA / ("state.json" if mode == "spot" else f"{mode}_state.json")
     if not state_file.exists():
         return False
@@ -548,52 +647,199 @@ def _has_open_trades():
         return False
 
 
-@app.route("/api/get_mode", methods=["GET"])
-def get_mode():
-    mode = _read_env_var("BOT_MODE")
-    has_open = _has_open_trades()
-    return jsonify({"mode": mode, "has_open_trades": has_open})
+def _dechunk_body(raw_body: bytes) -> bytes:
+    """Decode HTTP chunked transfer encoding."""
+    result = b""
+    pos = 0
+    while pos < len(raw_body):
+        line_end = raw_body.find(b"\r\n", pos)
+        if line_end == -1:
+            break
+        line = raw_body[pos:line_end]
+        pos = line_end + 2
+        try:
+            chunk_size = int(line.split(b";")[0].strip(), 16)
+        except (ValueError, IndexError):
+            break
+        if chunk_size == 0:
+            break
+        if pos + chunk_size <= len(raw_body):
+            result += raw_body[pos:pos + chunk_size]
+        pos += chunk_size + 2
+    return result
 
 
-@app.route("/api/set_mode", methods=["POST"])
-def set_mode():
+def _docker_api(method: str, path: str, body: dict = None):
+    """Send request to Docker socket API. Returns (status_code, body_dict) or (None, None) on error."""
+    import socket, json as _json
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect("/var/run/docker.sock")
+
+        body_bytes = b""
+        if body:
+            body_str = _json.dumps(body)
+            body_bytes = body_str.encode()
+
+        request = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {len(body_bytes)}\r\nConnection: close\r\n\r\n"
+        sock.sendall(request.encode() + body_bytes)
+
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        sock.close()
+
+        headers_end = response.find(b"\r\n\r\n")
+        if headers_end == -1:
+            return None, None
+
+        headers_section = response[:headers_end]
+        raw_body = response[headers_end + 4:]
+
+        status_line = headers_section.split(b"\r\n")[0].decode()
+        status_code = int(status_line.split(" ")[1])
+
+        is_chunked = (
+            b"Transfer-Encoding: chunked" in headers_section
+            or b"transfer-encoding: chunked" in headers_section
+        )
+        if is_chunked and raw_body.strip():
+            raw_body = _dechunk_body(raw_body)
+
+        parsed_body = None
+        if raw_body.strip():
+            try:
+                parsed_body = _json.loads(raw_body)
+            except _json.JSONDecodeError:
+                pass
+
+        return status_code, parsed_body
+    except PermissionError:
+        print("[dashboard] Docker socket permission denied — is /var/run/docker.sock mounted?")
+        return None, None
+    except Exception as e:
+        print(f"[dashboard] Docker API error: {type(e).__name__}: {e}")
+        return None, None
+
+
+def _docker_container_action(container_name: str, action: str):
+    """Start/stop a Docker container via API. Returns (success: bool, message: str)."""
+    if action not in ("start", "stop"):
+        return False, f"Unknown action: {action}"
+    status_code, body = _docker_api("POST", f"/containers/{container_name}/{action}")
+    if status_code is None:
+        return False, "Docker socket API unreachable"
+    if status_code in (200, 204):
+        return True, f"Container {action} succeeded"
+    if status_code == 304:
+        return True, f"Container already in desired state (304)"
+    if status_code == 404:
+        return False, f"Container '{container_name}' not found"
+    if status_code == 409:
+        return False, f"Container '{container_name}' {action} conflict (409) — check container state"
+    return False, f"Docker API returned HTTP {status_code}"
+
+
+# ── Bot Control Endpoints ────────────────────────────────────────────────────
+
+@app.route("/api/bot_status", methods=["GET"])
+def bot_status():
+    mode = _get_running_mode()
+    running = mode != "none"
+    paused = _trading_paused()
+    has_open = _has_open_trades(mode) if running else False
+    return jsonify({
+        "mode": mode if running else (_read_env_var("BOT_MODE")),
+        "running": running,
+        "trading_paused": paused,
+        "has_open_trades": has_open,
+    })
+
+
+@app.route("/api/start_bot", methods=["POST"])
+def start_bot():
     err, code = _check_auth()
     if err:
         return err, code
 
-    # Block switch if there are open trades
-    if _has_open_trades():
+    data = request.get_json(force=True) or {}
+    mode = data.get("mode", "futures")
+    if mode not in ("spot", "futures"):
+        return jsonify({"error": "Invalid mode. Choose 'spot' or 'futures'"}), 400
+
+    # Stop the OTHER mode's bot first to prevent dual-running
+    other_mode = "spot" if mode == "futures" else "futures"
+    if _is_bot_running(other_mode):
+        _docker_container_action(f"cryptobot-{other_mode}", "stop")
+        _write_bot_command(other_mode, "stop")
+        import time as _time
+        _time.sleep(2)
+
+    _write_env_var("BOT_MODE", mode)
+    container = f"cryptobot-{mode}"
+
+    success, msg = _docker_container_action(container, "start")
+    if not success:
+        return jsonify({"error": f"Failed to start bot container: {msg}"}), 502
+    return jsonify({"mode": mode, "started": True})
+
+
+@app.route("/api/stop_bot", methods=["POST"])
+def stop_bot():
+    err, code = _check_auth()
+    if err:
+        return err, code
+
+    mode = _get_running_mode()
+    if mode == "none":
+        return jsonify({"error": "No bot is running"}), 409
+
+    # Try Docker socket first
+    success, msg = _docker_container_action(f"cryptobot-{mode}", "stop")
+    if not success:
+        # Fallback: write command file to shared data volume
+        _write_bot_command(mode, "stop")
+        print(f"[dashboard] Docker stop failed ({msg}), wrote command file for {mode}")
+    return jsonify({"stopped": True, "mode": mode, "method": "docker" if success else "command_file"})
+
+
+@app.route("/api/switch_mode", methods=["POST"])
+def switch_mode():
+    err, code = _check_auth()
+    if err:
+        return err, code
+
+    old_mode = _get_running_mode()
+
+    # Block if open trades in current mode
+    if old_mode != "none" and _has_open_trades(old_mode):
         return jsonify({
             "error": "Cannot switch mode while trades are open. Close all trades first."
         }), 409
 
     data = request.get_json(force=True) or {}
-    mode = data.get("mode", "spot")
-    if mode not in ("spot", "futures"):
+    new_mode = data.get("mode", "spot")
+    if new_mode not in ("spot", "futures"):
         return jsonify({"error": "Invalid mode. Choose 'spot' or 'futures'"}), 400
 
-    _write_env_var("BOT_MODE", mode)
+    _write_env_var("BOT_MODE", new_mode)
 
-    # Update systemd service file
-    if SERVICE_PATH.exists():
-        with open(SERVICE_PATH) as f:
-            svc_lines = f.readlines()
-        new_svc = []
-        for line in svc_lines:
-            if "BOT_MODE=" in line:
-                new_svc.append(f'Environment="BOT_MODE={mode}"\n')
-            else:
-                new_svc.append(line)
-        with open(SERVICE_PATH, "w") as f:
-            f.writelines(new_svc)
+    # Stop old container (command-file fallback works for stop)
+    if old_mode != "none":
+        success, _ = _docker_container_action(f"cryptobot-{old_mode}", "stop")
+        if not success:
+            _write_bot_command(old_mode, "stop")
 
-    # Restart bot service
-    try:
-        subprocess.run(["systemctl", "restart", f"cryptobot-{mode}"], timeout=10)
-    except Exception:
-        pass
+    # Start new container (no fallback — bot must be running to read command file)
+    success, msg = _docker_container_action(f"cryptobot-{new_mode}", "start")
+    if not success:
+        return jsonify({"error": f"Failed to start {new_mode} bot: {msg}"}), 502
 
-    return jsonify({"mode": mode, "restarting": True})
+    return jsonify({"mode": new_mode, "switched": True})
 
 
 @app.route("/api/stop_trading", methods=["POST"])
@@ -624,6 +870,13 @@ def start_trading():
 
 @app.route("/api/strategy_config", methods=["GET"])
 def get_strategy_config():
+    base = {
+        "forward_bars": 1, "timeframe": "1h",
+        "min_confidence": 0.40, "min_votes": 1,
+        "htf_filter_mode": "strict",
+        "training_min_bars": 3000, "training_min_coins": 8,
+        "dynamic_min_conf": True,
+    }
     for cfg_path in (CFG_FUT, CFG_SPOT):
         if cfg_path.exists():
             try:
@@ -632,25 +885,41 @@ def get_strategy_config():
                 strat = cfg.get("strategy", {})
                 ml    = cfg.get("ml", {})
                 train = cfg.get("training", {})
-                return jsonify({
+                base = {
                     "forward_bars":       ml.get("forward_bars", 1),
                     "timeframe":          ml.get("timeframe", "1h"),
-                    "min_confidence":     strat.get("min_confidence", 0.42),
-                    "min_votes":          strat.get("min_votes", 2),
+                    "min_confidence":     strat.get("min_confidence", 0.40),
+                    "min_votes":          strat.get("min_votes", 1),
                     "htf_filter_mode":    strat.get("htf_filter_mode", "strict"),
                     "training_min_bars":  train.get("min_bars_per_coin", 3000),
                     "training_min_coins": train.get("min_coins", 8),
                     "dynamic_min_conf":   True,
-                })
+                }
             except (yaml.YAMLError, OSError):
                 pass
-    return jsonify({
-        "forward_bars": 1, "timeframe": "1h",
-        "min_confidence": 0.42, "min_votes": 2,
-        "htf_filter_mode": "strict",
-        "training_min_bars": 3000, "training_min_coins": 8,
-        "dynamic_min_conf": True,
-    })
+
+    # Inject live effective values from bot state
+    for state_name in ("futures_state.json", "spot_state.json"):
+        sp = DATA / state_name
+        if sp.exists():
+            try:
+                with open(sp) as f:
+                    st = json.load(f)
+                live = st.get("live_strategy", {})
+                if live:
+                    base["live"] = {
+                        "eff_min_conf":    live.get("eff_min_conf", base["min_confidence"]),
+                        "eff_size_mult":   live.get("eff_size_mult", 1.0),
+                        "market_regime":   live.get("market_regime", "UNKNOWN"),
+                        "hmm_regime":      live.get("hmm_regime", "UNKNOWN"),
+                        "profile":         live.get("profile", "BALANCED"),
+                        "updated_at":      live.get("updated_at", ""),
+                    }
+                    break
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    return jsonify(base)
 
 
 @app.route("/api/strategy_config", methods=["POST"])
@@ -682,8 +951,8 @@ def set_strategy_config():
 
         if "min_votes" in data:
             v = int(data["min_votes"])
-            if not (1 <= v <= 3):
-                return jsonify({"error": "min_votes must be 1–3"}), 400
+            if not (1 <= v <= 2):
+                return jsonify({"error": "min_votes must be 1–2"}), 400
             data["min_votes"] = v
     except (ValueError, TypeError) as e:
         return jsonify({"error": f"Invalid value: {e}"}), 400
@@ -707,8 +976,8 @@ def set_strategy_config():
                 saved = {
                     "forward_bars":    cfg.get("ml", {}).get("forward_bars", 1),
                     "timeframe":       cfg.get("ml", {}).get("timeframe", "1h"),
-                    "min_confidence":  cfg.get("strategy", {}).get("min_confidence", 0.42),
-                    "min_votes":       cfg.get("strategy", {}).get("min_votes", 2),
+                    "min_confidence":  cfg.get("strategy", {}).get("min_confidence", 0.40),
+                    "min_votes":       cfg.get("strategy", {}).get("min_votes", 1),
                     "htf_filter_mode": cfg.get("strategy", {}).get("htf_filter_mode", "strict"),
                 }
             except (yaml.YAMLError, OSError) as e:
@@ -717,45 +986,159 @@ def set_strategy_config():
     return jsonify({"status": "ok", "config": saved})
 
 
+# ── Trading Profile ──────────────────────────────────────────────────────────
+
+VALID_PROFILES = ("STRICT", "BALANCED", "AGGRESSIVE")
+
+
+@app.route("/api/trading_profile", methods=["GET"])
+def get_trading_profile():
+    profile_name = "BALANCED"
+    for cfg_path in (CFG_FUT, CFG_SPOT):
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                profile_name = cfg.get("strategy", {}).get("trading_profile", "BALANCED")
+            except (yaml.YAMLError, OSError):
+                pass
+
+    # Resolve full profile from engine module
+    profile = {"name": profile_name}
+    try:
+        from engine.profiles import TradingProfile
+        p = TradingProfile.load(profile_name)
+        profile = {
+            "name": p.name, "min_confidence": p.min_confidence,
+            "min_agent_agreement": p.min_agent_agreement,
+            "net_score_threshold": p.net_score_threshold,
+            "ml_prob_threshold": p.ml_prob_threshold,
+            "smc_sub_checks_min": p.smc_sub_checks_min,
+            "smc_liquidity_sweep_pct": p.smc_liquidity_sweep_pct,
+            "smc_bos_body_pct": p.smc_bos_body_pct,
+            "smc_fvg_required": p.smc_fvg_required,
+            "smc_volume_spike_ratio": p.smc_volume_spike_ratio,
+            "smc_pattern_completion": p.smc_pattern_completion,
+            "funding_filter_enabled": p.funding_filter_enabled,
+            "htf_filter_mode": p.htf_filter_mode,
+            "position_size_pct": p.position_size_pct,
+            "stop_loss_atr_mult": p.stop_loss_atr_mult,
+            "take_profit_atr_mult": p.take_profit_atr_mult,
+            "max_correlation": p.max_correlation,
+            "max_portfolio_heat": p.max_portfolio_heat,
+            "size_mult": p.size_mult,
+        }
+    except Exception:
+        pass
+
+    # Inject live effective values
+    for state_name in ("futures_state.json", "spot_state.json"):
+        sp = DATA / state_name
+        if sp.exists():
+            try:
+                with open(sp) as f:
+                    st = json.load(f)
+                live = st.get("live_strategy", {})
+                if live:
+                    profile["live"] = {
+                        "eff_min_conf": live.get("eff_min_conf", profile["min_confidence"]),
+                        "eff_size_mult": live.get("eff_size_mult", 1.0),
+                        "market_regime": live.get("market_regime", "UNKNOWN"),
+                        "hmm_regime": live.get("hmm_regime", "UNKNOWN"),
+                        "updated_at": live.get("updated_at", ""),
+                    }
+                    break
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    return jsonify(profile)
+
+
+@app.route("/api/trading_profile", methods=["POST"])
+def set_trading_profile():
+    err, code = _check_auth()
+    if err:
+        return err, code
+
+    data = request.get_json(force=True) or {}
+    profile_name = str(data.get("profile", "")).upper()
+    if profile_name not in VALID_PROFILES:
+        return jsonify({"error": f"Invalid profile. Choose: {', '.join(VALID_PROFILES)}"}), 400
+
+    saved = False
+    for cfg_path in (CFG_SPOT, CFG_FUT):
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                cfg.setdefault("strategy", {})["trading_profile"] = profile_name
+                _write_config_safe(cfg_path, cfg)
+                saved = True
+            except (yaml.YAMLError, OSError) as e:
+                return jsonify({"error": f"Config write failed: {e}"}), 500
+
+    if not saved:
+        return jsonify({"error": "No config files found"}), 500
+
+    return jsonify({"status": "ok", "profile": profile_name, "message": f"Switched to {profile_name} — bot reloads on next cycle"})
+
+
 @app.route("/api/retrain", methods=["POST"])
 def request_retrain():
     err, code = _check_auth()
     if err:
         return err, code
 
-    # Rate limit: block if a retrain is already running
-    status_p = DATA / "retrain_status.json"
-    if status_p.exists():
-        try:
-            with open(status_p) as f:
-                st = json.load(f)
-            if st.get("status") == "running":
-                return jsonify({"error": "retrain already running", "status": "running"}), 429
-        except (json.JSONDecodeError, OSError):
-            pass
+    # Rate limit: block if any retrain is already running
+    for mode in ("futures", "spot"):
+        sp = DATA / f"retrain_status_{mode}.json"
+        if sp.exists():
+            try:
+                with open(sp) as f:
+                    st = json.load(f)
+                if st.get("status") == "running":
+                    return jsonify({"error": "retrain already running", "status": "running", "mode": mode}), 429
+            except (json.JSONDecodeError, OSError):
+                pass
 
     data = request.get_json(force=True, silent=True) or {}
-    p    = DATA / "retrain_requested.json"
-    p.parent.mkdir(exist_ok=True)
-    with open(p, "w") as f:
-        json.dump({
-            "requested": True,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "source":    data.get("source", "dashboard"),
-            "reason":    data.get("reason", "manual"),
-        }, f)
-    return jsonify({"status": "requested", "message": "Retrain signal sent to bot"})
+    pkg = {
+        "requested": True,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": data.get("source", "dashboard"),
+        "reason": data.get("reason", "manual"),
+    }
+
+    # Write to both modes (spot + futures run in parallel via Docker)
+    written = []
+    for mode in ("futures", "spot"):
+        p = DATA / f"retrain_requested_{mode}.json"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp.json")
+            with open(tmp, "w") as f:
+                json.dump(pkg, f)
+            tmp.replace(p)
+            written.append(mode)
+        except OSError as e:
+            return jsonify({"error": f"Failed to write retrain request for {mode}: {e}"}), 500
+
+    return jsonify({"status": "requested", "modes": written, "message": f"Retrain signal sent to {', '.join(written)}"})
 
 
 @app.route("/api/retrain_status", methods=["GET"])
 def get_retrain_status():
-    p = DATA / "retrain_status.json"
-    if p.exists():
-        try:
-            with open(p) as f:
-                return jsonify(json.load(f))
-        except (json.JSONDecodeError, OSError):
-            pass
+    for mode in ("futures", "spot"):
+        p = DATA / f"retrain_status_{mode}.json"
+        if p.exists():
+            try:
+                with open(p) as f:
+                    st = json.load(f)
+                if st.get("status") in ("running", "completed", "error"):
+                    st["mode"] = mode
+                    return jsonify(st)
+            except (json.JSONDecodeError, OSError):
+                pass
     return jsonify({"status": "idle"})
 
 
@@ -773,5 +1156,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     if API_KEY:
         print(f"Auth enabled — set X-Dashboard-Key header or store key in localStorage('dashboard_key')")
-    print(f"Dashboard v3: http://localhost:{port}")
+    print(f"Dashboard v4: http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)

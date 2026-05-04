@@ -12,7 +12,7 @@ import requests
 from pathlib import Path
 from datetime import datetime, timezone
 import numpy as np
-from env_config import DATA_DIR
+from core.config import DATA_DIR
 
 log  = logging.getLogger("Agents")
 DATA = DATA_DIR
@@ -467,6 +467,12 @@ class AgentCoordinator:
     def record_trade_result(self, symbol, pnl):
         action = self._decision_actions.get(symbol, "HOLD")
         self.tracker.record_prediction("master", action, pnl)
+
+    def invalidate_cache(self):
+        """Clear decision cache after model retrain so stale predictions are not reused."""
+        self._decision_cache.clear()
+        self._decision_time.clear()
+        log.info("Agent decision cache invalidated (models retrained)")
 
     def get_performance_report(self):
         return {

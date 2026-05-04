@@ -17,7 +17,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
-from env_config import DATA_DIR
+from core.config import DATA_DIR
 
 log  = logging.getLogger("RLAgent")
 DATA = DATA_DIR
@@ -314,6 +314,14 @@ class RLTradeManager:
             if len(self.buffer) >= self.BATCH_SIZE:
                 self._train_step()
             self._save()
+
+    def prune_pending(self, open_trade_ids):
+        """Remove _pending entries for trades that no longer exist (sync-cleaned)."""
+        stale = [tid for tid in self._pending if tid not in open_trade_ids]
+        for tid in stale:
+            del self._pending[tid]
+        if stale:
+            log.info(f"RLAgent pruned {len(stale)} stale pending entries")
 
     def _train_step(self):
         if len(self.buffer) < self.BATCH_SIZE:

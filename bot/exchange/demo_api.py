@@ -205,27 +205,31 @@ class BinanceDemoClient:
             return result
         else:
             # Futures uses /v2/account
-            url    = f"{self.base_url}/fapi/v2/account"
-            params = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
-            params["signature"] = self._sign(params)
-            r      = self.session.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            data   = r.json()
-            result = {"info": data, "free": {}, "used": {}, "total": {}}
-            for asset_data in data.get("assets", []):
-                asset = asset_data["asset"]
-                wb    = float(asset_data.get("walletBalance", 0))
-                cb    = float(asset_data.get("crossWalletBalance", 0))
-                if wb > 0 or cb > 0:
-                    result["free"][asset]  = float(asset_data.get("availableBalance", 0))
-                    result["used"][asset]  = wb - float(asset_data.get("availableBalance", 0))
-                    result["total"][asset] = wb
-                    result[asset] = {
-                        "free":  float(asset_data.get("availableBalance", 0)),
-                        "used":  wb - float(asset_data.get("availableBalance", 0)),
-                        "total": wb,
-                    }
-            return result
+            try:
+                url    = f"{self.base_url}/fapi/v2/account"
+                params = {"timestamp": int(time.time() * 1000), "recvWindow": 10000}
+                params["signature"] = self._sign(params)
+                r      = self.session.get(url, params=params, timeout=15)
+                r.raise_for_status()
+                data   = r.json()
+                result = {"info": data, "free": {}, "used": {}, "total": {}}
+                for asset_data in data.get("assets", []):
+                    asset = asset_data["asset"]
+                    wb    = float(asset_data.get("walletBalance", 0))
+                    cb    = float(asset_data.get("crossWalletBalance", 0))
+                    if wb > 0 or cb > 0:
+                        result["free"][asset]  = float(asset_data.get("availableBalance", 0))
+                        result["used"][asset]  = wb - float(asset_data.get("availableBalance", 0))
+                        result["total"][asset] = wb
+                        result[asset] = {
+                            "free":  float(asset_data.get("availableBalance", 0)),
+                            "used":  wb - float(asset_data.get("availableBalance", 0)),
+                            "total": wb,
+                        }
+                return result
+            except Exception as e:
+                log.warning(f"Futures balance fetch failed: {e}")
+                return {"info": {}, "free": {}, "used": {}, "total": {}}
 
     # ── Orders ──────────────────────────────────────────────────
     def create_market_order(self, symbol: str, side: str, amount: float, params: dict = None) -> dict:
@@ -305,11 +309,21 @@ class BinanceDemoClient:
     def cancel_order(self, order_id: str, symbol: str) -> dict:
         """Cancel an open order."""
         sym = self._normalize_symbol(symbol)
-        data = self._signed_post("/order", {
+        params = {
             "symbol":  sym,
             "orderId": order_id,
-            "_method": "DELETE",
-        })
+            "timestamp": int(time.time() * 1000),
+            "recvWindow": 10000,
+        }
+        params["signature"] = self._sign(params)
+        url = f"{self.base_url}{self.api_prefix}/order"
+        try:
+            r = self.session.delete(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except requests.exceptions.HTTPError:
+            log.error(f"Cancel order {symbol}: {r.text}")
+            raise
 
         return {
             "id":     str(data.get("orderId", "")),
@@ -419,7 +433,10 @@ class BinanceDemoClient:
                             if step > 0:
                                 precision = max(0, len(f"{step:.10f}".rstrip("0").split(".")[-1]))
                                 rounded   = (amount // step) * step
-                                return round(rounded, precision)
+                                result    = round(rounded, precision)
+                                if result <= 0:
+                                    return round(step, precision)  # minimum valid quantity
+                                return result
         except Exception:
             pass
         return round(amount, 6)
