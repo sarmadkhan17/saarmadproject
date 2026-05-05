@@ -318,7 +318,7 @@ def _detect_active_mode():
     now = datetime.now(timezone.utc).timestamp()
     for mode in ("futures", "spot"):
         hb = DATA / f"bot_heartbeat_{mode}.json"
-        if hb.exists() and (now - hb.stat().st_mtime) < 30:
+        if hb.exists() and (now - hb.stat().st_mtime) < 120:
             return mode
     # Fallback to state file
     futures_state = DATA / "futures_state.json"
@@ -592,7 +592,7 @@ def _write_env_var(key, value):
 def _is_bot_running(mode: str) -> bool:
     now = datetime.now(timezone.utc).timestamp()
     hb = DATA / f"bot_heartbeat_{mode}.json"
-    if hb.exists() and (now - hb.stat().st_mtime) < 45:
+    if hb.exists() and (now - hb.stat().st_mtime) < 120:
         return True
     return False
 
@@ -647,101 +647,18 @@ def _has_open_trades(mode: str = None) -> bool:
         return False
 
 
-def _dechunk_body(raw_body: bytes) -> bytes:
-    """Decode HTTP chunked transfer encoding."""
-    result = b""
-    pos = 0
-    while pos < len(raw_body):
-        line_end = raw_body.find(b"\r\n", pos)
-        if line_end == -1:
-            break
-        line = raw_body[pos:line_end]
-        pos = line_end + 2
-        try:
-            chunk_size = int(line.split(b";")[0].strip(), 16)
-        except (ValueError, IndexError):
-            break
-        if chunk_size == 0:
-            break
-        if pos + chunk_size <= len(raw_body):
-            result += raw_body[pos:pos + chunk_size]
-        pos += chunk_size + 2
-    return result
-
-
-def _docker_api(method: str, path: str, body: dict = None):
-    """Send request to Docker socket API. Returns (status_code, body_dict) or (None, None) on error."""
-    import socket, json as _json
+def _systemctl_cmd(mode: str, action: str):
+    """Run systemctl action on cryptobot-{mode} service. Returns (success: bool, msg: str)."""
+    svc = f"cryptobot-{mode}"
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect("/var/run/docker.sock")
-
-        body_bytes = b""
-        if body:
-            body_str = _json.dumps(body)
-            body_bytes = body_str.encode()
-
-        request = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {len(body_bytes)}\r\nConnection: close\r\n\r\n"
-        sock.sendall(request.encode() + body_bytes)
-
-        response = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        sock.close()
-
-        headers_end = response.find(b"\r\n\r\n")
-        if headers_end == -1:
-            return None, None
-
-        headers_section = response[:headers_end]
-        raw_body = response[headers_end + 4:]
-
-        status_line = headers_section.split(b"\r\n")[0].decode()
-        status_code = int(status_line.split(" ")[1])
-
-        is_chunked = (
-            b"Transfer-Encoding: chunked" in headers_section
-            or b"transfer-encoding: chunked" in headers_section
-        )
-        if is_chunked and raw_body.strip():
-            raw_body = _dechunk_body(raw_body)
-
-        parsed_body = None
-        if raw_body.strip():
-            try:
-                parsed_body = _json.loads(raw_body)
-            except _json.JSONDecodeError:
-                pass
-
-        return status_code, parsed_body
-    except PermissionError:
-        print("[dashboard] Docker socket permission denied — is /var/run/docker.sock mounted?")
-        return None, None
+        r = subprocess.run(["systemctl", action, svc], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return True, f"systemctl {action} {svc} OK"
+        return False, r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, f"systemctl {action} {svc} timed out"
     except Exception as e:
-        print(f"[dashboard] Docker API error: {type(e).__name__}: {e}")
-        return None, None
-
-
-def _docker_container_action(container_name: str, action: str):
-    """Start/stop a Docker container via API. Returns (success: bool, message: str)."""
-    if action not in ("start", "stop"):
-        return False, f"Unknown action: {action}"
-    status_code, body = _docker_api("POST", f"/containers/{container_name}/{action}")
-    if status_code is None:
-        return False, "Docker socket API unreachable"
-    if status_code in (200, 204):
-        return True, f"Container {action} succeeded"
-    if status_code == 304:
-        return True, f"Container already in desired state (304)"
-    if status_code == 404:
-        return False, f"Container '{container_name}' not found"
-    if status_code == 409:
-        return False, f"Container '{container_name}' {action} conflict (409) — check container state"
-    return False, f"Docker API returned HTTP {status_code}"
+        return False, str(e)
 
 
 # ── Bot Control Endpoints ────────────────────────────────────────────────────
@@ -752,11 +669,13 @@ def bot_status():
     running = mode != "none"
     paused = _trading_paused()
     has_open = _has_open_trades(mode) if running else False
+    has_open_fut = _has_open_trades("futures")
     return jsonify({
         "mode": mode if running else (_read_env_var("BOT_MODE")),
         "running": running,
         "trading_paused": paused,
         "has_open_trades": has_open,
+        "has_open_futures": has_open_fut,
     })
 
 
@@ -774,17 +693,18 @@ def start_bot():
     # Stop the OTHER mode's bot first to prevent dual-running
     other_mode = "spot" if mode == "futures" else "futures"
     if _is_bot_running(other_mode):
-        _docker_container_action(f"cryptobot-{other_mode}", "stop")
+        print(f"[dashboard] START_BOT: stopping {other_mode} before starting {mode}")
+        _systemctl_cmd(other_mode, "stop")
         _write_bot_command(other_mode, "stop")
         import time as _time
         _time.sleep(2)
 
     _write_env_var("BOT_MODE", mode)
-    container = f"cryptobot-{mode}"
+    print(f"[dashboard] START_BOT: {mode}")
 
-    success, msg = _docker_container_action(container, "start")
+    success, msg = _systemctl_cmd(mode, "start")
     if not success:
-        return jsonify({"error": f"Failed to start bot container: {msg}"}), 502
+        return jsonify({"error": f"Failed to start bot: {msg}"}), 502
     return jsonify({"mode": mode, "started": True})
 
 
@@ -798,13 +718,12 @@ def stop_bot():
     if mode == "none":
         return jsonify({"error": "No bot is running"}), 409
 
-    # Try Docker socket first
-    success, msg = _docker_container_action(f"cryptobot-{mode}", "stop")
+    print(f"[dashboard] STOP_BOT: {mode}")
+    success, msg = _systemctl_cmd(mode, "stop")
     if not success:
-        # Fallback: write command file to shared data volume
         _write_bot_command(mode, "stop")
-        print(f"[dashboard] Docker stop failed ({msg}), wrote command file for {mode}")
-    return jsonify({"stopped": True, "mode": mode, "method": "docker" if success else "command_file"})
+        print(f"[dashboard] STOP_BOT: systemctl failed ({msg}), wrote command file for {mode}")
+    return jsonify({"stopped": True, "mode": mode, "method": "systemctl" if success else "command_file"})
 
 
 @app.route("/api/switch_mode", methods=["POST"])
@@ -815,10 +734,10 @@ def switch_mode():
 
     old_mode = _get_running_mode()
 
-    # Block if open trades in current mode
-    if old_mode != "none" and _has_open_trades(old_mode):
+    # Only block switching FROM futures (leveraged), spot trades are safe with exchange SL/TP
+    if old_mode == "futures" and _has_open_trades("futures"):
         return jsonify({
-            "error": "Cannot switch mode while trades are open. Close all trades first."
+            "error": "Cannot switch from futures while futures trades are open"
         }), 409
 
     data = request.get_json(force=True) or {}
@@ -826,17 +745,21 @@ def switch_mode():
     if new_mode not in ("spot", "futures"):
         return jsonify({"error": "Invalid mode. Choose 'spot' or 'futures'"}), 400
 
+    print(f"[dashboard] SWITCH_MODE: {old_mode} → {new_mode}")
+
     _write_env_var("BOT_MODE", new_mode)
 
-    # Stop old container (command-file fallback works for stop)
     if old_mode != "none":
-        success, _ = _docker_container_action(f"cryptobot-{old_mode}", "stop")
+        success, _ = _systemctl_cmd(old_mode, "stop")
         if not success:
             _write_bot_command(old_mode, "stop")
 
-    # Start new container (no fallback — bot must be running to read command file)
-    success, msg = _docker_container_action(f"cryptobot-{new_mode}", "start")
+    success, msg = _systemctl_cmd(new_mode, "start")
     if not success:
+        # Rollback: restart old service so bot doesn't stay dead
+        if old_mode != "none":
+            print(f"[dashboard] SWITCH_MODE: failed to start {new_mode}, rolling back to {old_mode}")
+            _systemctl_cmd(old_mode, "start")
         return jsonify({"error": f"Failed to start {new_mode} bot: {msg}"}), 502
 
     return jsonify({"mode": new_mode, "switched": True})
@@ -1128,7 +1051,15 @@ def request_retrain():
 
 @app.route("/api/retrain_status", methods=["GET"])
 def get_retrain_status():
+    # Check currently running mode first
+    running_mode = _get_running_mode()
+    check_modes = []
+    if running_mode != "none":
+        check_modes.append(running_mode)
     for mode in ("futures", "spot"):
+        if mode not in check_modes:
+            check_modes.append(mode)
+    for mode in check_modes:
         p = DATA / f"retrain_status_{mode}.json"
         if p.exists():
             try:

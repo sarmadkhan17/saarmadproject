@@ -524,20 +524,25 @@ def _compute_dataset_stats(path: Path) -> Dict:
     stats = df.select([
         pl.len().alias("n_rows"),
         pl.col("symbol").n_unique().alias("n_symbols"),
-        pl.col("target").value_counts().alias("label_counts"),
     ]).collect()
 
     n_rows = stats["n_rows"][0]
     n_symbols = stats["n_symbols"][0]
 
-    label_counts = {}
-    for item in stats["label_counts"][0]:
-        label_counts[str(item["target"])] = item["count"]
+    # Compute label counts separately (value_counts in select behaves differently across Polars versions)
+    label_df = df.group_by("target").len().sort("target").collect()
+    label_counts = {str(row[0]): row[1] for row in label_df.rows()}
+
+    # Get symbol list
+    symbols_df = df.select(pl.col("symbol").unique().sort()).collect()
+    symbols = symbols_df["symbol"].to_list()
 
     return {
         "n_rows": n_rows,
         "n_symbols": n_symbols,
         "n_features": n_features,
+        "symbols": symbols,
+        "build_time_sec": 0,
         "label_counts": label_counts,
         "memory_mb": round(path.stat().st_size / 1024 / 1024, 2) if path.exists() else 0,
     }

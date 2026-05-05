@@ -845,6 +845,15 @@ td {
 .retrain-status .dot.completed { background: var(--green); }
 .retrain-status .dot.error { background: var(--red); }
 
+.train-bar {
+  flex: 1; min-width: 80px; height: 4px; background: var(--bg2);
+  border-radius: 2px; margin-left: 8px; overflow: hidden;
+}
+.train-fill {
+  height: 100%; background: var(--gold); border-radius: 2px;
+  transition: width 0.8s ease;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -1418,22 +1427,20 @@ function updateBotUI() {
     botRunning = d.running;
     tradingEnabled = !d.trading_paused;
     hasOpenTrades = d.has_open_trades;
+    hasOpenFutures = d.has_open_futures;
 
     // Mode selector
     document.getElementById('selFutures').classList.toggle('active', currentMode === 'futures');
     document.getElementById('selSpot').classList.toggle('active', currentMode === 'spot');
+    document.getElementById('selFutures').classList.toggle('running-active', botRunning && currentMode === 'futures');
+    document.getElementById('selSpot').classList.toggle('running-active', botRunning && currentMode === 'spot');
 
-    if (botRunning) {
-      document.getElementById('selFutures').classList.toggle('running-active', currentMode === 'futures');
-      document.getElementById('selSpot').classList.toggle('running-active', currentMode === 'spot');
-      document.getElementById('selFutures').disabled = (currentMode !== 'futures');
-      document.getElementById('selSpot').disabled = (currentMode !== 'spot');
-    } else {
-      document.getElementById('selFutures').classList.remove('running-active');
-      document.getElementById('selSpot').classList.remove('running-active');
-      document.getElementById('selFutures').disabled = false;
-      document.getElementById('selSpot').disabled = false;
-    }
+    // Spot button: locked only if futures has open trades
+    document.getElementById('selSpot').disabled = hasOpenFutures;
+    // Futures button: always available
+    document.getElementById('selFutures').disabled = false;
+    // Stop button: locked only if futures has open trades
+    document.getElementById('botBtn').disabled = hasOpenFutures;
 
     // Start/Stop button
     var btn = document.getElementById('botBtn');
@@ -1480,7 +1487,11 @@ function toggleBot() {
 }
 
 function selectMode(mode) {
-  if (currentMode === mode || botRunning) return;
+  if (currentMode === mode) return;
+  if (hasOpenFutures && mode !== 'futures') {
+    showNotif('Close futures trades before switching to ' + mode.toUpperCase(), 'err');
+    return;
+  }
   post('/api/switch_mode', {mode: mode}, function(d) {
     currentMode = d.mode;
     updateBotUI();
@@ -1564,7 +1575,10 @@ function updateRetrainStatus() {
     if (status === 'idle') {
       msg = 'No retraining pending';
     } else if (status === 'running') {
-      msg = 'Retraining models... (' + (d.started ? new Date(d.started).toLocaleTimeString() : '') + ')';
+      var pct = d.progress || 0;
+      msg = 'Training ' + pct + '%';
+      var bar = '<span class="train-bar"><span class="train-fill" style="width:' + pct + '%"></span></span>';
+      msg = msg + bar;
     } else if (status === 'completed') {
       msg = 'Retrain completed in ' + escapeHtml(String(d.duration_seconds || '?')) + 's'
           + ' (' + (d.completed ? new Date(d.completed).toLocaleTimeString() : '') + ')';

@@ -241,6 +241,7 @@ class BaseBot:
         self.max_open      = risk.get("max_open_trades", 8)
         self.min_conf      = self.config.get("strategy", {}).get("min_confidence", 0.52)
         self.htf_filter_mode = self.config.get("strategy", {}).get("htf_filter_mode", "strict")
+        self._training_in_progress = False   # set True during background retrain
 
         # State — separate files for spot and futures
         state_file    = "state.json" if self.MODE == "spot" else "futures_state.json"
@@ -273,36 +274,61 @@ class BaseBot:
                       f"net_threshold={self.profile.net_score_threshold}")
 
         self.smc_agent   = SMCAgent()
-        self.ensemble    = EnsembleEngine(self.smc_agent, None)  # tech_agent set below
-        # Wire technical agent (ML models) into ensemble
         from engine.smc_agent import AgentSignal
         class MLTechnicalAgent:
-            """Bridge: existing AIStrategyEngine → Ensemble AgentSignal."""
-            def __init__(self, ai):
+            """Fail-fast ML agent: features set via set_features() before analyze().
+            Calls build_features → validate → scaler.transform → predict_numpy.
+            No fallbacks. FeatureValidationError propagates — no trade for that symbol."""
+            def __init__(self, ai, mode_dir):
                 self.ai = ai
+                self.mode_dir = mode_dir
+                self._scaler = None
+                self._feature_cols = None
+                self._last_X = None  # pre-scaled numpy array, 1 row × N cols
+                self._last_symbol = "?"
+
+            def _load_metadata(self):
+                if self._scaler is not None:
+                    return
+                from features.feature_builder import load_feature_metadata
+                self._scaler, self._feature_cols = load_feature_metadata(self.mode_dir)
+
+            def set_features(self, symbol: str, feature_row):
+                """Compute and validate features for one symbol. Stores pre-scaled X for analyze()."""
+                self._load_metadata()
+                from features.feature_builder import validate_features, FeatureValidationError
+                validate_features(feature_row, self._feature_cols, self._scaler, symbol)
+                self._last_X = self._scaler.transform(feature_row.values)
+                self._last_symbol = symbol
+
             def analyze(self, df, profile):
+                import numpy as np
+                if self._last_X is None:
+                    raise RuntimeError("MLTechnicalAgent: set_features() must be called before analyze()")
                 try:
-                    ml = self.ai.predict(df, "UNKNOWN", regime="RANGING")
-                    buy_votes  = ml.get("indicators", {}).get("buy_votes", 0)
-                    sell_votes = ml.get("indicators", {}).get("sell_votes", 0)
-                    buy_score  = max(0.0, buy_votes / 3 * 0.8)
-                    sell_score = max(0.0, sell_votes / 3 * 0.8)
-                    ml_action  = ml.get("action", "HOLD")
-                    ml_conf    = ml.get("confidence", 0.50)
-                    if ml_action == "BUY":
-                        buy_score = max(buy_score, ml_conf * 0.9)
-                    elif ml_action == "SELL":
-                        sell_score = max(sell_score, ml_conf * 0.9)
-                    net_score  = buy_score - sell_score
-                    return AgentSignal(
-                        agent="technical", buy_score=buy_score, sell_score=sell_score,
-                        net_score=net_score, confidence=ml_conf,
-                        reasoning=f"ML:{ml_action} votes={buy_votes}B/{sell_votes}S",
-                    )
-                except Exception as e:
-                    return AgentSignal("technical", 0, 0, 0, 0, reasoning=f"error:{e}")
+                    ml = self.ai.predict_numpy(self._last_X, self._last_symbol)
+                finally:
+                    self._last_X = None  # clear for next cycle
+                buy_votes  = ml.get("indicators", {}).get("buy_votes", 0)
+                sell_votes = ml.get("indicators", {}).get("sell_votes", 0)
+                buy_score  = max(0.0, buy_votes / 3 * 0.8)
+                sell_score = max(0.0, sell_votes / 3 * 0.8)
+                ml_action  = ml.get("action", "HOLD")
+                ml_conf    = ml.get("confidence", 0.50)
+                if ml_action == "BUY":
+                    buy_score = max(buy_score, ml_conf * 0.9)
+                elif ml_action == "SELL":
+                    sell_score = max(sell_score, ml_conf * 0.9)
+                net_score  = buy_score - sell_score
+                return AgentSignal(
+                    agent="technical", buy_score=buy_score, sell_score=sell_score,
+                    net_score=net_score, confidence=ml_conf,
+                    reasoning=f"ML:{ml_action} votes={buy_votes}B/{sell_votes}S",
+                )
+
+        self.ml_agent = MLTechnicalAgent(self.ai, DATA_DIR / self.MODE)
         self.ensemble = EnsembleEngine(
-            self.smc_agent, MLTechnicalAgent(self.ai), None  # Macro/Flow deferred
+            self.smc_agent, self.ml_agent, None  # Macro/Flow deferred
         )
         self.risk_agent  = RiskDecisionAgent(self.risk, self.gnn_filter, self.hmm_regime)
         self.execution   = ExecutionEngine(
@@ -310,7 +336,7 @@ class BaseBot:
             get_leverage_fn=self._get_leverage,
         )
 
-        self._train(quick=True)
+        self._with_training_heartbeat(lambda: self._train(quick=True), source="startup")
 
     def _setup_exchange(self):
         """Override in subclass to set spot or futures."""
@@ -352,12 +378,20 @@ class BaseBot:
         except Exception as e:
             self.log.warning(f"Config reload failed: {e}")
 
-    def _train_with_pipeline(self, quick: bool = False):
-        """v5 training: build unified multi-timeframe dataset, then train models
-        using make_features() / make_labels() per symbol for predict() compatibility."""
+    def _train_with_pipeline(self, quick: bool = False, force: bool = False):
+        """v5 training: build multi-TF dataset via build_features(), save FeatureScaler
+        for predict-time use. Single feature function for both train and predict.
+        quick=True + force=False skips if models already exist."""
+        # Quick skip: check cached models first
+        if quick and not force:
+            model_dir = DATA_DIR / self.MODE
+            if (model_dir / "rf_model.pkl").exists() and (model_dir / "lgbm_model.pkl").exists():
+                self.log.info(f"Quick pipeline retrain SKIPPED — models already exist for {self.MODE}")
+                return
         import pandas as pd
         from features.pipeline import build_training_dataset, load_dataset
-        from models.ai_strategy import make_features, make_labels
+        from features.feature_builder import build_features, save_feature_metadata
+        from models.ai_strategy import make_labels
 
         training_cfg = self.config.get("training", {})
         ml_cfg       = self.config.get("ml", {})
@@ -365,17 +399,10 @@ class BaseBot:
         fb           = ml_cfg.get("forward_bars", 2)
         mc           = self.config.get("strategy", {}).get("min_confidence", 0.52)
         mv           = self.config.get("strategy", {}).get("min_votes", 1)
+        n_jobs       = training_cfg.get("n_jobs", 4)
+        train_tfs    = training_cfg.get("timeframes", ["1h", "4h", "1d"])
 
-        # Clear stale feature_cols cache — fresh per-symbol features this run
-        mode_dir = DATA_DIR / self.MODE
-        for feat_path in (mode_dir / "rf_features.pkl", mode_dir / "lgbm_features.pkl"):
-            try:
-                feat_path.unlink(missing_ok=True)
-                self.log.info(f"Cleared stale feature cols: {feat_path.name}")
-            except OSError:
-                pass
-
-        # Build pipeline dataset from real Binance (cached to parquet)
+        # Build pipeline dataset (for stats + caching only — not used for training features)
         symbols = training_cfg.get("symbols", [])
         if self.scanner.top_coins:
             extra = [c for c in self.scanner.top_coins[:training_cfg.get("top_n", 10)] if c not in symbols]
@@ -391,52 +418,92 @@ class BaseBot:
             f"v5 dataset: {dataset_stats['n_rows']} rows, "
             f"{dataset_stats['n_features']} features, "
             f"{dataset_stats['n_symbols']} symbols, "
-            f"{dataset_stats['build_time_sec']}s build, "
-            f"{dataset_stats['memory_mb']} MB"
+            f"{dataset_stats['build_time_sec']}s build"
         )
 
-        # Fetch per-symbol OHLCV and extract features/labels using make_features()
-        # (same as legacy path) so that predict() matches training columns
+        # ── SINGLE feature extraction: build_features() for ALL symbols ──
         primary_tf = training_cfg.get("primary_timeframe", "1h")
-        self.log.info(f"Fetching per-symbol OHLCV for training (timeframe={primary_tf})...")
-        raw_dfs = []
-        for sym in dataset_stats["symbols"]:
-            df = self.training_feed.fetch_ohlcv(sym, primary_tf, limit=5000)
-            if df is not None and len(df) >= 100:
-                raw_dfs.append(df)
-                self.log.info(f"  {sym}: {len(df)} bars @ {primary_tf}")
+        self.log.info(f"Building per-symbol multi-TF features ({train_tfs}) using parallel workers...")
 
-        if not raw_dfs:
-            raise RuntimeError("No valid OHLCV data for any symbol")
+        def _build_symbol_features(sym_idx):
+            sym = dataset_stats["symbols"][sym_idx]
+            try:
+                sym_api = sym.replace("_", "/", 1) if "_" in sym else sym
+                dfs = {}
+                for t in train_tfs:
+                    df = self.training_feed.fetch_ohlcv(sym_api, t, limit=0)
+                    if df is not None and len(df) >= 100:
+                        dfs[t] = df
+                if len(dfs) < 2:
+                    self.log.warning(f"  {sym}: insufficient TFs ({len(dfs)}) — skip")
+                    return None
+
+                f = build_features(dfs, prediction_mode=False)
+                primary_df = self.training_feed.fetch_ohlcv(sym_api, primary_tf, limit=0)
+                if primary_df is None or len(primary_df) < 50:
+                    return None
+                labels = make_labels(primary_df, forward_bars=fb)
+                common = f.index.intersection(labels.index)
+                if len(common) < 50:
+                    self.log.warning(f"  {sym_api}: {len(common)} clean rows (<50) — skip")
+                    return None
+                f = f.loc[common].reset_index(drop=True)
+                labels = labels.loc[common].reset_index(drop=True)
+                valid = labels.notna() & f.notna().all(axis=1)
+                f = f[valid].reset_index(drop=True)
+                labels = labels[valid].reset_index(drop=True)
+
+                if len(f) < 50:
+                    self.log.warning(f"  {sym}: {len(f)} clean rows (<50) — skip")
+                    return None
+
+                self.log.info(f"  {sym_api}: {len(f)} rows, {f.shape[1]} features")
+                return (f, labels)
+            except Exception as e:
+                self.log.warning(f"  {sym}: feature build error: {e}")
+                return None
 
         feat_parts, label_parts = [], []
-        for sym_df in raw_dfs:
-            try:
-                f = make_features(sym_df)
-                l = make_labels(sym_df, forward_bars=fb).reindex(f.index).dropna()
-                f = f.loc[l.index]
-                if len(f) < 50:
-                    self.log.warning(f"Feature skip: {len(f)} clean rows (<50)")
-                    continue
-                feat_parts.append(f.reset_index(drop=True))
-                label_parts.append(l.reset_index(drop=True))
-            except Exception as e:
-                self.log.warning(f"Feature/label error: {e}")
+        n_workers = min(8, len(dataset_stats["symbols"]))
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for result in ex.map(_build_symbol_features, range(len(dataset_stats["symbols"]))):
+                if result is not None:
+                    feat_parts.append(result[0])
+                    label_parts.append(result[1])
 
         if not feat_parts:
             raise RuntimeError("No clean feature rows — training aborted")
 
-        combined_feats  = pd.concat(feat_parts,  ignore_index=True)
-        combined_labels = pd.concat(label_parts, ignore_index=True)
+        combined_feats  = pd.concat(feat_parts,  ignore_index=True).dropna()
+        combined_labels = pd.concat(label_parts, ignore_index=True).loc[combined_feats.index]
+
+        # Cap dataset size
+        max_rows = training_cfg.get("max_rows", 200000)
+        if len(combined_feats) > max_rows:
+            combined_feats  = combined_feats.iloc[-max_rows:]
+            combined_labels = combined_labels.iloc[-max_rows:]
 
         self.log.info(
-            f"Training on {len(combined_feats)} clean rows from {len(feat_parts)} coins "
-            f"(forward_bars={fb}, source=real Binance)"
+            f"Training on {len(combined_feats)} rows from {len(feat_parts)} coins "
+            f"(forward_bars={fb}, n_jobs={n_jobs})"
         )
 
+        # ── Fit + save FeatureScaler ─────────────────────────────────
+        self._write_training_status("running", source="pipeline", progress=15)
+        from sklearn.preprocessing import StandardScaler
+        feature_cols = combined_feats.columns.tolist()
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(combined_feats.values)
+
+        mode_dir = DATA_DIR / self.MODE
+        mode_dir.mkdir(parents=True, exist_ok=True)
+        save_feature_metadata(scaler, feature_cols, mode_dir)
+
+        # ── Train models on scaled features ──────────────────────────
+        self._write_training_status("running", source="pipeline", progress=20)
         results = self.ai.train_all(
             combined_feats,
-            feat_df=combined_feats,
+            feat_df=pd.DataFrame(X_scaled, columns=feature_cols),
             labels_s=combined_labels,
             btc_rows=0,
             forward_bars=fb,
@@ -444,13 +511,24 @@ class BaseBot:
             min_confidence=mc,
             min_votes=mv,
             quick=quick,
+            n_jobs=n_jobs,
+            progress_fn=lambda p: self._write_training_status("running", source="pipeline", progress=p),
         )
         self.log.info(f"Training complete: {results}")
         self._check_model_health(results)
         self.agents.invalidate_cache()
 
-    def _train(self, quick: bool = False):
+    def _train(self, quick: bool = False, force: bool = False):
         self._reload_config()
+        # Quick skip: if models already exist and not forced, skip retrain entirely
+        if quick and not force:
+            model_dir = DATA_DIR / self.MODE
+            if (model_dir / "rf_model.pkl").exists() and (model_dir / "lgbm_model.pkl").exists():
+                self.log.info(f"Quick retrain SKIPPED — models already exist for {self.MODE}")
+                self._write_training_status("completed", source="startup", duration_seconds=0,
+                                            note="models already exist, skipped")
+                return
+
         training_type = "QUICK (RF+LGBM only)" if quick else "FULL (all models)"
         self.log.info("=" * 50)
         self.log.info(f"TRAINING AI MODELS v4 [{self.MODE.upper()}] — {training_type}")
@@ -462,7 +540,7 @@ class BaseBot:
         # ── v5 pipeline: unified multi-timeframe dataset ──────────────────────
         if training_cfg.get("use_dataset_pipeline"):
             try:
-                self._train_with_pipeline(quick)
+                self._train_with_pipeline(quick, force)
                 return
             except Exception as e:
                 self.log.warning(f"Dataset pipeline failed: {e} — falling back to legacy training")
@@ -672,13 +750,21 @@ class BaseBot:
     def check_exits(self):
         """
         Check open trades for exit conditions.
-        Uses shared RiskManager ATR trailing stops.
+        Pre-fetches ATR values in parallel to avoid sequential API calls.
         """
-        exits = self.risk.check_exits(
-            self.state.get_open_trades(),
-            self.get_price,
-            self.get_atr,
-        )
+        trades = self.state.get_open_trades()
+        if not trades:
+            return
+        symbols = list(set(t["symbol"] for t in trades))
+        atr_cache = {}
+        def _fetch_atr(s):
+            return s, self.get_atr(s)
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as ex:
+            for s, atr in ex.map(_fetch_atr, symbols):
+                atr_cache[s] = atr
+        def _get_atr_cached(symbol):
+            return atr_cache.get(symbol, 0.0)
+        exits = self.risk.check_exits(trades, self.get_price, _get_atr_cached)
         for trade, price, reason, fraction in exits:
             close_amount = trade["amount"] * fraction
             order = self._place_close(
@@ -776,6 +862,12 @@ class BaseBot:
                         self.rl_agent.record_step(trade["id"], current_price, atr, done=True, final_pnl=pnl)
                         self.log.info(f"RL CLOSE {symbol} | PnL={pnl:+.4f}")
                         self.notifier.send_alert(f"RL CLOSE {symbol}\nPnL: ${pnl:+.4f}")
+                    else:
+                        self.log.warning(f"RL CLOSE {symbol} FAILED — marking as cancelled (insufficient balance)")
+                        self.state.close_trade(trade["id"], current_price,
+                                               self._calc_pnl(trade, current_price))
+                        self.risk.cleanup_trade(trade["id"])
+                        self._cancel_exchange_stop_loss(symbol, trade.get("sl_order_id", ""))
 
                 elif action == "SCALE_OUT":
                     close_amt = trade["amount"] * 0.25
@@ -807,16 +899,24 @@ class BaseBot:
             except Exception as e:
                 self.log.error(f"RL manage error {trade.get('symbol','?')}: {e}")
 
-    def analyze_symbol(self, symbol, balance, open_trades, regime_ctx=None, btc_1h_return=None):
+    def analyze_symbol(self, symbol, balance, open_trades, regime_ctx=None, btc_1h_return=None,
+                        pre_multi=None, pre_train=None):
         """Decision pipeline: Ensemble → Risk Agent → Execution. v5 layered architecture."""
         try:
-            # Fetch data using training config timeframes for consistency
+            # Use pre-fetched data if available, otherwise fetch
+            if pre_multi:
+                dfs = pre_multi
+            else:
+                tf = (self.config.get("ml", {}).get("timeframe")
+                      or self.config.get("scanner", {}).get("timeframe", "15m"))
+                train_tfs = self.config.get("training", {}).get("timeframes", ["1h", "4h", "1d"])
+                multi_tfs = [(t, 500 if t == tf else (300 if t in ("1h","30m") else 200)) for t in train_tfs]
+                dfs = self.feed.fetch_multi_timeframe(symbol, timeframes=multi_tfs)
+            if not dfs:
+                return
             tf = (self.config.get("ml", {}).get("timeframe")
                   or self.config.get("scanner", {}).get("timeframe", "15m"))
-            train_tfs = self.config.get("training", {}).get("timeframes", ["1h", "4h", "1d"])
-            multi_tfs = [(t, 500 if t == tf else (300 if t in ("1h","30m") else 200)) for t in train_tfs]
-            dfs = self.feed.fetch_multi_timeframe(symbol, timeframes=multi_tfs)
-            if not dfs or tf not in dfs:
+            if tf not in dfs:
                 return
 
             df_tf = dfs[tf]
@@ -825,6 +925,28 @@ class BaseBot:
 
             # ── Layer 1: Ensemble (SMC + Technical + Macro/Flow) ─────────
             hmm_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
+
+            # Fail-fast: compute multi-TF features for ML agent via build_features()
+            try:
+                from features.feature_builder import build_features, SUPPORTED_TFS, FeatureValidationError
+                if pre_train:
+                    tf_dfs = pre_train
+                else:
+                    tf_dfs = {}
+                    for t in SUPPORTED_TFS:
+                        tdf = self.training_feed.fetch_ohlcv(symbol, t, limit=2000)
+                        if tdf is not None and len(tdf) >= 50:
+                            tf_dfs[t] = tdf
+                if len(tf_dfs) >= 2:
+                    feature_row = build_features(tf_dfs, prediction_mode=True)
+                    self.ml_agent.set_features(symbol, feature_row)
+            except FeatureValidationError as e:
+                self.log.error(f"[{symbol}] Feature validation FAILED — no ML signal: {e}")
+                # Don't trade this symbol on ML signal — let SMC decide alone
+                pass
+            except Exception as e:
+                self.log.error(f"[{symbol}] Feature build FAILED — no ML signal: {e}")
+
             ensemble = self.ensemble.run(symbol, df_1h, self.profile)
 
             # Log signals for dashboard
@@ -1174,15 +1296,31 @@ class BaseBot:
                             pass
 
                 # RULE 2: Asset on exchange, NOT in bot → add it (buy-only for spot)
+                # Track recently cancelled to prevent re-adding ghosts (stale fetch_balance)
+                cancelled_syms = set()
+                for t in d["trades"]:
+                    if t.get("status") == "cancelled":
+                        ts = t.get("close_timestamp", "")
+                        try:
+                            if ts:
+                                closed = datetime.fromisoformat(ts)
+                                if closed.tzinfo is None:
+                                    closed = closed.replace(tzinfo=timezone.utc)
+                                if (datetime.now(timezone.utc) - closed).total_seconds() < 86400:
+                                    cancelled_syms.add(t["symbol"])
+                        except (ValueError, TypeError):
+                            pass
                 for asset, free_val in bal.get("free", {}).items():
                     free = float(free_val)
                     if free <= 0:
                         continue
-                    # Only add USDT-paired assets (skip stablecoins)
                     sym = f"{asset}/USDT"
                     if asset in ("USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD"):
                         continue
                     if sym in all_syms:
+                        continue
+                    if sym in cancelled_syms:
+                        self.log.debug(f"Sync: skipping recently cancelled {sym}")
                         continue
                     try:
                         ticker = self.exchange.fetch_ticker(sym)
@@ -1231,6 +1369,16 @@ class BaseBot:
         finally:
             self.state.save(immediate=True)
 
+    def _write_training_status(self, status, source="unknown", **extra):
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            p = DATA_DIR / f"retrain_status_{self.MODE}.json"
+            data = {"status": status, "source": source, **extra}
+            with open(p, "w") as f:
+                json.dump(data, f)
+        except OSError:
+            pass
+
     def _get_watchlist_hash(self, coins):
         return hash(tuple(sorted(coins)))
 
@@ -1241,21 +1389,22 @@ class BaseBot:
         if hasattr(self, '_last_watchlist_hash'):
             added   = set(new_coins) - set(getattr(self, '_last_watchlist', []))
             removed = set(getattr(self, '_last_watchlist', [])) - set(new_coins)
-            if added or removed:
-                self.log.info(f"Watchlist changed! Added:{added} Removed:{removed}")
+            change_count = len(added) + len(removed)
+            if change_count >= 5:
+                self.log.info(f"Watchlist changed by {change_count} coins Added:{added} Removed:{removed}")
                 try:
                     self.notifier.send(
-                        f"ℹ️ <b>Watchlist changed [{self.MODE.upper()}]</b>\n"
+                        f"ℹ️ <b>Watchlist changed [{self.MODE.upper()}]</b> — {change_count} coins\n"
                         f"Added: {added or 'none'}\n"
                         f"Removed: {removed or 'none'}\n"
                         f"Retraining models on new coin set…"
                     )
                 except Exception:
                     pass
-                # Retrain without deleting existing models:
-                # champion/challenger in each model's train() will decide
-                # whether to keep the old or save the new.
-                self._train(quick=True)
+                try:
+                    self._with_training_heartbeat(lambda: self._train(quick=True, force=True), source="watchlist")
+                except Exception as e:
+                    self.log.error(f"Watchlist retrain error: {e}", exc_info=True)
         self._last_watchlist_hash = new_hash
         self._last_watchlist      = list(new_coins)
 
@@ -1263,7 +1412,6 @@ class BaseBot:
         """Check if dashboard requested a retrain via signal file."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         p = DATA_DIR / f"retrain_requested_{self.MODE}.json"
-        status_path = DATA_DIR / f"retrain_status_{self.MODE}.json"
         if not p.exists():
             return
 
@@ -1293,37 +1441,11 @@ class BaseBot:
             pass
 
         try:
-            with open(status_path, "w") as f:
-                json.dump({
-                    "status": "running",
-                    "started": datetime.now(timezone.utc).isoformat(),
-                    "source": req.get("source", "unknown"),
-                }, f)
-        except OSError:
-            pass
-
-        try:
-            start_time = time.time()
-            self._train(quick=False)
-            elapsed = time.time() - start_time
-            try:
-                with open(status_path, "w") as f:
-                    json.dump({
-                        "status": "completed",
-                        "started": req.get("timestamp", ""),
-                        "completed": datetime.now(timezone.utc).isoformat(),
-                        "duration_seconds": round(elapsed, 1),
-                    }, f)
-            except OSError:
-                pass
+            self._with_training_heartbeat(lambda: self._train(quick=False), source="dashboard")
         except Exception as e:
             self.log.error(f"Retrain processing error: {e}", exc_info=True)
             try:
                 self.notifier.send_error_alert(str(e), context=f"Retrain failed [{self.MODE.upper()}]")
-            except Exception:
-                pass
-            try:
-                status_path.unlink()
             except Exception:
                 pass
         finally:
@@ -1375,9 +1497,9 @@ class BaseBot:
             if btc_df is not None and len(btc_df) >= 2:
                 btc_1h_return = float(btc_df["close"].pct_change().iloc[-1])
             if btc_df is not None and len(btc_df) >= 50:
-                hmm_regime, hmm_adj = self.hmm_regime.get_regime_and_adjustments(btc_df)
+                hmm_regime, hmm_adj = self.hmm_regime.get_regime_and_adjustments(btc_df, self.profile.name)
             else:
-                hmm_regime, hmm_adj = self.hmm_regime.predict_fallback(btc_df)
+                hmm_regime, hmm_adj = self.hmm_regime.predict_fallback(btc_df, self.profile.name)
                 self.log.info(f"HMM fallback (no BTC data): regime={hmm_regime}")
             if regime_ctx:
                 regime_ctx = dict(regime_ctx)  # shallow copy — prevent cache pollution
@@ -1443,12 +1565,54 @@ class BaseBot:
         except Exception as e:
             self.log.warning(f"Online learning update failed: {e}")
 
-        # Process symbols — pass pre-fetched 1h data to avoid redundant fetches
+        # Process symbols — pre-fetch OHLCV data in parallel, then analyze sequentially
+        # This avoids 4-8 sequential API fetches per symbol (the main cycle bottleneck)
+        from features.feature_builder import SUPPORTED_TFS
+        tf_list = list(SUPPORTED_TFS)
+        tf = (self.config.get("ml", {}).get("timeframe") or self.config.get("scanner", {}).get("timeframe", "15m"))
+        train_tfs = self.config.get("training", {}).get("timeframes", ["15m", "1h", "4h", "1d"])
+
+        # Pre-fetch multi-TF OHLCV for ALL symbols in parallel
+        multi_cache = {}
+        def _prefetch_multi(symbol):
+            try:
+                multi_tfs = [(t, 500 if t == tf else (300 if t in ("1h","30m") else 200)) for t in train_tfs]
+                dfs = self.feed.fetch_multi_timeframe(symbol, timeframes=multi_tfs)
+                return symbol, dfs
+            except Exception as e:
+                self.log.warning(f"Pre-fetch multi-TF failed for {symbol}: {e}")
+                return symbol, None
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as ex:
+            for s, dfs in ex.map(_prefetch_multi, symbols):
+                if dfs:
+                    multi_cache[s] = dfs
+
+        # Pre-fetch training-feed OHLCV for ALL symbols and TFs in parallel
+        train_cache = {}
+        def _prefetch_train(symbol):
+            try:
+                tf_dfs = {}
+                for t in tf_list:
+                    tdf = self.training_feed.fetch_ohlcv(symbol, t, limit=2000)
+                    if tdf is not None and len(tdf) >= 50:
+                        tf_dfs[t] = tdf
+                return symbol, tf_dfs
+            except Exception as e:
+                self.log.warning(f"Pre-fetch train failed for {symbol}: {e}")
+                return symbol, None
+                tdf = self.training_feed.fetch_ohlcv(symbol, t, limit=2000)
+                if tdf is not None and len(tdf) >= 50:
+                    tf_dfs[t] = tdf
+            return symbol, tf_dfs
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as ex:
+            for s, tf_dfs in ex.map(_prefetch_train, symbols):
+                if tf_dfs:
+                    train_cache[s] = tf_dfs
+
         for symbol in symbols:
             if not can_trade or max_reached or trading_paused:
-                # Still save signals for dashboard
                 try:
-                    dfs = self.feed.fetch_multi_timeframe(symbol)
+                    dfs = multi_cache.get(symbol) or self.feed.fetch_multi_timeframe(symbol)
                     if dfs and "1h" in dfs:
                         ml = self.ai.predict(dfs["1h"], symbol)
                         s  = self.agents.analyze(symbol, dfs["1h"], ml)
@@ -1457,7 +1621,9 @@ class BaseBot:
                     pass
                 continue
 
-            self.analyze_symbol(symbol, balance, open_trades, regime_ctx, btc_1h_return)
+            self.analyze_symbol(symbol, balance, open_trades, regime_ctx, btc_1h_return,
+                               pre_multi=multi_cache.get(symbol),
+                               pre_train=train_cache.get(symbol))
 
 
     def run(self):
@@ -1465,15 +1631,20 @@ class BaseBot:
         self.log.info(f"CRYPTOBOT v4 STARTED — MODE: {self.MODE.upper()}")
         self.log.info("=" * 50)
 
-        last_train = datetime.now(timezone.utc).date()
+        last_train_week = datetime.now(timezone.utc).isocalendar()[1]
         alert_sent = False
 
         while True:
             try:
-                today = datetime.now(timezone.utc).date()
-                if today != last_train:
-                    self._train(quick=False)  # full daily retrain
-                    last_train = today
+                current_week = datetime.now(timezone.utc).isocalendar()[1]
+                if current_week != last_train_week:
+                    self.log.info(f"Starting weekly retrain in background (week {current_week})")
+                    threading.Thread(
+                        target=self._with_training_heartbeat,
+                        args=(lambda: self._train(quick=False), "weekly"),
+                        daemon=True
+                    ).start()
+                    last_train_week = current_week
 
                 current_coins = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols)
                 self._retrain_if_watchlist_changed(current_coins)
@@ -1481,7 +1652,10 @@ class BaseBot:
                 self._check_for_retrain_request()
 
                 if self.learner.should_run():
-                    self.learner.run_learning_cycle()
+                    try:
+                        self._with_training_heartbeat(lambda: self.learner.run_learning_cycle(), source="ai_agent")
+                    except Exception as e:
+                        self.log.error(f"AI agent learning error: {e}", exc_info=True)
 
                 # Heartbeat: write liveness flag for dashboard detection
                 self._write_heartbeat()
@@ -1496,6 +1670,7 @@ class BaseBot:
                     break
 
                 self.run_once()
+                self._write_heartbeat()  # also write after cycle — halves gap to dashboard
                 # Send startup alert only after first successful cycle — prevents spam during deploys
                 if not alert_sent:
                     alert_sent = True
@@ -1520,6 +1695,30 @@ class BaseBot:
                 json.dump({"timestamp": datetime.now(timezone.utc).isoformat()}, f)
         except OSError:
             pass
+
+    def _heartbeat_during_training(self, stop_event):
+        while not stop_event.is_set():
+            self._write_heartbeat()
+            stop_event.wait(30)
+
+    def _with_training_heartbeat(self, fn, source="unknown"):
+        stop_event = threading.Event()
+        hb_thread = threading.Thread(target=self._heartbeat_during_training, args=(stop_event,), daemon=True)
+        hb_thread.start()
+        self._training_in_progress = True
+        self._write_training_status("running", source=source, started=datetime.now(timezone.utc).isoformat())
+        t0 = time.time()
+        try:
+            fn()
+            self._write_training_status("completed", source=source, duration_seconds=round(time.time() - t0, 1),
+                                        completed=datetime.now(timezone.utc).isoformat())
+        except Exception as e:
+            self._write_training_status("error", source=source, error=str(e))
+            raise
+        finally:
+            self._training_in_progress = False
+            stop_event.set()
+            hb_thread.join(timeout=2)
 
     def _check_bot_control(self) -> bool:
         """Check for control commands from dashboard. Returns True if should stop."""

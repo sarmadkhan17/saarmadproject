@@ -10,6 +10,8 @@ screen -r cryptobot_v3_spot           # attach (Ctrl+A D to detach)
 ```
 Launcher: auto-restart with exponential backoff, circuit breaks at 10 crashes, Telegram crash alerts.
 
+Dont assume things. always use plugin superpowers before writing any code also make use of writing-plans and executing-plans
+
 ## File Layout
 ```
 ~/cryptobot_v3/

@@ -29,12 +29,26 @@ DATA = DATA_DIR
 
 # ── State → threshold adjustments ─────────────────────────────────────────────
 # Only adjusts min_conf + size_mult. Never blocks or overrides signal direction.
+# Profile-aware: AGGRESSIVE ignores RANGING; STRICT tightens all regimes.
 REGIME_ADJUSTMENTS: Dict[str, Dict] = {
     "TRENDING":  {"min_conf_delta": -0.03, "size_mult": 1.20},
-    "RANGING":   {"min_conf_delta":  0.02, "size_mult": 0.80},
+    "RANGING":   {"min_conf_delta":  0.01, "size_mult": 0.90},
     "HIGH_VOL":  {"min_conf_delta":  0.05, "size_mult": 0.60},
     "CRASH":     {"min_conf_delta":  0.08, "size_mult": 0.40},
 }
+
+_PROFILE_MODIFIERS = {
+    "STRICT":    {"min_conf_bias":  0.02, "size_factor": 0.90},
+    "BALANCED":  {"min_conf_bias":  0.00, "size_factor": 1.00},
+    "AGGRESSIVE":{"min_conf_bias": -0.01, "size_factor": 1.05},
+}
+
+def _get_regime_adjustments(regime: str, profile: str = "BALANCED") -> Dict:
+    base = REGIME_ADJUSTMENTS.get(regime, _NULL_ADJ).copy()
+    mod = _PROFILE_MODIFIERS.get(profile, _PROFILE_MODIFIERS["BALANCED"])
+    base["min_conf_delta"] = round(base["min_conf_delta"] + mod["min_conf_bias"], 4)
+    base["size_mult"] = round(base["size_mult"] * mod["size_factor"], 4)
+    return base
 
 _NULL_ADJ = {"min_conf_delta": 0.0, "size_mult": 1.0}
 
@@ -225,22 +239,22 @@ class HMMRegimeModel:
 
     # ── Adjustment API ────────────────────────────────────────────────────────
 
-    def get_adjustments(self, regime: str) -> Dict:
+    def get_adjustments(self, regime: str, profile: str = "BALANCED") -> Dict:
         """Return threshold adjustments for regime. Never veto signals."""
-        return REGIME_ADJUSTMENTS.get(regime, _NULL_ADJ).copy()
+        return _get_regime_adjustments(regime, profile)
 
-    def get_regime_and_adjustments(self, df) -> Tuple[str, Dict]:
+    def get_regime_and_adjustments(self, df, profile: str = "BALANCED") -> Tuple[str, Dict]:
         regime = self.predict(df)
-        return regime, self.get_adjustments(regime)
+        return regime, self.get_adjustments(regime, profile)
 
-    def predict_fallback(self, df=None) -> Tuple[str, Dict]:
+    def predict_fallback(self, df=None, profile: str = "BALANCED") -> Tuple[str, Dict]:
         """
         Rule-based fallback when HMM is untrained or BTC data is unavailable.
         Uses ADX + volatility + EMA alignment on provided dataframe.
         Falls back to 'RANGING' if no data.
         """
         if df is None or len(df) < 50:
-            return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()
+            return "RANGING", _get_regime_adjustments("RANGING", profile)
 
         try:
             close = df["close"]
@@ -257,12 +271,14 @@ class HMMRegimeModel:
             ch_24 = (price - close.iloc[-96] if len(close) >= 96 else close.iloc[0]) / close.iloc[-96 if len(close) >= 96 else 0]
 
             if ch_24 < -0.10:
-                return "CRASH", REGIME_ADJUSTMENTS["CRASH"].copy()
-            if vol_ratio > 2.0:
-                return "HIGH_VOL", REGIME_ADJUSTMENTS["HIGH_VOL"].copy()
-            if adx > 25 and ((price > ema9 > ema50) or (price < ema9 < ema50)):
-                return "TRENDING", REGIME_ADJUSTMENTS["TRENDING"].copy()
-            return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()
+                return "CRASH", _get_regime_adjustments("CRASH", profile)
+            elif vol_ratio > 2.0:
+                return "HIGH_VOL", _get_regime_adjustments("HIGH_VOL", profile)
+            elif adx > 25:
+                return "TRENDING", _get_regime_adjustments("TRENDING", profile)
+            return "RANGING", _get_regime_adjustments("RANGING", profile)
+        except Exception:
+            return "RANGING", _get_regime_adjustments("RANGING", profile)
 
         except Exception:
             return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()

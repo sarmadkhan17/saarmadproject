@@ -159,32 +159,26 @@ def make_features(df):
     return f.dropna()
 
 
-def make_labels(df, forward_bars=1, atr_multiplier=0.75):
+def make_labels(df, forward_bars=1):
     """
-    ATR-based dynamic threshold labels.
-    threshold = (ATR/close) * atr_multiplier, clipped [0.001, 0.02].
-    Adapts to market volatility — wider threshold in volatile regimes.
+    Fixed-threshold labels using future returns.
+    BUY  if return >  +0.5%
+    SELL if return <  -0.5%
+    HOLD otherwise
+    Simple, consistent, same threshold for all coins.
     """
-    import ta as _ta
     close  = df["close"]
-    high   = df["high"]
-    low    = df["low"]
-
-    atr       = _ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
-    threshold = (atr / (close + 1e-9) * atr_multiplier).clip(lower=0.001, upper=0.02)
-
     future = close.shift(-forward_bars) / close - 1
-    labels = pd.Series(1, index=df.index)
-    labels[future >  threshold] = 2   # BUY
-    labels[future < -threshold] = 0   # SELL
+    labels = pd.Series(1, index=df.index)   # HOLD = 1
+    labels[future >  0.005] = 2   # BUY
+    labels[future < -0.005] = 0   # SELL
     labels = labels.dropna()
     counts = labels.value_counts().sort_index()
     total  = len(labels)
     log.info(
-        f"Labels (ATR-dynamic): SELL={counts.get(0,0)/total*100:.1f}% "
+        f"Labels (±0.5%): SELL={counts.get(0,0)/total*100:.1f}% "
         f"HOLD={counts.get(1,0)/total*100:.1f}% "
-        f"BUY={counts.get(2,0)/total*100:.1f}% "
-        f"avg_threshold={threshold.mean():.4f}"
+        f"BUY={counts.get(2,0)/total*100:.1f}%"
     )
     return labels
 
@@ -269,7 +263,7 @@ class RandomForestStrategy:
 
     def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None,
               forward_bars: int = 1, timeframe: str = "15m",
-              min_confidence: float = 0.52, min_votes: int = 2):
+              min_confidence: float = 0.52, min_votes: int = 2, n_jobs: int = 4):
         log.info("Training Random Forest (walk-forward)...")
         if feat_df is not None and labels_s is not None:
             feat   = feat_df
@@ -299,7 +293,7 @@ class RandomForestStrategy:
             sw_fold = sw[tr_idx] if sw is not None else None
             m = RandomForestClassifier(n_estimators=200, max_depth=10,
                                         min_samples_leaf=5, class_weight=cw,
-                                        random_state=42, n_jobs=4)
+                                        random_state=42, n_jobs=n_jobs)
             m.fit(Xtr, y[tr_idx], sample_weight=sw_fold)
             wf_scores.append(m.score(Xte, y[te_idx]))
         wf_acc = np.mean(wf_scores)
@@ -316,7 +310,7 @@ class RandomForestStrategy:
         new_model = RandomForestClassifier(
             n_estimators=500, max_depth=8, min_samples_leaf=8,
             min_samples_split=15, max_features="log2",
-            class_weight=cw, random_state=42, n_jobs=4,
+            class_weight=cw, random_state=42, n_jobs=n_jobs,
         )
         new_model.fit(Xtr, y[:split], sample_weight=sw_tr)
         new_acc = new_model.score(Xte, y[split:])
@@ -364,6 +358,19 @@ class RandomForestStrategy:
                 "confidence": round(float(full[label]), 4),
                 "probs": full.tolist()}
 
+    def predict_numpy(self, X: "np.ndarray"):
+        """Predict from pre-scaled numpy array (1 row × N features). No make_features() involved."""
+        if not self.is_trained:
+            raise RuntimeError("RF model not trained")
+        probs = self.model.predict_proba(X)[0]
+        full = np.zeros(3)
+        for i, c in enumerate(self.model.classes_):
+            full[c] = probs[i]
+        label = int(np.argmax(full))
+        return {"action": {0: "SELL", 1: "HOLD", 2: "BUY"}[label],
+                "confidence": round(float(full[label]), 4),
+                "probs": full.tolist()}
+
 
 class LightGBMStrategy:
     def __init__(self):
@@ -395,7 +402,7 @@ class LightGBMStrategy:
 
     def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None,
               forward_bars: int = 1, timeframe: str = "15m",
-              min_confidence: float = 0.52, min_votes: int = 2):
+              min_confidence: float = 0.52, min_votes: int = 2, n_jobs: int = 4):
         log.info("Training LightGBM (walk-forward)...")
         if feat_df is not None and labels_s is not None:
             feat   = feat_df
@@ -416,7 +423,7 @@ class LightGBMStrategy:
             subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
             num_leaves=31, min_child_samples=20,
             reg_alpha=0.1, reg_lambda=0.1,
-            class_weight="balanced", random_state=42, verbose=-1, n_jobs=4,
+            class_weight="balanced", random_state=42, verbose=-1, n_jobs=n_jobs,
         )
 
         # Walk-forward validation (same as RF)
@@ -492,6 +499,16 @@ class LightGBMStrategy:
                 "confidence": round(float(probs[label]), 4),
                 "probs": list(probs)}
 
+    def predict_numpy(self, X: "np.ndarray"):
+        """Predict from pre-scaled numpy array (1 row × N features). No make_features() involved."""
+        if not self.is_trained:
+            raise RuntimeError("LightGBM model not trained")
+        probs = self.model.predict_proba(X)[0]
+        label = int(np.argmax(probs))
+        return {"action": {0: "SELL", 1: "HOLD", 2: "BUY"}[label],
+                "confidence": round(float(probs[label]), 4),
+                "probs": list(probs)}
+
 class AIStrategyEngine:
     def __init__(self):
         self.rf            = RandomForestStrategy()
@@ -508,15 +525,21 @@ class AIStrategyEngine:
                   use_decay_weights: bool = False, btc_rows: int = 0,
                   forward_bars: int = 1, timeframe: str = "15m",
                   min_confidence: float = 0.52, min_votes: int = 2,
-                  quick: bool = False):
+                  quick: bool = False, n_jobs: int = 4, progress_fn=None):
         """All modes train RF+LGBM only (LSTM/Meta/TFT removed)."""
         r = {}
         r["rf"]   = self.rf.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights,
                                     forward_bars=forward_bars, timeframe=timeframe,
-                                    min_confidence=min_confidence, min_votes=min_votes)
+                                    min_confidence=min_confidence, min_votes=min_votes, n_jobs=n_jobs)
+        if progress_fn:
+            try: progress_fn(50)
+            except Exception: pass
         r["lgbm"] = self.lgbm.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights,
                                       forward_bars=forward_bars, timeframe=timeframe,
-                                      min_confidence=min_confidence, min_votes=min_votes)
+                                      min_confidence=min_confidence, min_votes=min_votes, n_jobs=n_jobs)
+        if progress_fn:
+            try: progress_fn(100)
+            except Exception: pass
 
         if quick:
             log.info(f"Quick train done! RF={r['rf'].get('accuracy','?')} LGBM={r['lgbm'].get('accuracy','?')}")
@@ -544,46 +567,37 @@ class AIStrategyEngine:
             "rf_trained":    self.rf.metadata.get("trained_at", "never"),
         }
 
-    def predict(self, df, symbol, regime: str = "RANGING"):
-        """2-model confidence-weighted vote: RF + LightGBM."""
+    def predict(self, df, symbol):
+        """Probability-based decision: compare raw model probabilities.
+        BUY  if buy_prob > sell_prob and buy_prob > 0.55
+        SELL if sell_prob > buy_prob and sell_prob > 0.55
+        HOLD otherwise."""
         rf_p   = self.rf.predict(df)
         lgbm_p = self.lgbm.predict(df)
 
-        buy_score, sell_score = 0.0, 0.0
-        for action, conf, weight in [
-            (lgbm_p["action"], lgbm_p["confidence"], 0.50),
-            (rf_p["action"],   rf_p["confidence"],   0.35),
-        ]:
-            if action == "BUY":
-                buy_score += conf * weight
-            elif action == "SELL":
-                sell_score += conf * weight
+        # Weighted probabilities from raw model outputs (not binned actions)
+        rf_probs   = np.array(rf_p["probs"])      # [SELL, HOLD, BUY]
+        lgbm_probs = np.array(lgbm_p["probs"])
 
-        if regime == "TRENDING":
-            buy_score *= 1.2
-            sell_score *= 1.2
-        elif regime == "RANGING":
-            buy_score *= 0.8
-            sell_score *= 0.8
+        w_rf, w_lgbm = 0.40, 0.60
+        buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
+        sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
 
-        net = buy_score - sell_score
-        if net > 0.15:
+        if buy_prob > sell_prob and buy_prob > 0.55:
             action = "BUY"
-            conf = min(abs(net) * 1.5, 0.92)
-        elif net < -0.15:
+            conf = min(buy_prob * 1.2, 0.95)
+        elif sell_prob > buy_prob and sell_prob > 0.55:
             action = "SELL"
-            conf = min(abs(net) * 1.5, 0.92)
+            conf = min(sell_prob * 1.2, 0.95)
         else:
             action = "HOLD"
-            hold_probs = [rf_p["probs"][1], lgbm_p["probs"][1]]
-            conf = sum(hold_probs) / len(hold_probs)
+            conf = max(0.35, 1.0 - max(buy_prob, sell_prob))
 
         conf = round(float(conf), 4)
-
         buy_votes = sum(1 for a in [rf_p["action"], lgbm_p["action"]] if a == "BUY")
         sell_votes = sum(1 for a in [rf_p["action"], lgbm_p["action"]] if a == "SELL")
 
-        strat = f"v4+RF:{rf_p['action']}+LGBM:{lgbm_p['action']}"
+        strat = f"prob:RF={rf_probs[2]:.2f}/{rf_probs[0]:.2f} LGBM={lgbm_probs[2]:.2f}/{lgbm_probs[0]:.2f}"
         ts = datetime.now(timezone.utc).isoformat()
 
         self._unc_buffer.append({
@@ -604,6 +618,44 @@ class AIStrategyEngine:
                 "ensemble_v4": True,
             },
             "timestamp": ts,
+        }
+
+    def predict_numpy(self, X: "np.ndarray", symbol: str):
+        """Predict from pre-scaled numpy array (1 row × N features).
+        Probability-based decision: same as predict()."""
+        rf_p   = self.rf.predict_numpy(X)
+        lgbm_p = self.lgbm.predict_numpy(X)
+
+        rf_probs   = np.array(rf_p["probs"])
+        lgbm_probs = np.array(lgbm_p["probs"])
+
+        w_rf, w_lgbm = 0.40, 0.60
+        buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
+        sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
+
+        if buy_prob > sell_prob and buy_prob > 0.55:
+            action = "BUY"
+            conf = min(buy_prob * 1.2, 0.95)
+        elif sell_prob > buy_prob and sell_prob > 0.55:
+            action = "SELL"
+            conf = min(sell_prob * 1.2, 0.95)
+        else:
+            action = "HOLD"
+            conf = max(0.35, 1.0 - max(buy_prob, sell_prob))
+
+        conf = round(float(conf), 4)
+        buy_votes = sum(1 for a in [rf_p["action"], lgbm_p["action"]] if a == "BUY")
+        sell_votes = sum(1 for a in [rf_p["action"], lgbm_p["action"]] if a == "SELL")
+        strat = f"prob:RF={rf_probs[2]:.2f}/{rf_probs[0]:.2f} LGBM={lgbm_probs[2]:.2f}/{lgbm_probs[0]:.2f}"
+
+        return {
+            "symbol": symbol, "action": action, "confidence": conf,
+            "strategy": strat, "timeframe": "AI-v4",
+            "indicators": {
+                "rf_conf": rf_p["confidence"], "lgbm_conf": lgbm_p["confidence"],
+                "rf_action": rf_p["action"], "lgbm_action": lgbm_p["action"],
+                "buy_votes": buy_votes, "sell_votes": sell_votes,
+            },
         }
 
     def _flush_uncertainty_log(self):

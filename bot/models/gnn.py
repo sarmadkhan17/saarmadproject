@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 log = logging.getLogger("GNNCorr")
 
 EDGE_THRESHOLD  = 0.65   # |Pearson r| above this → graph edge
-RISK_THRESHOLD  = 0.60   # avg correlation with open positions → block
+RISK_THRESHOLD  = 0.75   # avg correlation with open positions → block
 N_GCN_LAYERS   = 2
 
 
