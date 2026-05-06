@@ -279,6 +279,3 @@ class HMMRegimeModel:
             return "RANGING", _get_regime_adjustments("RANGING", profile)
         except Exception:
             return "RANGING", _get_regime_adjustments("RANGING", profile)
-
-        except Exception:
-            return "RANGING", REGIME_ADJUSTMENTS["RANGING"].copy()

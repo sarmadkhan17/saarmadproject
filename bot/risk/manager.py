@@ -271,6 +271,10 @@ class KellyCriterionSizer:
     MAX_PCT        = 0.15
     BASE_PCT       = 0.05
 
+    def __init__(self, config=None):
+        cfg = config or {}
+        self.leverage = cfg.get("risk", {}).get("leverage", 1)
+
     def calculate(self, confidence, balance, price, atr_pct, regime, recent_trades, all_agree=False):
         closed = [t for t in recent_trades if t.get("status") == "closed"]
         if len(closed) < 10:
@@ -293,8 +297,10 @@ class KellyCriterionSizer:
                     wr = len(wins) / len(pct_returns)
                     avg_win = np.mean(wins)
                     avg_los = np.mean(losses)
-                    kelly = (wr * avg_win - (1 - wr) * avg_los) / (avg_los + 1e-9)
-                    pos_pct = max(0, kelly) * self.KELLY_FRACTION * (0.5 + confidence * 0.5)
+                    payoff_ratio = avg_win / (avg_los + 1e-9)
+                    kelly = (wr * payoff_ratio - (1 - wr)) / (payoff_ratio + 1e-9)
+                    kelly = max(0, kelly)
+                    pos_pct = kelly * self.KELLY_FRACTION * (0.5 + confidence * 0.5)
                 else:
                     pos_pct = self.BASE_PCT
             else:
@@ -317,9 +323,9 @@ class KellyCriterionSizer:
         else:
             cap = 0.10
         pos_pct = max(self.MIN_PCT, min(cap, pos_pct))
-        usdt    = balance * pos_pct
+        usdt    = balance * pos_pct * self.leverage
         amount  = usdt / price
-        log.info(f"Kelly size: {pos_pct*100:.1f}% cap={cap*100:.0f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
+        log.info(f"Kelly size: {pos_pct*100:.1f}% × {self.leverage}× lev = ${usdt:.2f} cap={cap*100:.0f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
         return amount, usdt
 
 
@@ -352,7 +358,9 @@ class CircuitBreaker:
     def __init__(self, config):
         self.max_daily_loss  = config.get("max_daily_loss_pct", 0.05)
         self.max_consec_loss = config.get("max_consecutive_losses", 4)
+        self.max_drawdown    = config.get("max_drawdown_pct", 0.10)
         self._initial_balance = None
+        self._peak_balance   = None
         self._load()
 
     def _load(self):
@@ -363,10 +371,12 @@ class CircuitBreaker:
                 self.pnl_history   = d.get("pnl_history", {})
                 self.consec_losses = d.get("consec_losses", 0)
                 self._initial_balance = d.get("initial_balance")
+                self._peak_balance   = d.get("peak_balance")
         else:
             self.pnl_history   = {}
             self.consec_losses = 0
             self._initial_balance = None
+            self._peak_balance   = None
 
     def _save(self):
         from datetime import timedelta
@@ -375,7 +385,8 @@ class CircuitBreaker:
         with open(DATA / "circuit_breaker.json", "w") as f:
             json.dump({"pnl_history": self.pnl_history,
                        "consec_losses": self.consec_losses,
-                       "initial_balance": self._initial_balance}, f)
+                       "initial_balance": self._initial_balance,
+                       "peak_balance": self._peak_balance}, f)
 
     def _get_rolling_loss(self):
         from datetime import timedelta
@@ -391,6 +402,8 @@ class CircuitBreaker:
     def record_trade(self, pnl, balance):
         if self._initial_balance is None and balance > 0:
             self._initial_balance = balance
+        if self._peak_balance is None or balance > self._peak_balance:
+            self._peak_balance = balance
         today_str = str(date.today())
         self.pnl_history[today_str] = self.pnl_history.get(today_str, 0.0) + pnl
         self.consec_losses = self.consec_losses + 1 if pnl < 0 else 0
@@ -404,6 +417,11 @@ class CircuitBreaker:
             return False, f"Rolling {self.WINDOW_DAYS}-day loss ${rolling_loss:.2f} (limit -${threshold:.2f})"
         if self.consec_losses >= self.max_consec_loss:
             return False, f"Consecutive losses: {self.consec_losses}"
+        peak = self._peak_balance or self._initial_balance or balance
+        if peak and peak > 0:
+            drawdown = (peak - balance) / peak
+            if drawdown > self.max_drawdown:
+                return False, f"Drawdown {drawdown*100:.1f}% from peak ${peak:.2f} (limit {self.max_drawdown*100:.0f}%)"
         return True, "OK"
 
 
@@ -412,10 +430,11 @@ class RiskManager:
         risk             = config.get("risk", {})
         self.market_gate = MarketRegimeGate()
         self.correlation = CorrelationFilter()
-        self.trailing    = ATRTrailingStop(risk.get("stop_loss_atr_multiplier", 2.0))
-        self.sizer       = KellyCriterionSizer()
+        self.trailing    = ATRTrailingStop(risk.get("stop_loss_atr_multiplier", 3.0))
+        self.sizer       = KellyCriterionSizer(config)
         self.breaker     = CircuitBreaker(risk)
         self.heat        = PortfolioHeatTracker(risk.get("max_portfolio_heat", 0.40))
+        self.sl_min_pct  = risk.get("stop_loss_min_pct", 0.015)
         self.tp_atr_mult = risk.get("take_profit_atr_multiplier", 2.5)
         self.fallback_tp = risk.get("take_profit_pct", 0.05)
 

@@ -334,10 +334,10 @@ class RandomForestStrategy:
 
     def predict(self, df):
         if not self.is_trained:
-            return {"action": "BUY", "confidence": 0.50, "probs": [0.50, 0.50]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
         feat = make_features(df)
         if len(feat) == 0:
-            return {"action": "BUY", "confidence": 0.50, "probs": [0.50, 0.50]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
         last   = feat.iloc[[-1]][self.feature_cols]
         probs  = self.model.predict_proba(self.scaler.transform(last.values))[0]
         # Binary: [SELL_prob, BUY_prob]
@@ -474,10 +474,10 @@ class LightGBMStrategy:
 
     def predict(self, df):
         if not self.is_trained:
-            return {"action": "BUY", "confidence": 0.50, "probs": [0.50, 0.50]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
         feat = make_features(df)
         if len(feat) == 0:
-            return {"action": "BUY", "confidence": 0.50, "probs": [0.50, 0.50]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
         last  = feat.iloc[[-1]][self.feature_cols]
         probs = self.model.predict_proba(self.scaler.transform(last.values))[0]
         # Binary: [SELL_prob, BUY_prob]
@@ -545,7 +545,7 @@ class AIStrategyEngine:
         lgbm_wf  = max(self.lgbm.metadata.get("wf_accuracy", 0.33), 0.10)
         raw = np.array([rf_wf, lgbm_wf], dtype=float)
         w   = raw / raw.sum()
-        return {"rf": float(w[0]), "lgbm": float(w[1])}
+        return float(w[0]), float(w[1])
 
     def get_model_health(self):
         return {
@@ -563,11 +563,18 @@ class AIStrategyEngine:
         rf_probs   = np.array(rf_p["probs"])      # [SELL_prob, BUY_prob]
         lgbm_probs = np.array(lgbm_p["probs"])
 
-        w_rf, w_lgbm = 0.40, 0.60
+        w_rf, w_lgbm = self._get_dynamic_weights()
         buy_prob  = rf_probs[1] * w_rf + lgbm_probs[1] * w_lgbm
         sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
 
-        if buy_prob >= sell_prob:
+        if rf_p.get("action") == "HOLD" or lgbm_p.get("action") == "HOLD":
+            if buy_prob < 0.60 and sell_prob < 0.60:
+                action, conf = "HOLD", max(buy_prob, sell_prob)
+            elif buy_prob >= sell_prob:
+                action, conf = "BUY", min(buy_prob, 0.95)
+            else:
+                action, conf = "SELL", min(sell_prob, 0.95)
+        elif buy_prob >= sell_prob:
             action, conf = "BUY", min(buy_prob, 0.95)
         else:
             action, conf = "SELL", min(sell_prob, 0.95)

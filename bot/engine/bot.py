@@ -198,6 +198,20 @@ class StateManager:
                 break
         self.save()
 
+    def update_trade_amount(self, trade_id, new_amount):
+        for t in self.state["trades"]:
+            if t["id"] == trade_id:
+                t["amount"] = round(new_amount, 8)
+                break
+        self.save()
+
+    def update_trade_sl(self, trade_id, sl_order_id):
+        for t in self.state["trades"]:
+            if t["id"] == trade_id:
+                t["sl_order_id"] = sl_order_id
+                break
+        self.save()
+
     def add_signal(self, signal):
         self.state["signals"].append(signal)
         self.state["signals"] = self.state["signals"][-500:]
@@ -777,6 +791,21 @@ class BaseBot:
                     )
                 else:
                     self.state.partial_close_trade(trade["id"], close_amount, pnl)
+                    if self.MODE == "futures" and trade.get("sl_order_id"):
+                        remaining = trade["amount"] - close_amount
+                        if remaining > 0:
+                            self._cancel_exchange_stop_loss(
+                                trade["symbol"], trade.get("sl_order_id", "")
+                            )
+                            atr = _get_atr_cached(trade["symbol"])
+                            if atr and atr > 0:
+                                new_sl_id = self.execution._place_sl(
+                                    trade["symbol"], trade["side"], remaining,
+                                    float(trade["price"]), atr,
+                                )
+                                if new_sl_id:
+                                    self.state.update_trade_sl(trade["id"], new_sl_id)
+                                    self.log.info(f"SL re-placed for {trade['symbol']}: {remaining:.4f} remaining")
                 self.ai.record_trade_result(trade["symbol"], pnl)
                 self.agents.record_trade_result(trade["symbol"], pnl)
                 self.risk.record_trade_result(pnl, self.get_usdt_balance())
@@ -878,6 +907,22 @@ class BaseBot:
                             full_pnl = self._calc_pnl(trade, current_price)
                             pnl      = full_pnl * 0.25
                             self.state.partial_close_trade(trade["id"], close_amt, pnl)
+                            try:
+                                self.ai.record_trade_result(symbol, pnl)
+                            except Exception:
+                                pass
+                            try:
+                                self.agents.record_trade_result(symbol, pnl)
+                            except Exception:
+                                pass
+                            try:
+                                self.risk.record_trade_result(pnl, balance)
+                            except Exception:
+                                pass
+                            try:
+                                self.rl_agent.record_external_close(trade["id"], pnl)
+                            except Exception:
+                                pass
                             self.log.info(f"RL SCALE_OUT {symbol} 25% | PnL={pnl:+.4f}")
 
                 elif action == "SCALE_IN":
@@ -895,6 +940,9 @@ class BaseBot:
                         else:
                             order = self._place_sell(symbol, extra_amount)
                         if order:
+                            new_amount = trade["amount"] + extra_amount
+                            trade["amount"] = new_amount
+                            self.state.update_trade_amount(trade["id"], new_amount)
                             self.log.info(f"RL SCALE_IN {symbol} +25% @ {current_price:.4f}")
 
             except Exception as e:
@@ -1210,10 +1258,30 @@ class BaseBot:
 
                 # Add exchange positions the bot does not know about
                 our_syms = {t["symbol"] for t in d.get("trades", []) if t.get("status") == "open"}
+                recently_closed = set()
+                for t in d.get("trades", []):
+                    if t.get("status") == "closed":
+                        ts = t.get("close_timestamp", "")
+                        if ts:
+                            try:
+                                closed = datetime.fromisoformat(ts)
+                                if closed.tzinfo is None:
+                                    closed = closed.replace(tzinfo=timezone.utc)
+                                if (datetime.now(timezone.utc) - closed).total_seconds() < 86400:
+                                    recently_closed.add(t["symbol"])
+                            except (ValueError, TypeError):
+                                pass
                 import time as _time
                 for pos in positions:
                     sym = pos["symbol"]
                     if sym in our_syms or float(pos.get("amount", 0)) == 0:
+                        continue
+                    if sym in recently_closed:
+                        self.log.info(f"Sync: skipping {sym} — recently closed within 24h")
+                        continue
+                    current_open = sum(1 for t in d.get("trades", []) if t.get("status") == "open")
+                    if current_open >= self.max_open:
+                        self.log.warning(f"Sync: skipping {sym} — max_open={self.max_open} reached ({current_open} open)")
                         continue
                     trade = {
                         "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
@@ -1531,6 +1599,18 @@ class BaseBot:
                     self.risk.cleanup_trade(trade["id"])
                     self._cancel_exchange_stop_loss(sym, trade.get("sl_order_id", ""))
                     try:
+                        self.ai.record_trade_result(sym, pnl)
+                    except Exception:
+                        pass
+                    try:
+                        self.agents.record_trade_result(sym, pnl)
+                    except Exception:
+                        pass
+                    try:
+                        self.risk.record_trade_result(pnl, balance)
+                    except Exception:
+                        pass
+                    try:
                         self.rl_agent.record_external_close(trade["id"], pnl)
                     except Exception:
                         pass
@@ -1555,7 +1635,9 @@ class BaseBot:
                 close_flag.unlink()
             except OSError:
                 pass
-            open_trades = self.state.get_open_trades()  # refresh after close
+            open_trades = self.state.get_open_trades()
+            balance     = self.get_usdt_balance()
+            max_reached = len(open_trades) >= self.max_open
 
         # Check if trading paused via dashboard
         trading_paused = self.is_trading_paused()
@@ -1617,6 +1699,9 @@ class BaseBot:
 
         # RL execution layer: manages open trades, runs after ATR stops + HMM context ready
         self._rl_manage_trades(regime_ctx)
+        open_trades = self.state.get_open_trades()
+        balance     = self.get_usdt_balance()
+        max_reached = len(open_trades) >= self.max_open
 
         # Pre-fetch 1h OHLCV for all symbols once — shared between GNN and analysis
         try:
