@@ -1,7 +1,3 @@
-training:
-  min_bars_per_coin: 3000
-  min_coins: 8
-  use_real_api: true
 bot:
   groq_cache_seconds: 1800
   scan_interval_seconds: 30
@@ -24,7 +20,7 @@ risk:
   leverage: 5
   max_consecutive_losses: 10
   max_daily_loss_pct: 0.05
-  max_open_trades: 20
+  max_open_trades: 5
   max_portfolio_heat: 0.6
   max_position_pct: 0.03
   stop_loss_atr_multiplier: 2.0

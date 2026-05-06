@@ -177,11 +177,11 @@ class StateManager:
             if t["id"] == trade_id:
                 t["status"]          = "closed"
                 t["close_price"]     = price
-                t["pnl"]             = pnl
+                t["pnl"]             = round(t.get("pnl", 0.0) + pnl, 8)
                 t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
                 self.state["stats"]["total_pnl"] += pnl
-                if pnl > 0: self.state["stats"]["wins"]   += 1
-                else:       self.state["stats"]["losses"] += 1
+                if t["pnl"] > 0: self.state["stats"]["wins"]   += 1
+                else:             self.state["stats"]["losses"] += 1
                 break
         self.save()
 
@@ -308,22 +308,16 @@ class BaseBot:
                 try:
                     ml = self.ai.predict_numpy(self._last_X, self._last_symbol)
                 finally:
-                    self._last_X = None  # clear for next cycle
-                buy_votes  = ml.get("indicators", {}).get("buy_votes", 0)
-                sell_votes = ml.get("indicators", {}).get("sell_votes", 0)
-                buy_score  = max(0.0, buy_votes / 3 * 0.8)
-                sell_score = max(0.0, sell_votes / 3 * 0.8)
-                ml_action  = ml.get("action", "HOLD")
-                ml_conf    = ml.get("confidence", 0.50)
-                if ml_action == "BUY":
-                    buy_score = max(buy_score, ml_conf * 0.9)
-                elif ml_action == "SELL":
-                    sell_score = max(sell_score, ml_conf * 0.9)
+                    self._last_X = None
+                ml_action = ml.get("action", "BUY")
+                ml_conf   = ml.get("confidence", 0.50)
+                buy_score  = ml_conf if ml_action == "BUY" else 0.0
+                sell_score = ml_conf if ml_action == "SELL" else 0.0
                 net_score  = buy_score - sell_score
                 return AgentSignal(
                     agent="technical", buy_score=buy_score, sell_score=sell_score,
                     net_score=net_score, confidence=ml_conf,
-                    reasoning=f"ML:{ml_action} votes={buy_votes}B/{sell_votes}S",
+                    reasoning=f"ML:{ml_action} prob={ml_conf:.2f}",
                 )
 
         self.ml_agent = MLTechnicalAgent(self.ai, DATA_DIR / self.MODE)
@@ -693,8 +687,10 @@ class BaseBot:
                             f"Order confirmed: {side.upper()} {amount:.6f} {symbol}"
                         )
                         return filled
+
                     elif status == "open":
                         return filled
+
                 except Exception:
                     return order  # Testnet may not support fetch_order
 
@@ -863,11 +859,16 @@ class BaseBot:
                         self.log.info(f"RL CLOSE {symbol} | PnL={pnl:+.4f}")
                         self.notifier.send_alert(f"RL CLOSE {symbol}\nPnL: ${pnl:+.4f}")
                     else:
-                        self.log.warning(f"RL CLOSE {symbol} FAILED — marking as cancelled (insufficient balance)")
-                        self.state.close_trade(trade["id"], current_price,
-                                               self._calc_pnl(trade, current_price))
+                        pnl = self._calc_pnl(trade, current_price)
+                        self.log.warning(f"RL CLOSE {symbol} FAILED — closing locally (order rejected)")
+                        self.state.close_trade(trade["id"], current_price, pnl)
                         self.risk.cleanup_trade(trade["id"])
                         self._cancel_exchange_stop_loss(symbol, trade.get("sl_order_id", ""))
+                        self.ai.record_trade_result(symbol, pnl)
+                        self.agents.record_trade_result(symbol, pnl)
+                        self.risk.record_trade_result(pnl, balance)
+                        self.rl_agent.record_step(trade["id"], current_price, atr, done=True, final_pnl=pnl)
+                        self.notifier.send_alert(f"RL CLOSE {symbol} FAILED (local)\nPnL: ${pnl:+.4f}")
 
                 elif action == "SCALE_OUT":
                     close_amt = trade["amount"] * 0.25
@@ -1114,121 +1115,134 @@ class BaseBot:
             self._sync_spot()
 
     def _sync_futures(self):
-        """Position-based sync for futures mode."""
+        """Simple futures sync: cancel any open trade not on the exchange.
+        No re-adding, no grace period — position missing → cancel immediately."""
         try:
             self.log.info("Sync running — mode=futures")
             try:
                 positions = self.exchange.get_position()
-                self.log.info(f"Sync: got {len(positions) if positions else 0} positions")
             except Exception as pe:
                 self.log.warning(f"get_position failed: {pe}")
                 positions = []
             if not positions:
                 positions = []
 
+            exchange_syms = {p["symbol"] for p in positions if float(p.get("amount", 0)) != 0}
+            self.log.info(f"Sync: got {len(exchange_syms)} active positions from exchange")
+
             bal  = self.exchange.fetch_balance()
             usdt = float(bal["total"].get("USDT", 0))
 
-            d        = self.state.state
-            our_open = {t["symbol"]: t for t in d["trades"] if t["status"] == "open"}
-            binance_syms = {p["symbol"] for p in positions}
-            our_syms = set(our_open.keys())
-
+            d = self.state.state
             with self.state._lock:
-                for pos in positions:
-                    sym = pos["symbol"]
-                    if sym in our_syms:
-                        for t in d["trades"]:
-                            if t["symbol"] == sym and t["status"] == "open":
-                                t["amount"]    = pos["amount"]
-                                t["price"]     = pos["entry_price"]
-                                t["leverage"]  = pos.get("leverage", 5)
-                                t["live_pnl"]  = round(pos["pnl"], 6)
-                                t["mark_price"]= pos.get("mark_price", 0)
-
-                import time as _time
-                for pos in positions:
-                    sym = pos["symbol"]
-                    if sym not in our_syms:
-                        trade = {
-                            "id":              f"sync_{sym.replace('/','_')}_{int(_time.time())}",
-                            "symbol":          sym,
-                            "side":            pos["side"],
-                            "amount":          pos["amount"],
-                            "price":           pos["entry_price"],
-                            "mark_price":      pos.get("mark_price", 0),
-                            "live_pnl":        round(pos["pnl"], 6),
-                            "timestamp":       datetime.now(timezone.utc).isoformat(),
-                            "strategy":        "synced_from_exchange",
-                            "timeframe":       f"AUTO-{self.MODE}",
-                            "status":          "open",
-                            "mode":            self.MODE,
-                            "leverage":        pos.get("leverage", 5),
-                            "sl_order_id":     "",
-                            "pnl":             0.0,
-                            "close_price":     0.0,
-                            "close_timestamp": ""
-                        }
-                        d["trades"].append(trade)
-                        d["stats"]["total_trades"] += 1
-                        self.log.info(f"Sync: added {sym} {pos['side']}")
-
-                for t in d["trades"]:
-                    if t["status"] == "open" and t["symbol"] not in binance_syms:
+                for t in d.get("trades", []):
+                    if t["status"] != "open": continue
+                    sym = t["symbol"]
+                    if sym in exchange_syms:
+                        # Position exists — update live PnL
+                        for pos in positions:
+                            if pos["symbol"] == sym:
+                                t["amount"]     = pos["amount"]
+                                t["price"]      = pos["entry_price"]
+                                t["leverage"]   = pos.get("leverage", 5)
+                                t["live_pnl"]   = round(pos["pnl"], 6)
+                                t["mark_price"] = pos.get("mark_price", 0)
+                                break
+                    else:
+                        # Position missing — close trade (after 60s grace)
                         ts_str = t.get("timestamp", "")
-                        recent_entry = False
+                        recent = False
                         try:
                             if ts_str:
                                 opened = datetime.fromisoformat(ts_str)
                                 if opened.tzinfo is None:
                                     opened = opened.replace(tzinfo=timezone.utc)
-                                if (datetime.now(timezone.utc) - opened).total_seconds() < 120:
-                                    recent_entry = True
+                                if (datetime.now(timezone.utc) - opened).total_seconds() < 60:
+                                    recent = True
                         except (ValueError, TypeError):
                             pass
-                        if recent_entry:
-                            self.log.debug(f"Sync: skipping orphan check for {t['symbol']} (entered <120s ago)")
+                        if recent:
+                            self.log.debug(f"Sync: skipping orphan {sym} (entered <60s ago)")
                             continue
+                        # Try to get actual close price from trade history
+                        close_price = float(t["price"])
+                        trades = []
                         try:
-                            last_price = self.exchange.fetch_ticker(t["symbol"])["last"]
-                            entry  = float(t["price"])
-                            amount = float(t["amount"])
-                            side   = t.get("side", "long")
-                            pnl    = (last_price - entry) * amount if side == "long" else (entry - last_price) * amount
+                            trades = self.exchange.fetch_my_trades(sym, limit=10)
+                            if trades:
+                                close_price = max(trades, key=lambda x: x["time"]).get("price", close_price)
                         except Exception:
-                            last_price = float(t["price"])
-                            pnl        = 0.0
-                        t["status"]          = "cancelled"
-                        t["close_price"]     = last_price
-                        t["pnl"]             = round(pnl, 6)
+                            pass
+                        if not trades:
+                            try:
+                                close_price = self.exchange.fetch_ticker(sym)["last"]
+                            except Exception:
+                                pass
+                        pnl = self._calc_pnl(t, close_price)
+                        t["status"]          = "closed"
+                        t["close_price"]     = close_price
+                        t["pnl"]             = round(pnl, 8)
                         t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
                         d["stats"]["total_pnl"] += round(pnl, 6)
-                        if pnl > 0:
-                            d["stats"]["wins"]   += 1
-                        elif pnl < 0:
-                            d["stats"]["losses"] += 1
-                        self.log.info(f"Sync: cancelled orphan {t['symbol']} pnl={pnl:+.4f}")
-                        self._cancel_exchange_stop_loss(
-                            t["symbol"], t.get("sl_order_id", "")
-                        )
+                        if pnl > 0:  d["stats"]["wins"]   += 1
+                        elif pnl < 0: d["stats"]["losses"] += 1
+                        self.log.info(f"Sync: closed orphan {sym} pnl={pnl:+.4f}")
+                        try:
+                            self._cancel_exchange_stop_loss(sym, t.get("sl_order_id", ""))
+                        except Exception:
+                            pass
+                        try:
+                            self.rl_agent.record_external_close(t["id"], pnl)
+                        except Exception:
+                            pass
+                        try:
+                            self.ai.record_trade_result(sym, pnl)
+                        except Exception:
+                            pass
+                        try:
+                            self.agents.record_trade_result(sym, pnl)
+                        except Exception:
+                            pass
                         try:
                             self.risk.record_trade_result(pnl, usdt)
                         except Exception:
                             pass
-                        try:
-                            self.ai.record_trade_result(t.get("symbol", "unknown"), pnl)
-                        except Exception:
-                            pass
 
-            live_pnl = round(sum(p["pnl"] for p in positions), 4)
-            self.log.info(f"Sync saving balance=${usdt:.2f} live_pnl={live_pnl:.4f}")
-            self.state.state["stats"]["balance"]        = round(usdt, 2)
-            self.state.state["stats"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
-            self.state.state["stats"]["total_live_pnl"] = live_pnl
+                # Add exchange positions the bot does not know about
+                our_syms = {t["symbol"] for t in d.get("trades", []) if t.get("status") == "open"}
+                import time as _time
+                for pos in positions:
+                    sym = pos["symbol"]
+                    if sym in our_syms or float(pos.get("amount", 0)) == 0:
+                        continue
+                    trade = {
+                        "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
+                        "symbol":          sym,
+                        "side":            pos["side"],
+                        "amount":          pos["amount"],
+                        "price":           pos["entry_price"],
+                        "mark_price":      pos.get("mark_price", 0),
+                        "live_pnl":        round(pos["pnl"], 6),
+                        "timestamp":       datetime.now(timezone.utc).isoformat(),
+                        "strategy":        "synced_from_position",
+                        "timeframe":       f"AUTO-{self.MODE}",
+                        "status":          "open",
+                        "mode":            self.MODE,
+                        "leverage":        pos.get("leverage", 5),
+                        "sl_order_id":     "",
+                        "pnl":             0.0,
+                        "close_price":     0.0,
+                        "close_timestamp": ""
+                    }
+                    d["trades"].append(trade)
+                    d["stats"]["total_trades"] += 1
+                    self.log.info(f"Sync: imported {sym} {pos['side']} from exchange")
+
+            self.state.state["stats"]["balance"]   = round(usdt, 2)
+            self.state.state["stats"]["last_sync"] = datetime.now(timezone.utc).isoformat()
+            self.log.info(f"Sync saving balance=${usdt:.2f}")
         except Exception as e:
-            import traceback
             self.log.warning(f"Sync error: {e}")
-            self.log.warning(traceback.format_exc())
         finally:
             self.state.save(immediate=True)
 
@@ -1245,7 +1259,7 @@ class BaseBot:
             all_syms = {t["symbol"] for t in d["trades"]}
 
             with self.state._lock:
-                # RULE 1: Trade in bot, NOT on exchange → cancel it
+                # RULE 1: Trade in bot, NOT on exchange → close it
                 for t in d["trades"]:
                     if t["status"] != "open":
                         continue
@@ -1268,24 +1282,30 @@ class BaseBot:
                     min_held = float(t["amount"]) * 0.1
                     trade_value = float(t["amount"]) * float(t["price"])
                     if held < min_held or trade_value < 1.0:
+                        close_price = float(t["price"])
+                        trades = []
                         try:
-                            last_price = self.exchange.fetch_ticker(t["symbol"])["last"]
-                            entry  = float(t["price"])
-                            amount = float(t["amount"])
-                            pnl    = (last_price - entry) * amount
+                            trades = self.exchange.fetch_my_trades(t["symbol"], limit=10)
+                            if trades:
+                                close_price = max(trades, key=lambda x: x["time"]).get("price", close_price)
                         except Exception:
-                            last_price = float(t["price"])
-                            pnl        = 0.0
-                        t["status"]          = "cancelled"
-                        t["close_price"]     = last_price
-                        t["pnl"]             = round(pnl, 6)
+                            pass
+                        if not trades:
+                            try:
+                                close_price = self.exchange.fetch_ticker(t["symbol"])["last"]
+                            except Exception:
+                                pass
+                        pnl = self._calc_pnl(t, close_price)
+                        t["status"]          = "closed"
+                        t["close_price"]     = close_price
+                        t["pnl"]             = round(pnl, 8)
                         t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
                         d["stats"]["total_pnl"] += round(pnl, 6)
                         if pnl > 0:
                             d["stats"]["wins"]   += 1
                         elif pnl < 0:
                             d["stats"]["losses"] += 1
-                        self.log.info(f"Sync: cancelled {t['symbol']} (asset {asset} balance={held:.6f}) pnl={pnl:+.4f}")
+                        self.log.info(f"Sync: closed {t['symbol']} (asset {asset} balance={held:.6f}) pnl={pnl:+.4f}")
                         try:
                             self.risk.record_trade_result(pnl, 5000)
                         except Exception:
@@ -1295,11 +1315,14 @@ class BaseBot:
                         except Exception:
                             pass
 
-                # RULE 2: Asset on exchange, NOT in bot → add it (buy-only for spot)
-                # Track recently cancelled to prevent re-adding ghosts (stale fetch_balance)
-                cancelled_syms = set()
+                # RULE 2: Import watchlist exchange balances with >$50 value
+                try:
+                    watchlist_coins = set(self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols))
+                except Exception:
+                    watchlist_coins = set()
+                recently_closed = set()
                 for t in d["trades"]:
-                    if t.get("status") == "cancelled":
+                    if t.get("status") in ("cancelled", "closed"):
                         ts = t.get("close_timestamp", "")
                         try:
                             if ts:
@@ -1307,7 +1330,7 @@ class BaseBot:
                                 if closed.tzinfo is None:
                                     closed = closed.replace(tzinfo=timezone.utc)
                                 if (datetime.now(timezone.utc) - closed).total_seconds() < 86400:
-                                    cancelled_syms.add(t["symbol"])
+                                    recently_closed.add(t["symbol"])
                         except (ValueError, TypeError):
                             pass
                 for asset, free_val in bal.get("free", {}).items():
@@ -1319,8 +1342,9 @@ class BaseBot:
                         continue
                     if sym in all_syms:
                         continue
-                    if sym in cancelled_syms:
-                        self.log.debug(f"Sync: skipping recently cancelled {sym}")
+                    if sym not in watchlist_coins:
+                        continue
+                    if sym in recently_closed:
                         continue
                     try:
                         ticker = self.exchange.fetch_ticker(sym)
@@ -1329,9 +1353,8 @@ class BaseBot:
                         continue
                     if price <= 0:
                         continue
-                    # Skip dust balances (less than $1 USDT value)
-                    if free * price < 1.0:
-                        self.log.debug(f"Sync: skipping dust {sym} (${free * price:.4f})")
+                    if free * price < 50.0:
+                        self.log.debug(f"Sync: skipping {sym} — dust (${free*price:.2f})")
                         continue
                     import time as _time
                     trade = {
@@ -1355,7 +1378,7 @@ class BaseBot:
                     }
                     d["trades"].append(trade)
                     d["stats"]["total_trades"] += 1
-                    self.log.info(f"Sync: added {sym} buy {free}")
+                    self.log.info(f"Sync: imported {sym} buy {free:.6f} (${free*price:.2f})")
 
             usdt = float(totals.get("USDT", 0))
             self.log.info(f"Sync saving balance=${usdt:.2f}")
@@ -1465,6 +1488,57 @@ class BaseBot:
                 pass
         return False
 
+    def _close_all_positions(self, open_trades, balance):
+        """Close all open positions — triggered by dashboard Close All button."""
+        if not open_trades:
+            self.log.info("Close All: no open trades to close")
+            return
+        self.log.info(f"Close All: closing {len(open_trades)} positions")
+        self.notifier.send_alert(f"CLOSE ALL: closing {len(open_trades)} positions")
+        for trade in list(open_trades):
+            sym = trade["symbol"]
+            try:
+                price = self.get_price(sym)
+                if not price or price <= 0:
+                    price = float(trade.get("price", 0))
+                order = self._place_close(sym, trade["amount"], trade["side"])
+                if order:
+                    pnl = self._calc_pnl(trade, price)
+                    self.state.close_trade(trade["id"], price, pnl)
+                    self.risk.cleanup_trade(trade["id"])
+                    self._cancel_exchange_stop_loss(sym, trade.get("sl_order_id", ""))
+                    try:
+                        self.ai.record_trade_result(sym, pnl)
+                    except Exception:
+                        pass
+                    try:
+                        self.agents.record_trade_result(sym, pnl)
+                    except Exception:
+                        pass
+                    try:
+                        self.risk.record_trade_result(pnl, balance)
+                    except Exception:
+                        pass
+                    try:
+                        self.rl_agent.record_external_close(trade["id"], pnl)
+                    except Exception:
+                        pass
+                    self.log.info(f"Close All: {sym} closed pnl={pnl:+.4f}")
+                else:
+                    self.log.warning(f"Close All: {sym} order failed — marking closed locally")
+                    pnl = self._calc_pnl(trade, price)
+                    self.state.close_trade(trade["id"], price, pnl)
+                    self.risk.cleanup_trade(trade["id"])
+                    self._cancel_exchange_stop_loss(sym, trade.get("sl_order_id", ""))
+                    try:
+                        self.rl_agent.record_external_close(trade["id"], pnl)
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.log.error(f"Close All: error closing {sym}: {e}")
+        self.state.save(immediate=True)
+        self.notifier.send_alert(f"CLOSE ALL: done — {len(open_trades)} positions closed")
+
     def run_once(self):
         """One scan cycle — identical for both modes."""
         self.sync_with_exchange()
@@ -1472,6 +1546,16 @@ class BaseBot:
 
         balance     = self.get_usdt_balance()
         open_trades = self.state.get_open_trades()
+
+        # Check for close-all request from dashboard
+        close_flag = DATA / "close_all_positions.json"
+        if close_flag.exists():
+            self._close_all_positions(open_trades, balance)
+            try:
+                close_flag.unlink()
+            except OSError:
+                pass
+            open_trades = self.state.get_open_trades()  # refresh after close
 
         # Check if trading paused via dashboard
         trading_paused = self.is_trading_paused()

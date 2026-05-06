@@ -119,16 +119,18 @@ class RLTradeManager:
     Learns online from closed-trade PnL. Safe before trained (returns HOLD).
     """
 
-    BATCH_SIZE       = 32
-    GAMMA            = 0.99
-    LR               = 1e-3
-    EPS_START        = 1.0
-    EPS_END          = 0.15
-    EPS_DECAY        = 0.995
-    TARGET_SYNC      = 50    # steps between target-net sync
-    MIN_EXPERIENCES  = 64    # minimum buffer before any non-HOLD action
-    MIN_CONF_THRESH  = 0.60  # Q-net confidence below this → rule-based HOLD
-    SCALE_IN_MIN_EXP = 500   # experiences needed before SCALE_IN is allowed
+    BATCH_SIZE        = 32
+    GAMMA             = 0.99
+    LR                = 1e-3
+    EPS_START         = 1.0
+    EPS_END           = 0.05
+    EPS_DECAY         = 0.995
+    TARGET_SYNC       = 50    # steps between target-net sync
+    MIN_EXPERIENCES   = 64    # minimum buffer before any non-HOLD action
+    MIN_CONF_THRESH   = 0.60  # Q-net confidence below this → rule-based HOLD
+    SCALE_IN_MIN_EXP  = 500   # experiences needed before SCALE_IN is allowed
+    MIN_CLOSE_CONF    = 0.55  # confidence required for RL-driven CLOSE
+    MIN_HOLD_SECONDS  = 300   # minimum trade age before RL can CLOSE (5 min)
 
     def __init__(self):
         self.model_path  = DATA / "rl_agent.pt"
@@ -210,7 +212,8 @@ class RLTradeManager:
         Guardrails:
           - HOLD until MIN_EXPERIENCES in buffer
           - SCALE_IN blocked until SCALE_IN_MIN_EXP experiences
-          - fallback to HOLD if Q-net confidence < MIN_CONF_THRESH
+          - SCALE_IN/SCALE_OUT → HOLD if confidence < MIN_CONF_THRESH
+          - CLOSE → HOLD if confidence < MIN_CLOSE_CONF OR trade age < MIN_HOLD_SECONDS
         """
         try:
             state = build_state(trade, current_price, atr, regime, price_1h_ago)
@@ -241,8 +244,33 @@ class RLTradeManager:
                 action_idx = 0
                 log.debug(f"RL {trade.get('symbol','?')}: SCALE_IN blocked (exp={len(self.buffer)}/{self.SCALE_IN_MIN_EXP})")
 
-            # Guardrail: low-confidence network → fall back to rule-based HOLD
-            if confidence < self.MIN_CONF_THRESH and action not in ("HOLD", "CLOSE"):
+            # Guardrail: CLOSE requires confidence + minimum trade age
+            if action == "CLOSE":
+                blocked = False
+                reason  = ""
+                if confidence < self.MIN_CLOSE_CONF:
+                    blocked = True
+                    reason  = f"conf={confidence:.2f}<{self.MIN_CLOSE_CONF}"
+                else:
+                    try:
+                        ts_str = trade.get("timestamp", "")
+                        if ts_str:
+                            opened = datetime.fromisoformat(ts_str)
+                            if opened.tzinfo is None:
+                                opened = opened.replace(tzinfo=timezone.utc)
+                            age = (datetime.now(timezone.utc) - opened).total_seconds()
+                            if age < self.MIN_HOLD_SECONDS:
+                                blocked = True
+                                reason  = f"age={age:.0f}s<{self.MIN_HOLD_SECONDS}s"
+                    except (ValueError, TypeError):
+                        pass
+                if blocked:
+                    log.debug(f"RL {trade.get('symbol','?')}: CLOSE → HOLD ({reason})")
+                    action     = "HOLD"
+                    action_idx = 0
+
+            # Guardrail: SCALE_IN/SCALE_OUT require confidence
+            if action in ("SCALE_IN", "SCALE_OUT") and confidence < self.MIN_CONF_THRESH:
                 log.debug(
                     f"RL {trade.get('symbol','?')}: {action} → HOLD "
                     f"(conf={confidence:.2f} < {self.MIN_CONF_THRESH})"

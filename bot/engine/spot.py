@@ -43,7 +43,11 @@ class SpotBot(BaseBot):
         return self.place_order_with_confirmation(symbol, "sell", amount)
 
     def _calc_pnl(self, trade, close_price) -> float:
-        return (close_price - trade["price"]) * trade["amount"]
+        entry  = float(trade["price"])
+        amount = float(trade["amount"])
+        pnl    = (close_price - entry) * amount
+        fee    = entry * amount * 0.001 * 2   # 0.1% taker × 2 sides
+        return pnl - fee
 
     def _get_leverage(self) -> int:
         return 1

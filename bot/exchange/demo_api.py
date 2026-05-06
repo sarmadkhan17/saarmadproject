@@ -281,16 +281,21 @@ class BinanceDemoClient:
             "symbol":      sym,
             "side":        side.upper(),
             "type":        "STOP_MARKET",
-            "quantity":    amount,
             "stopPrice":   self._round_price(symbol, stop_price),
             "workingType": "CONTRACT_PRICE",
         }
 
+        close_pos = False
         if params:
-            if params.get("reduceOnly"):
-                order_params["reduceOnly"] = "true"
             if params.get("closePosition"):
+                close_pos = True
                 order_params["closePosition"] = "true"
+            elif params.get("reduceOnly"):
+                order_params["reduceOnly"] = "true"
+
+        # closePosition doesn't need quantity — Binance closes entire position
+        if not close_pos:
+            order_params["quantity"] = amount
 
         path = "/order"
         data = self._signed_post(path, order_params)
@@ -499,6 +504,34 @@ class BinanceDemoClient:
         """ccxt compatibility - we're already in demo mode."""
         pass
 
+    def fetch_my_trades(self, symbol: str, limit: int = 50) -> list:
+        """Fetch recent filled trades for a symbol (for accurate close PnL)."""
+        sym = self._normalize_symbol(symbol)
+        params = {
+            "symbol":     sym,
+            "limit":      limit,
+            "timestamp":  int(time.time() * 1000),
+            "recvWindow": 10000,
+        }
+        params["signature"] = self._sign(params)
+        url = f"{self.base_url}{self.api_prefix}/userTrades"
+        try:
+            r = self.session.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            return [
+                {
+                    "symbol":  symbol,
+                    "price":   float(t.get("price", 0)),
+                    "qty":     float(t.get("qty", 0)),
+                    "quoteQty": float(t.get("quoteQty", 0)),
+                    "side":    t.get("side", "").lower(),
+                    "time":    t.get("time", 0),
+                }
+                for t in r.json()
+            ]
+        except Exception:
+            return []
+
 
 # ── Adapter Wrapper ──────────────────────────────────────────────
 # Wraps the demo client to look like ccxt for our existing bot code
@@ -548,6 +581,9 @@ class DemoExchangeAdapter:
 
     def get_position(self, symbol=None):
         return self.client.get_position(symbol)
+
+    def fetch_my_trades(self, symbol, limit=50):
+        return self.client.fetch_my_trades(symbol, limit)
 
     def set_sandbox_mode(self, enabled):
         self.client.set_sandbox_mode(enabled)

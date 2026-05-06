@@ -84,7 +84,7 @@ class RiskDecisionAgent:
         htf_conflict = (action == "BUY" and htf_bias == "SELL") or (action == "SELL" and htf_bias == "BUY")
         if htf_conflict:
             if htf_mode == "soft":
-                conf = round(conf * 0.70, 4)
+                conf = round(conf * 0.50, 4)
                 reasons.append(f"HTF {htf_bias} softened → conf={conf:.2f}")
             elif htf_mode == "hard":
                 if conf < 0.65:

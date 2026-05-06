@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>CryptoBot v4</title>
+<title>CryptoBot v4 — 2026-05-06T18:00Z</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -1186,6 +1186,7 @@ td {
       <div class="panel-header">
         <span class="panel-title">Futures Trades</span>
         <span class="panel-badge" id="fuTC">0 trades</span>
+        <button id="btnCloseAll" onclick="closeAllPositions()" style="font-size:11px;padding:3px 10px;background:#c0392b;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-left:auto;">Close All</button>
       </div>
       <div class="filter-bar">
         <span class="filter-label">Status</span>
@@ -1413,6 +1414,24 @@ function toggleTrading() {
   }, function() {
     tradingToggleInProgress = false;
     btn.disabled = false;
+  });
+}
+
+/* ─── CLOSE ALL POSITIONS ─── */
+function closeAllPositions() {
+  if (!confirm('Close ALL open futures positions on exchange?')) return;
+  var btn = document.getElementById('btnCloseAll');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Closing...';
+  post('/api/close_all_positions', {}, function(d) {
+    showNotif('Close-all queued — bot will close on next cycle (' + (d.count || '?') + ' positions)', 'ok');
+    btn.disabled = false;
+    btn.textContent = 'Close All';
+  }, function(e) {
+    showNotif('Close-all failed: ' + ((e && e.error) || 'unknown error'), 'err');
+    btn.disabled = false;
+    btn.textContent = 'Close All';
   });
 }
 

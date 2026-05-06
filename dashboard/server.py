@@ -791,6 +791,30 @@ def start_trading():
     return jsonify({"status": "running", "trading_paused": False})
 
 
+@app.route("/api/close_all_positions", methods=["POST"])
+def close_all_positions():
+    err, code = _check_auth()
+    if err:
+        return err, code
+
+    p = DATA / "close_all_positions.json"
+    p.parent.mkdir(exist_ok=True)
+
+    count = 0
+    state_path = DATA / "futures_state.json"
+    try:
+        if state_path.exists():
+            with open(state_path) as f:
+                state = json.load(f)
+            count = sum(1 for t in state.get("trades", []) if t.get("status") == "open")
+    except Exception:
+        pass
+
+    with open(p, "w") as f:
+        json.dump({"close_all": True, "timestamp": datetime.now(timezone.utc).isoformat()}, f)
+    return jsonify({"status": "queued", "count": count})
+
+
 @app.route("/api/strategy_config", methods=["GET"])
 def get_strategy_config():
     base = {
@@ -1081,6 +1105,11 @@ def index():
     response.headers["Pragma"]        = "no-cache"
     response.headers["Expires"]       = "0"
     return response
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
 
 
 if __name__ == "__main__":

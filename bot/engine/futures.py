@@ -100,18 +100,18 @@ class FuturesBot(BaseBot):
 
     def _calc_pnl(self, trade, close_price) -> float:
         """
-        Futures PnL - matches Binance calculation exactly.
+        Futures PnL - includes fee deduction.
         PnL = (close - entry) * amount  (long)
         PnL = (entry - close) * amount  (short)
-        Note: Leverage affects margin requirement, NOT raw PnL.
-        Raw PnL already reflects leveraged exposure via position size.
+        Fee = 0.04% taker × 2 sides
         """
         entry  = float(trade["price"])
         amount = float(trade["amount"])
+        fee    = entry * amount * 0.0004 * 2
         if trade["side"] == "long":
-            return (close_price - entry) * amount
+            return (close_price - entry) * amount - fee
         else:
-            return (entry - close_price) * amount
+            return (entry - close_price) * amount - fee
 
     def _get_leverage(self) -> int:
         return self.leverage
@@ -136,7 +136,7 @@ class FuturesBot(BaseBot):
 
             order = self.exchange.create_stop_market_order(
                 symbol, close_side, amount, stop_price,
-                params={"reduceOnly": True},
+                params={"closePosition": True},
             )
             self.log.info(f"Exchange SL placed for {symbol}: {side} @ {stop_price:.4f} (order_id={order['id']})")
             return order["id"]

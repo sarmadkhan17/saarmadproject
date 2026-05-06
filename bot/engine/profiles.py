@@ -83,7 +83,7 @@ _PRESETS = {
         funding_filter_enabled=True, funding_extreme_required=True,
         flow_imbalance_ratio=2.0, macro_alignment_required=True, sentiment_standalone=False,
         htf_filter_mode="strict", btc_momentum_filter=True,
-        position_size_pct=0.015, stop_loss_atr_mult=1.5, take_profit_atr_mult=2.0,
+        position_size_pct=0.015, stop_loss_atr_mult=2.5, take_profit_atr_mult=3.0,
         max_correlation=0.40, max_portfolio_heat=0.30, trailing_activation_atr=1.0, size_mult=0.8,
     ),
     "BALANCED": TradingProfile(
@@ -109,7 +109,7 @@ _PRESETS = {
         funding_filter_enabled=False, funding_extreme_required=False,
         flow_imbalance_ratio=0.0, macro_alignment_required=False, sentiment_standalone=True,
         htf_filter_mode="soft", btc_momentum_filter=False,
-        position_size_pct=0.04, stop_loss_atr_mult=2.5, take_profit_atr_mult=3.0,
+        position_size_pct=0.04, stop_loss_atr_mult=1.5, take_profit_atr_mult=2.0,
         max_correlation=0.70, max_portfolio_heat=0.70, trailing_activation_atr=1.5, size_mult=1.2,
     ),
 }

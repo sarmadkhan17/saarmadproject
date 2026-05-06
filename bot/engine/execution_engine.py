@@ -115,9 +115,9 @@ class ExecutionEngine:
             sl_mult = 2.0
             sl_price = (entry_price - sl_mult * atr) if side == "long" else (entry_price + sl_mult * atr)
             sl_price = max(sl_price, entry_price * 0.75) if side == "long" else min(sl_price, entry_price * 1.25)
-            order = self.exchange.create_market_order(
+            order = self.exchange.create_stop_market_order(
                 symbol, "sell" if side == "long" else "buy", amount,
-                params={"stopPrice": round(sl_price, 4), "reduceOnly": True}
+                stop_price=sl_price, params={"closePosition": True}
             )
             return order.get("id", "") if order else ""
         except Exception as e:
