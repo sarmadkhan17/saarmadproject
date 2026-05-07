@@ -24,10 +24,10 @@ risk:
   max_open_trades: 5
   max_portfolio_heat: 0.5
   max_position_pct: 0.03
-  stop_loss_atr_multiplier: 3.0
-  stop_loss_min_pct: 0.015
-  take_profit_atr_multiplier: 2.5
-  take_profit_pct: 0.02
+  stop_loss_atr_multiplier: 1.5
+  stop_loss_min_pct: 0.010
+  take_profit_atr_multiplier: 3.0
+  take_profit_pct: 0.03
 scanner:
   blacklist:
   - USDC/USDT
@@ -43,6 +43,7 @@ strategy:
   htf_filter_mode: soft
   min_confidence: 0.42
   min_votes: 2
+  trading_profile: BALANCED
 training:
   atr_k: 0.45
   max_rows: 200000
