@@ -1,5 +1,5 @@
 """
-CryptoBot v3 Launcher
+CryptoBot v4 Launcher
 Select trading mode: spot or futures (both run on Binance Demo)
 """
 
@@ -60,7 +60,10 @@ def _write_bot_mode_to_env(mode: str):
             break
     if not found:
         lines.append(f'BOT_MODE="{mode}"\n')
-    env_path.write_text("".join(lines))
+    try:
+        env_path.write_text("".join(lines))
+    except OSError:
+        pass  # Docker mounts .env read-only — BOT_MODE already set via env var
 
 
 def _alert_crash(mode: str, error: str, crash_count: int):
@@ -100,7 +103,7 @@ def main():
 
     if not mode:
         print("\n" + "=" * 50)
-        print("  CryptoBot v3 — Binance Demo Trading")
+        print("  CryptoBot v4 — Binance Demo Trading")
         print("=" * 50)
         print("  1. Spot Trading    (BUY/SELL only)")
         print("  2. Futures Trading (LONG/SHORT + leverage)")
@@ -119,11 +122,11 @@ def main():
         try:
             if mode == "futures":
                 print("\nStarting FUTURES bot (LONG + SHORT, demo trading)...")
-                from futures_bot import FuturesBot
+                from engine.futures import FuturesBot
                 bot = FuturesBot()
             else:
                 print("\nStarting SPOT bot (BUY/SELL, demo trading)...")
-                from spot_bot import SpotBot
+                from engine.spot import SpotBot
                 bot = SpotBot()
 
             if crash_count > 0 and not recovered_once:

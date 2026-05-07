@@ -10,8 +10,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from env_config import create_demo_exchange
-from base_bot   import BaseBot
+from core.config import create_demo_exchange
+from engine.bot   import BaseBot
 
 log = logging.getLogger("FuturesBot")
 
@@ -43,18 +43,23 @@ class FuturesBot(BaseBot):
             log_file="futures_bot.log",
         )
         self.leverage = self.config.get("risk", {}).get("leverage", 5)
+        self._leveraged_symbols = set()
         log.info(f"FuturesBot v3 initialized — DEMO TRADING — {self.leverage}x leverage")
         self._setup_leverage_for_symbols()
 
     def _setup_exchange(self):
         return create_demo_exchange(mode="futures")
 
-    def _setup_leverage_for_symbols(self):
-        """Set leverage and margin mode for all watched symbols."""
+    def _setup_leverage_for_symbols(self, symbols=None):
+        """Set leverage and margin mode for symbols not yet configured."""
         try:
-            symbols     = self.scanner.get_coins(self.exchange)
+            if symbols is None:
+                symbols = self.scanner.get_coins(self.exchange)
+            new_symbols = [s for s in symbols if s not in self._leveraged_symbols]
+            if not new_symbols:
+                return
             margin_type = self.config.get("exchange", {}).get("margin_type", "ISOLATED")
-            for symbol in symbols:
+            for symbol in new_symbols:
                 try:
                     self.exchange.set_leverage(self.leverage, symbol)
                 except Exception as e:
@@ -64,12 +69,18 @@ class FuturesBot(BaseBot):
                 except Exception as e:
                     if "-4046" not in str(e):
                         log.debug(f"Margin {symbol}: {e}")
+                self._leveraged_symbols.add(symbol)
+            if new_symbols:
+                log.info(f"Leverage set for {len(new_symbols)} new coins ({self.leverage}x)")
         except Exception as e:
             log.warning(f"Leverage setup failed: {e}")
 
     def _place_buy(self, symbol, amount):
         """Open LONG position."""
         return self.place_order_with_confirmation(symbol, "buy", amount)
+
+    def _post_scan(self, symbols):
+        self._setup_leverage_for_symbols(symbols)
 
     def _place_sell(self, symbol, amount):
         """Open SHORT position."""
@@ -89,18 +100,18 @@ class FuturesBot(BaseBot):
 
     def _calc_pnl(self, trade, close_price) -> float:
         """
-        Futures PnL - matches Binance calculation exactly.
+        Futures PnL - includes fee deduction.
         PnL = (close - entry) * amount  (long)
         PnL = (entry - close) * amount  (short)
-        Note: Leverage affects margin requirement, NOT raw PnL.
-        Raw PnL already reflects leveraged exposure via position size.
+        Fee = 0.04% taker × 2 sides
         """
         entry  = float(trade["price"])
         amount = float(trade["amount"])
+        fee    = entry * amount * 0.0004 * 2
         if trade["side"] == "long":
-            return (close_price - entry) * amount
+            return (close_price - entry) * amount - fee
         else:
-            return (entry - close_price) * amount
+            return (entry - close_price) * amount - fee
 
     def _get_leverage(self) -> int:
         return self.leverage
@@ -125,7 +136,7 @@ class FuturesBot(BaseBot):
 
             order = self.exchange.create_stop_market_order(
                 symbol, close_side, amount, stop_price,
-                params={"reduceOnly": True},
+                params={"closePosition": True},
             )
             self.log.info(f"Exchange SL placed for {symbol}: {side} @ {stop_price:.4f} (order_id={order['id']})")
             return order["id"]

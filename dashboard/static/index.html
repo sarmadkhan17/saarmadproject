@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>CryptoBot v3</title>
+<title>CryptoBot v4 — 2026-05-06T18:00Z</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -179,6 +179,36 @@ nav.tabs {
 .mode-btn:hover { border-color: var(--gold); color: var(--gold); }
 .mode-btn:disabled { opacity: 0.4; cursor: default; }
 
+.mode-sel-btn {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border: 1px solid var(--border2);
+  color: var(--text2);
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  background: transparent;
+  transition: all 0.15s;
+}
+.mode-sel-btn:first-child { border-radius: 4px 0 0 4px; }
+.mode-sel-btn:last-child  { border-radius: 0 4px 4px 0; margin-left: -1px; }
+.mode-sel-btn:hover { border-color: var(--blue); color: var(--text1); }
+.mode-sel-btn.active {
+  color: var(--blue);
+  border-color: var(--blue);
+  background: rgba(59,130,246,0.10);
+}
+.mode-sel-btn.running-active {
+  color: var(--blue);
+  border-color: var(--blue);
+  background: rgba(59,130,246,0.18);
+  font-weight: 700;
+  font-size: 12px;
+  box-shadow: 0 0 8px rgba(59,130,246,0.25);
+}
+.mode-sel-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
 .ctrl-btn {
   font-family: var(--mono);
   font-size: 10px;
@@ -221,6 +251,8 @@ nav.tabs {
 
 .status-pill.active { border-color: rgba(16,185,129,0.4); color: var(--green); }
 .status-pill.active .status-dot { background: var(--green); animation: pulse-dot 2s infinite; }
+.status-pill.paused .status-dot { background: var(--gold); animation: pulse-dot 3s infinite; }
+.status-pill.idle .status-dot    { background: var(--red); }
 
 @keyframes pulse-dot {
   0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.5); }
@@ -261,6 +293,21 @@ nav.tabs {
 
 .notif.ok  { background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.4); color: var(--green); }
 .notif.err { background: rgba(239,68,68,0.12);  border-color: rgba(239,68,68,0.4);  color: var(--red);   }
+
+/* ─── CIRCUIT BREAKER BANNER ─── */
+.cb-banner {
+  display: none;
+  background: rgba(239,68,68,0.10);
+  border-bottom: 1px solid rgba(239,68,68,0.45);
+  color: #ef4444;
+  padding: 8px 20px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-align: center;
+}
+.cb-banner.show { display: block; animation: notif-in 0.3s ease; }
 
 /* ─── TAB PANELS ─── */
 .tab-panel { display: none; padding: 22px 24px; }
@@ -444,6 +491,7 @@ nav.tabs {
   padding: 10px 18px;
   border-bottom: 1px solid var(--border);
   transition: background 0.1s;
+  overflow: hidden;
 }
 
 .signal-item:hover { background: rgba(255,255,255,0.02); }
@@ -627,7 +675,11 @@ td {
 /* ─── MODEL HEALTH ─── */
 .model-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0;
+}
+.model-grid .empty {
+  grid-column: 1 / -1;
 }
 
 .model-cell {
@@ -646,7 +698,7 @@ td {
 /* ─── HEALTH GRID ─── */
 .health-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(6, 1fr);
 }
 
 .health-item {
@@ -658,8 +710,8 @@ td {
   border-right: 1px solid var(--border);
 }
 
-.health-item:nth-child(4n) { border-right: none; }
-.health-item:nth-last-child(-n+4) { border-bottom: none; }
+.health-item:nth-child(6n) { border-right: none; }
+.health-item:nth-last-child(-n+6) { border-bottom: none; }
 
 .health-lbl { font-size: 11px; color: var(--text2); font-weight: 500; }
 .health-val { font-family: var(--mono); font-size: 12px; font-weight: 600; }
@@ -715,6 +767,55 @@ td {
   justify-content: flex-end;
 }
 
+/* ─── PROFILE SELECTOR ─── */
+.profile-selector {
+  display: flex;
+  gap: 10px;
+  padding: 0 20px 20px;
+  align-items: center;
+}
+.profile-selector label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text2);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  margin-right: 8px;
+}
+.profile-btn {
+  background: #1a1f30;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text2);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 8px 16px;
+  transition: all 0.2s;
+}
+.profile-btn:hover { border-color: var(--blue); color: var(--text1); }
+.profile-btn.active {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+.profile-live {
+  padding: 0 20px 12px;
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.profile-live-item {
+  font-size: 11px;
+  color: var(--text2);
+}
+.profile-live-item span {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text1);
+  margin-left: 4px;
+}
+
 .btn {
   background: var(--blue);
   color: #fff;
@@ -759,6 +860,15 @@ td {
 .retrain-status .dot.completed { background: var(--green); }
 .retrain-status .dot.error { background: var(--red); }
 
+.train-bar {
+  flex: 1; min-width: 80px; height: 4px; background: var(--bg2);
+  border-radius: 2px; margin-left: 8px; overflow: hidden;
+}
+.train-fill {
+  height: 100%; background: var(--gold); border-radius: 2px;
+  transition: width 0.8s ease;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -789,18 +899,125 @@ td {
   padding: 36px;
   text-align: center;
 }
+
+/* ─── RESPONSIVE ──────────────────────────────────────────────────── */
+
+/* Tablet / small desktop (≤1200px) */
+@media (max-width: 1200px) {
+  .cards-6 { grid-template-columns: repeat(3, 1fr); }
+  .row-7030 { grid-template-columns: 1fr; }
+  .row-7030 .panel:last-child { max-height: 320px; }
+  .strategy-config-grid { grid-template-columns: repeat(2, 1fr); }
+  .model-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .health-grid { grid-template-columns: repeat(2, 1fr); }
+  header { flex-wrap: wrap; height: auto; padding: 8px 16px; }
+  .hright { gap: 6px; flex-wrap: wrap; }
+  .clock { display: none; }
+}
+
+/* Mobile (≤768px) */
+@media (max-width: 768px) {
+  body { font-size: 13px; }
+
+  .cards-6 { grid-template-columns: repeat(2, 1fr); }
+  .cards-2 { grid-template-columns: 1fr; }
+  .row-5050 { grid-template-columns: 1fr; }
+  .row-7030 { grid-template-columns: 1fr; }
+  .trading-split { grid-template-columns: 1fr; }
+  .trading-side:first-child { border-right: none; border-bottom: 1px solid var(--border); }
+
+  .strategy-config-grid { grid-template-columns: 1fr; }
+  .model-grid { grid-template-columns: 1fr !important; }
+  .model-cell { border-right: none; border-bottom: 1px solid var(--border); }
+  .model-cell:last-child { border-bottom: none; }
+  .health-grid { grid-template-columns: 1fr; }
+  .health-item { border-right: none; }
+  .health-item:nth-last-child(-n+6) { border-bottom: 1px solid var(--border); }
+  .health-item:last-child { border-bottom: none; }
+
+  .mini-grid { grid-template-columns: repeat(2, 1fr); }
+
+  header { padding: 8px 12px; gap: 6px; }
+  nav.tabs { order: 3; width: 100%; overflow-x: auto; }
+  .tab { padding: 0 12px; font-size: 12px; white-space: nowrap; }
+  .logo { margin-right: 0; }
+  .logo-text { font-size: 12px; }
+  .logo-sub { display: none; }
+  .hright { gap: 4px; }
+  .badge, .mode-badge { font-size: 8px; padding: 2px 5px; }
+  .ctrl-btn { font-size: 9px; padding: 4px 10px; }
+  .status-pill { font-size: 9px; padding: 3px 8px; }
+  .vdivider { display: none; }
+  .clock { display: none; }
+
+  .tab-panel { padding: 14px 12px; }
+  .section-label { font-size: 9px; letter-spacing: 1.5px; }
+  .card { padding: 12px 14px; }
+  .card-value { font-size: 17px; }
+
+  .panel-header { padding: 10px 14px; }
+  .panel-title { font-size: 11px; }
+  .panel-badge { font-size: 9px; padding: 2px 6px; }
+
+  .signal-item { padding: 8px 12px; gap: 8px; grid-template-columns: 44px 1fr auto; }
+  .signal-action { font-size: 8px; }
+  .signal-symbol { font-size: 12px; }
+  .signal-conf { font-size: 12px; }
+
+  .filter-bar { padding: 6px 10px; gap: 6px; }
+  .filter-bar select, .filter-bar input { font-size: 10px; padding: 3px 6px; }
+
+  th { font-size: 8px; padding: 8px 10px; }
+  td { font-size: 11px; padding: 8px 10px; }
+
+  .cfg-field input, .cfg-field select { font-size: 14px; padding: 10px 12px; }
+  .cfg-actions { flex-direction: column; }
+
+  .table-wrap { max-height: 260px; }
+  .signals-body { max-height: 220px; }
+  .chart-body { height: 200px; padding: 12px; }
+  .model-accuracy { font-size: 22px; }
+  .model-name { font-size: 9px; }
+  .model-date { font-size: 9px; }
+}
+
+/* Small phone (≤480px) */
+@media (max-width: 480px) {
+  .cards-6 { grid-template-columns: 1fr 1fr; }
+  .mini-grid { grid-template-columns: 1fr 1fr; }
+
+  header { padding: 6px 8px; }
+  .logo-mark { width: 24px; height: 24px; font-size: 9px; }
+  .logo-text { font-size: 11px; }
+  .tab { padding: 0 8px; font-size: 11px; }
+
+  .card { padding: 10px 12px; }
+  .card-value { font-size: 15px; }
+  .card-label { font-size: 9px; }
+
+  .signal-action { font-size: 7px; padding: 3px 2px; }
+
+  th { font-size: 7px; padding: 6px 8px; }
+  td { font-size: 10px; padding: 6px 8px; }
+  .td-time { font-size: 9px; }
+
+  .page-btn { padding: 3px 7px; font-size: 10px; min-width: 26px; }
+
+  .notif { top: auto; bottom: 12px; right: 8px; left: 8px; text-align: center; }
+}
 </style>
 </head>
 <body>
 
 <div class="notif" id="notif"></div>
+<div class="cb-banner" id="cb-banner"></div>
 
 <!-- ═══════════ HEADER ═══════════ -->
 <header>
   <div class="logo">
     <div class="logo-mark">CB</div>
     <div>
-      <div class="logo-text">CryptoBot v3</div>
+       <div class="logo-text">CryptoBot v4</div>
       <div class="logo-sub">Autonomous AI</div>
     </div>
   </div>
@@ -812,20 +1029,28 @@ td {
   </nav>
 
   <div class="hright">
-    <span class="mode-badge spot" id="modeBadge">SPOT</span>
+    <!-- Mode selector -->
+    <button class="mode-sel-btn active" id="selFutures" onclick="selectMode('futures')">FUTURES</button>
+    <button class="mode-sel-btn" id="selSpot" onclick="selectMode('spot')">SPOT</button>
 
     <div class="vdivider"></div>
 
-    <button class="mode-btn" id="modeBtn" onclick="toggleMode()">Switch to Futures</button>
+    <!-- Start/Stop bot -->
+    <button class="ctrl-btn stopped" id="botBtn" onclick="toggleBot()">START BOT</button>
+
+    <!-- Pause/Resume trading -->
+    <button class="ctrl-btn running" id="tradeBtn" onclick="toggleTrading()" style="display:none">STOP TRADING</button>
 
     <div class="vdivider"></div>
 
-    <button class="ctrl-btn running" id="tradeBtn" onclick="toggleTrading()">STOP TRADING</button>
-
-    <div class="status-pill" id="sb">
+    <!-- Status -->
+    <div class="status-pill idle" id="sb">
       <div class="status-dot"></div>
-      <span id="st">IDLE</span>
+      <span id="st">STOPPED</span>
     </div>
+
+    <span class="badge demo" id="execBadge">DEMO</span>
+  </div>
 
     <div class="clock" id="clk">--:--:-- UTC</div>
   </div>
@@ -961,10 +1186,11 @@ td {
             <th onclick="sortTable('sp','side')">Side</th>
             <th onclick="sortTable('sp','price')">Price</th>
             <th onclick="sortTable('sp','amount')">Qty</th>
+            <th>Margin</th>
             <th onclick="sortTable('sp','pnl')">Realized PnL</th>
             <th onclick="sortTable('sp','status')">Status</th>
           </tr></thead>
-          <tbody id="spTB"><tr><td colspan="8" class="empty">No spot trades</td></tr></tbody>
+          <tbody id="spTB"><tr><td colspan="9" class="empty">No spot trades</td></tr></tbody>
         </table>
       </div>
       <div class="pagination" id="spPager"></div>
@@ -977,6 +1203,7 @@ td {
       <div class="panel-header">
         <span class="panel-title">Futures Trades</span>
         <span class="panel-badge" id="fuTC">0 trades</span>
+        <button id="btnCloseAll" onclick="closeAllPositions()" style="font-size:11px;padding:3px 10px;background:#c0392b;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-left:auto;">Close All</button>
       </div>
       <div class="filter-bar">
         <span class="filter-label">Status</span>
@@ -1004,10 +1231,11 @@ td {
             <th onclick="sortTable('fu','side')">Side</th>
             <th onclick="sortTable('fu','price')">Price</th>
             <th onclick="sortTable('fu','amount')">Qty</th>
+            <th>Margin</th>
             <th onclick="sortTable('fu','pnl')">Realized PnL</th>
             <th onclick="sortTable('fu','status')">Status</th>
           </tr></thead>
-          <tbody id="fuTB"><tr><td colspan="8" class="empty">No futures trades</td></tr></tbody>
+          <tbody id="fuTB"><tr><td colspan="9" class="empty">No futures trades</td></tr></tbody>
         </table>
       </div>
       <div class="pagination" id="fuPager"></div>
@@ -1028,7 +1256,7 @@ td {
           <span class="panel-badge">Walk-Forward Validated</span>
         </div>
         <div class="model-grid" id="modelGrid">
-          <div class="empty" style="grid-column:span 3">Loading...</div>
+          <div class="empty" style="grid-column:span 2">Loading...</div>
         </div>
       </div>
     </div>
@@ -1052,40 +1280,25 @@ td {
       <span class="panel-title">Live Strategy Parameters</span>
       <span class="panel-badge">Editable</span>
     </div>
-    <div class="strategy-config-grid">
-      <div class="cfg-field">
-        <label>Forward Bars</label>
-        <input type="number" id="cfgForwardBars" min="1" max="10" value="1">
-        <small>Prediction horizon (1-10 bars)</small>
-      </div>
-      <div class="cfg-field">
-        <label>Timeframe</label>
-        <select id="cfgTimeframe">
-          <option value="5m">5m</option>
-          <option value="15m">15m</option>
-          <option value="1h" selected>1h</option>
-          <option value="4h">4h</option>
-          <option value="1d">1d</option>
-        </select>
-        <small>Candle interval</small>
-      </div>
-      <div class="cfg-field">
-        <label>Min Confidence</label>
-        <input type="number" id="cfgMinConfidence" min="0.3" max="0.9" step="0.01" value="0.42">
-        <small>Threshold for trade entry (0.30-0.90)</small>
-      </div>
-      <div class="cfg-field">
-        <label>Min Model Votes</label>
-        <input type="number" id="cfgMinVotes" min="1" max="3" value="2">
-        <small>Required base model agreement (1-3)</small>
-      </div>
+    <div class="profile-selector">
+      <label>Trading Profile</label>
+      <button class="profile-btn" id="profStrict" onclick="switchProfile('STRICT')">STRICT</button>
+      <button class="profile-btn active" id="profBalanced" onclick="switchProfile('BALANCED')">BALANCED</button>
+      <button class="profile-btn" id="profAggressive" onclick="switchProfile('AGGRESSIVE')">AGGRESSIVE</button>
+      <button class="profile-btn" id="profConfluence" onclick="switchProfile('CONFLUENCE')">CONFLUENCE</button>
     </div>
-    <div class="cfg-actions">
-      <button class="btn" id="btnSaveConfig" onclick="saveStrategyConfig()">Save, Apply & Retrain</button>
-      <button class="btn btn-ghost" onclick="loadStrategyConfig()">Reset to Saved</button>
+    <div class="profile-live" id="profileLiveInfo" style="display:none">
+      <div class="profile-live-item">Eff Min Conf: <span id="plEffConf">-</span></div>
+      <div class="profile-live-item">Regime: <span id="plRegime">-</span></div>
+      <div class="profile-live-item">Size Mult: <span id="plSize">-</span></div>
+      <div class="profile-live-item">Updated: <span id="plUpdated">-</span></div>
+    </div>
+    <div class="cfg-actions" style="justify-content:center">
+      <button class="btn" id="btnRetrain" onclick="triggerRetrain()">Retrain Models</button>
     </div>
     <div class="retrain-status" id="retrainStatus"></div>
-  </div>
+
+
 
   <div class="section-label">System Logs</div>
   <div class="panel">
@@ -1095,6 +1308,27 @@ td {
     </div>
     <div class="log-body" id="logFeed">
       <div class="empty">No logs</div>
+    </div>
+  </div>
+
+  <div class="section-label">Training Data</div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Training Data Status</span>
+      <span class="panel-badge" id="tdStatus">Loading...</span>
+    </div>
+    <div class="table-wrap" style="max-height:200px">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Bars</th><th>Quality</th>
+        </tr></thead>
+        <tbody id="tdBody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div style="padding:10px 16px;border-top:1px solid var(--border);font-family:var(--mono);font-size:10px;color:var(--text2)">
+      Source: api.binance.com (real public) |
+      Min required: 3000 bars/coin, 8 coins
+      <span style="float:right" id="tdSummary"></span>
     </div>
   </div>
 
@@ -1142,7 +1376,41 @@ function showNotif(msg, type) {
   setTimeout(function() { el.className = 'notif'; }, 3000);
 }
 
-/* ─── TRADING TOGGLE ─── */
+/* ─── EXCHANGE MODE ─── */
+function updateExchangeMode() {
+  get('/api/exchange_mode', function(d) {
+    var badge = document.getElementById('execBadge');
+    if (!badge) return;
+    badge.textContent = (d.execution_mode || 'demo').toUpperCase();
+    badge.className = 'badge ' + (d.is_demo ? 'demo' : 'futures');
+  });
+}
+
+/* ─── TRAINING DATA ─── */
+function updateTrainingData() {
+  get('/api/training_data', function(d) {
+    var el = document.getElementById('tdBody');
+    var statusEl = document.getElementById('tdStatus');
+    var summaryEl = document.getElementById('tdSummary');
+    if (!el) return;
+    var coins = d.coins || [];
+    if (!coins.length) { el.innerHTML = "<tr><td colspan='3' class='empty'>No training data cached</td></tr>"; return; }
+    var h = '';
+    for (var i = 0; i < coins.length; i++) {
+      var c = coins[i];
+      var q = c.quality === 'good' ? '✓ GOOD' : (c.quality === 'ok' ? '⚠ OK' : '✗ LOW');
+      var qc = c.quality === 'good' ? 'td-buy' : (c.quality === 'ok' ? 'td-open' : 'td-sell');
+      h += "<tr><td class='td-sym'>" + escapeHtml(c.symbol) + "</td>" +
+        "<td>" + c.bars + "</td>" +
+        "<td class='" + qc + "'>" + q + "</td></tr>";
+    }
+    el.innerHTML = h;
+    var st = d.status === 'good' ? '✓ HEALTHY' : (d.status === 'degraded' ? '⚠ DEGRADED' : '✗ CRITICAL');
+    var sc = d.status === 'good' ? 'td-buy' : (d.status === 'degraded' ? 'td-open' : 'td-sell');
+    if (statusEl) { statusEl.textContent = st; statusEl.style.color = 'var(--' + (d.status === 'good' ? 'green' : d.status === 'degraded' ? 'gold' : 'red') + ')'; }
+    if (summaryEl) summaryEl.textContent = 'Coins OK: ' + (d.coins_passed || 0) + '/' + coins.length + ' | Rows: ' + (d.total_clean_rows || 0);
+  });
+}
 function toggleTrading() {
   if (tradingToggleInProgress) return;
   tradingToggleInProgress = true;
@@ -1168,110 +1436,160 @@ function toggleTrading() {
   });
 }
 
-/* ─── MODE TOGGLE ─── */
-var currentMode = 'spot';
-var hasOpenTrades = false;
-
-function updateModeBadge(mode, hasOpen) {
-  currentMode   = mode;
-  hasOpenTrades = hasOpen || false;
-  var badge = document.getElementById('modeBadge');
-  var btn   = document.getElementById('modeBtn');
-  if (!badge || !btn) return;
-  badge.textContent = mode.toUpperCase();
-  badge.className   = 'mode-badge ' + mode;
-  btn.textContent   = mode === 'spot' ? 'Switch to Futures' : 'Switch to Spot';
-  if (hasOpenTrades) {
-    btn.disabled    = true;
-    btn.title       = 'Close all open trades before switching mode';
-    btn.textContent = 'Open trades — cannot switch';
-  } else {
+/* ─── CLOSE ALL POSITIONS ─── */
+function closeAllPositions() {
+  if (!confirm('Close ALL open futures positions on exchange?')) return;
+  var btn = document.getElementById('btnCloseAll');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Closing...';
+  post('/api/close_all_positions', {}, function(d) {
+    showNotif('Close-all queued — bot will close on next cycle (' + (d.count || '?') + ' positions)', 'ok');
     btn.disabled = false;
-    btn.title    = '';
-  }
-}
-
-function toggleMode() {
-  if (modeToggleInProgress || hasOpenTrades) return;
-  modeToggleInProgress = true;
-  var btn = document.getElementById('modeBtn');
-  btn.disabled    = true;
-  btn.textContent = 'Switching...';
-  var newMode = currentMode === 'spot' ? 'futures' : 'spot';
-  post('/api/set_mode', { mode: newMode }, function(d) {
-    updateModeBadge(d.mode, false);
-    showNotif('Mode switched to ' + d.mode.toUpperCase(), 'ok');
-    modeToggleInProgress = false;
-  }, function() {
-    showNotif('Failed to switch mode', 'err');
-    modeToggleInProgress = false;
-    loadMode();
+    btn.textContent = 'Close All';
+  }, function(e) {
+    showNotif('Close-all failed: ' + ((e && e.error) || 'unknown error'), 'err');
+    btn.disabled = false;
+    btn.textContent = 'Close All';
   });
 }
 
-var modeToggleInProgress = false;
+/* ─── BOT CONTROL ─── */
+var currentMode = 'futures';
+var botRunning = false;
+var hasOpenTrades = false;
+var hasOpenFutures = false;
 
-function loadMode() {
-  get('/api/get_mode', function(d) { updateModeBadge(d.mode || 'spot', d.has_open_trades); });
+function updateBotUI() {
+  get('/api/bot_status', function(d) {
+    currentMode = d.mode || 'futures';
+    botRunning = d.running;
+    tradingEnabled = !d.trading_paused;
+    hasOpenTrades = d.has_open_trades;
+    hasOpenFutures = d.has_open_futures;
+
+    // Mode selector
+    document.getElementById('selFutures').classList.toggle('active', currentMode === 'futures');
+    document.getElementById('selSpot').classList.toggle('active', currentMode === 'spot');
+    document.getElementById('selFutures').classList.toggle('running-active', botRunning && currentMode === 'futures');
+    document.getElementById('selSpot').classList.toggle('running-active', botRunning && currentMode === 'spot');
+
+    // Spot button: locked only if futures has open trades
+    document.getElementById('selSpot').disabled = hasOpenFutures;
+    // Futures button: always available
+    document.getElementById('selFutures').disabled = false;
+    // Stop button: locked only if futures has open trades
+    document.getElementById('botBtn').disabled = hasOpenFutures;
+
+    // Start/Stop button
+    var btn = document.getElementById('botBtn');
+    if (botRunning) {
+      btn.textContent = 'STOP BOT';
+      btn.className = 'ctrl-btn running';
+    } else {
+      btn.textContent = 'START BOT';
+      btn.className = 'ctrl-btn stopped';
+    }
+
+    // Trading toggle
+    var tBtn = document.getElementById('tradeBtn');
+    if (botRunning) {
+      tBtn.style.display = '';
+      tBtn.textContent = tradingEnabled ? 'STOP TRADING' : 'START TRADING';
+      tBtn.className = 'ctrl-btn ' + (tradingEnabled ? 'running' : 'stopped');
+    } else {
+      tBtn.style.display = 'none';
+    }
+
+    // Status pill
+    var st = document.getElementById('st');
+    var sb = document.getElementById('sb');
+    if (!botRunning) {
+      st.textContent = 'STOPPED'; sb.className = 'status-pill idle';
+    } else if (!tradingEnabled) {
+      st.textContent = 'PAUSED'; sb.className = 'status-pill paused';
+    } else {
+      st.textContent = 'ACTIVE'; sb.className = 'status-pill active';
+    }
+  });
+}
+
+var botToggleInProgress = false;
+function toggleBot() {
+  if (botToggleInProgress) return;
+  botToggleInProgress = true;
+  if (botRunning) {
+    post('/api/stop_bot', {}, function() { updateBotUI(); showNotif('Bot stopped', 'ok'); botToggleInProgress=false; });
+  } else {
+    post('/api/start_bot', {mode: currentMode}, function() { updateBotUI(); showNotif('Bot starting in ' + currentMode.toUpperCase(), 'ok'); botToggleInProgress=false; });
+  }
+}
+
+function selectMode(mode) {
+  if (currentMode === mode) return;
+  if (hasOpenFutures && mode !== 'futures') {
+    showNotif('Close futures trades before switching to ' + mode.toUpperCase(), 'err');
+    return;
+  }
+  post('/api/switch_mode', {mode: mode}, function(d) {
+    currentMode = d.mode;
+    updateBotUI();
+    showNotif('Switched to ' + mode.toUpperCase(), 'ok');
+  }, function(e) {
+    if (e && e.status === 409) showNotif('Cannot switch — open trades exist', 'err');
+    else showNotif('Switch failed', 'err');
+  });
 }
 
 /* ─── STRATEGY CONFIG ─── */
 function loadStrategyConfig() {
-  get('/api/strategy_config', function(d) {
-    document.getElementById('cfgForwardBars').value = d.forward_bars || 1;
-    document.getElementById('cfgTimeframe').value = d.timeframe || '1h';
-    document.getElementById('cfgMinConfidence').value = d.min_confidence || 0.42;
-    document.getElementById('cfgMinVotes').value = d.min_votes || 2;
-  });
+  loadProfile();
 }
 
-function saveStrategyConfig() {
-  // Client-side validation before sending
-  var fb   = parseInt(document.getElementById('cfgForwardBars').value);
-  var tf   = document.getElementById('cfgTimeframe').value;
-  var mc   = parseFloat(document.getElementById('cfgMinConfidence').value);
-  var mv   = parseInt(document.getElementById('cfgMinVotes').value);
-
-  if (isNaN(fb) || fb < 1 || fb > 10)         { showNotif('Forward bars must be 1–10', 'err'); return; }
-  if (isNaN(mc) || mc < 0.30 || mc > 0.95)    { showNotif('Min confidence must be 0.30–0.95', 'err'); return; }
-  if (isNaN(mv) || mv < 1 || mv > 3)          { showNotif('Min votes must be 1–3', 'err'); return; }
-
-  var payload = { forward_bars: fb, timeframe: tf, min_confidence: mc, min_votes: mv };
-  var btn = document.getElementById('btnSaveConfig');
-  btn.disabled    = true;
-  btn.textContent = 'Saving...';
-
-  post('/api/strategy_config', payload, function(d) {
-    // Reflect what server actually saved (server returns validated config)
-    if (d.config) {
-      document.getElementById('cfgForwardBars').value   = d.config.forward_bars   || fb;
-      document.getElementById('cfgTimeframe').value     = d.config.timeframe       || tf;
-      document.getElementById('cfgMinConfidence').value = d.config.min_confidence  || mc;
-      document.getElementById('cfgMinVotes').value      = d.config.min_votes       || mv;
-    }
-    showNotif('Config saved', 'ok');
-    btn.disabled    = false;
-    btn.textContent = 'Save, Apply & Retrain';
-
-    // Trigger retrain separately
-    btn.disabled    = true;
-    btn.textContent = 'Requesting retrain...';
-    post('/api/retrain', { source: 'dashboard', reason: 'config_change' }, function() {
-      showNotif('Retraining started...', 'ok');
-      pollRetrainStatus();
-      btn.disabled    = false;
-      btn.textContent = 'Save, Apply & Retrain';
-    }, function(e) {
-      // 429 = already running, not an error
-      if (e && e.message === '429') showNotif('Retrain already running', 'ok');
-      btn.disabled    = false;
-      btn.textContent = 'Save, Apply & Retrain';
+/* ─── PROFILE ─── */
+function loadProfile() {
+  get('/api/trading_profile', function(d) {
+    ['STRICT','BALANCED','AGGRESSIVE','CONFLUENCE'].forEach(function(p) {
+      var el = document.getElementById('prof'+p.charAt(0)+p.slice(1).toLowerCase());
+      if (el) el.classList.toggle('active', d.name === p);
     });
-  }, function() {
-    btn.disabled    = false;
-    btn.textContent = 'Save, Apply & Retrain';
+    var live = d.live;
+    if (live && live.updated_at) {
+      document.getElementById('profileLiveInfo').style.display = 'flex';
+      document.getElementById('plEffConf').textContent = live.eff_min_conf || '-';
+      document.getElementById('plRegime').textContent = (live.market_regime||'?') + ' / ' + (live.hmm_regime||'?');
+      document.getElementById('plSize').textContent = live.eff_size_mult || '-';
+      document.getElementById('plUpdated').textContent = (live.updated_at || '').substring(11,19);
+    }
   });
 }
+
+function switchProfile(name) {
+  post('/api/trading_profile', {profile: name}, function(d) {
+    showNotif('Switched to ' + name, 'ok');
+    loadProfile();
+  });
+}
+
+function triggerRetrain() {
+  var btn = document.getElementById('btnRetrain');
+  btn.disabled = true;
+  btn.textContent = 'Requesting...';
+  post('/api/retrain', {source:'dashboard',reason:'manual'}, function(d) {
+    showNotif('Retraining started', 'ok');
+    pollRetrainStatus();
+    btn.disabled = false;
+    btn.textContent = 'Retrain Models';
+  }, function(e) {
+    if (e && e.message === '429') showNotif('Retrain already running', 'ok');
+    else showNotif('Retrain failed', 'err');
+    btn.disabled = false;
+    btn.textContent = 'Retrain Models';
+  });
+}
+
+
+
 
 var retrainPollInterval = null;
 function pollRetrainStatus() {
@@ -1296,7 +1614,10 @@ function updateRetrainStatus() {
     if (status === 'idle') {
       msg = 'No retraining pending';
     } else if (status === 'running') {
-      msg = 'Retraining models... (' + (d.started ? new Date(d.started).toLocaleTimeString() : '') + ')';
+      var pct = d.progress || 0;
+      msg = 'Training ' + pct + '%';
+      var bar = '<span class="train-bar"><span class="train-fill" style="width:' + pct + '%"></span></span>';
+      msg = msg + bar;
     } else if (status === 'completed') {
       msg = 'Retrain completed in ' + escapeHtml(String(d.duration_seconds || '?')) + 's'
           + ' (' + (d.completed ? new Date(d.completed).toLocaleTimeString() : '') + ')';
@@ -1572,7 +1893,7 @@ function renderPagedTrades(mode) {
 
   var tb = document.getElementById(tbId);
   if (!slice.length) {
-    tb.innerHTML = "<tr><td colspan='8' class='empty'>No trades found</td></tr>";
+    tb.innerHTML = "<tr><td colspan='9' class='empty'>No trades found</td></tr>";
     document.getElementById(pagerId).innerHTML = '';
     return;
   }
@@ -1597,6 +1918,7 @@ function renderPagedTrades(mode) {
       "<td class='" + sideClass + "'>" + escapeHtml((t.side || '').toUpperCase()) + lev + "</td>" +
       "<td>" + Number(t.price  || 0).toFixed(4) + "</td>" +
       "<td>" + Number(t.amount || 0).toFixed(4) + "</td>" +
+      "<td>" + (Number(t.price || 0) * Number(t.amount || 0) / safeLev).toFixed(2) + " USDT</td>" +
       "<td>" + pnlCell + "</td>" +
       "<td><span class='sdot " + safeStatus + "'></span>" + safeStatus + "</td>" +
       "</tr>";
@@ -1674,23 +1996,24 @@ function updateStatus() {
 function updateModelHealth() {
   get('/api/model_health', function(models) {
     var el    = document.getElementById('modelGrid');
-    var names = { rf: 'Random Forest', lgbm: 'LightGBM', lstm: 'LSTM', tft: 'TFT' };
+    var names = { rf: 'Random Forest', lgbm: 'LightGBM', hmm: 'HMM Regime', rl_agent: 'RL Agent' };
+    var activeModels = ['rf', 'lgbm', 'hmm', 'rl_agent'];
     var h     = '';
-    for (var key in models) {
+    for (var i = 0; i < activeModels.length; i++) {
+      var key = activeModels[i];
       var m   = models[key];
-      var acc = m.loaded ? (m.accuracy * 100).toFixed(1) + '%' : 'N/A';
-      // Threshold 0.40: random baseline for 3-class is 33%, meaningful signal starts at ~40%
-      var cls = (m.loaded && m.accuracy >= 0.40) ? 'good' : 'warn';
+      if (!m) continue;
+      var acc = m.loaded ? (m.accuracy ? (m.accuracy * 100).toFixed(1) + '%' : '—') : '—';
+      var cls = (m.loaded && (m.accuracy >= 0.40 || m.status === 'active')) ? 'good' : 'warn';
       var trainedAt = m.trained_at ? escapeHtml(m.trained_at.slice(0, 10)) : '—';
+      var badge = (m.usage || m.status).substring(0, 28);
       h += "<div class='model-cell'>" +
         "<div class='model-name'>" + escapeHtml(names[key] || key) + "</div>" +
         "<div class='model-accuracy " + cls + "'>" + acc + "</div>" +
-        "<div class='model-date'>" + trainedAt + "</div>" +
+        "<div class='model-date'>" + escapeHtml(badge) + "</div>" +
         "</div>";
     }
-    var count = Object.keys(models).length;
-    el.innerHTML = h || "<div class='empty' style='grid-column:span 3'>No data</div>";
-    el.style.gridTemplateColumns = 'repeat(' + Math.min(count, 4) + ', 1fr)';
+    el.innerHTML = h || "<div class='empty' style='grid-column:span 2'>No data</div>";
   });
 }
 
@@ -1700,18 +2023,19 @@ function updateHealth() {
     var el = document.getElementById('healthGrid');
     if (!r || !el) return;
     var items = [
-      { l: 'Bot Process',   ok: r.bot_running,               v: (r.bot_instances || 0) + ' running' },
-      { l: 'Dashboard',     ok: r.dash_running,               v: 'Running' },
-      { l: 'RF Model',      ok: r.rf_model,                   v: r.rf_model   ? 'Loaded' : 'MISSING' },
-      { l: 'LightGBM',      ok: r.xgb_model,                  v: r.xgb_model  ? 'Loaded' : 'MISSING' },
-      { l: 'LSTM',          ok: r.lstm_model,                  v: r.lstm_model ? 'Loaded' : 'MISSING' },
-      { l: 'Signal Age',    ok: (r.signal_age || 9999) < 120, v: (r.signal_age || 0) + 's' },
-      { l: 'Spot Open',     ok: true,                          v: r.spot_open     || 0 },
-      { l: 'Futures Open',  ok: true,                          v: r.futures_open  || 0 },
-      { l: 'Closed Trades', ok: true,                          v: r.closed_trades || 0 },
-      { l: 'Total PnL',     ok: (r.total_pnl || 0) >= 0,      v: '$' + (r.total_pnl || 0).toFixed(4) },
-      { l: 'Self Learning', ok: (r.reviews || 0) > 0,         v: (r.reviews || 0) + ' reviews' },
-      { l: 'Groq Tokens',   ok: (r.token_usage_pct || 0) < 80, v: (r.token_usage_pct || 0).toFixed(1) + '%' },
+      { l: 'Bot Process',    ok: r.bot_running,                v: (r.bot_instances || 0) + ' running' },
+      { l: 'Exchange',       ok: (r.exchange_mode || 'demo') === 'demo' || r.exchange_mode === 'live',
+                               v: (r.exchange_mode || 'demo').toUpperCase() },
+      { l: 'Training Data',  ok: (r.training_source || '').indexOf('api.binance') >= 0,
+                               v: 'api.binance.com' },
+      { l: 'Ensemble v4',    ok: r.ensemble_v4,                 v: r.ensemble_v4 ? '2-model vote' : 'Legacy' },
+      { l: 'Signal Age',     ok: (r.signal_age || 9999) < 120,  v: (r.signal_age || 0) + 's' },
+      { l: 'Spot Open',      ok: true,                           v: r.spot_open     || 0 },
+      { l: 'Futures Open',   ok: true,                           v: r.futures_open  || 0 },
+      { l: 'Closed Trades',  ok: true,                           v: r.closed_trades || 0 },
+      { l: 'Total PnL',      ok: (r.total_pnl || 0) >= 0,       v: '$' + (r.total_pnl || 0).toFixed(4) },
+      { l: 'Self Learning',  ok: (r.reviews || 0) > 0,          v: (r.reviews || 0) + ' reviews' },
+      { l: 'Dashboard',      ok: r.dash_running,                 v: 'Running' },
     ];
     var h = '';
     for (var i = 0; i < items.length; i++) {
@@ -1749,11 +2073,25 @@ function updateLogs() {
   });
 }
 
+/* ─── CIRCUIT BREAKER BANNER ─── */
+function updateCircuitBreaker() {
+  get('/api/circuit_breaker', function(d) {
+    var el = document.getElementById('cb-banner');
+    if (d.tripped) {
+      el.textContent = '⚠ CIRCUIT BREAKER ACTIVE — ' + d.reason;
+      el.classList.add('show');
+    } else {
+      el.classList.remove('show');
+    }
+  });
+}
+
 /* ─── REFRESH ─── */
 var _refreshInProgress = false;
 function refresh() {
   if (_refreshInProgress) return;
   _refreshInProgress = true;
+  updateCircuitBreaker();
   updateStats();
   updateChart();
   updateSignals();
@@ -1762,7 +2100,9 @@ function refresh() {
   updateStatus();
   updateModelHealth();
   updateHealth();
-  loadMode();
+  updateTrainingData();
+  updateExchangeMode();
+  updateBotUI();
   loadStrategyConfig();
   // Only poll retrain status if no dedicated poll interval running
   if (!retrainPollInterval) updateRetrainStatus();

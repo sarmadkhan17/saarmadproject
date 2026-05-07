@@ -9,8 +9,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from env_config import create_demo_exchange
-from base_bot   import BaseBot
+from core.config import create_demo_exchange
+from engine.bot   import BaseBot
 
 log = logging.getLogger("SpotBot")
 
@@ -43,7 +43,11 @@ class SpotBot(BaseBot):
         return self.place_order_with_confirmation(symbol, "sell", amount)
 
     def _calc_pnl(self, trade, close_price) -> float:
-        return (close_price - trade["price"]) * trade["amount"]
+        entry  = float(trade["price"])
+        amount = float(trade["amount"])
+        pnl    = (close_price - entry) * amount
+        fee    = entry * amount * 0.001 * 2   # 0.1% taker × 2 sides
+        return pnl - fee
 
     def _get_leverage(self) -> int:
         return 1

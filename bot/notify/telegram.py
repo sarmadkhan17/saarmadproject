@@ -1,5 +1,5 @@
 """
-Telegram Notifier v3
+Telegram Notifier v4
 - Supports both personal and group chats (negative chat IDs for groups)
 - Combined SPOT + FUTURES reporting
 - Commands: /status /agents /pnl /trades /health /help
@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yaml
-from env_config import get_telegram_config, DATA_DIR
+from core.config import get_telegram_config, DATA_DIR
 
 log      = logging.getLogger("Notifier")
 DATA     = DATA_DIR
@@ -150,15 +150,26 @@ class TelegramNotifier:
             pct = round(used / limit * 100, 1)
             token_info = f"  Groq: {used:,}/{limit:,} ({pct}%)\n"
 
+        # Profile info from state
+        profile_name = "?"
+        live_regime = "?"
+        p_state = DATA / "futures_state.json"
+        if p_state.exists():
+            with open(p_state) as f:
+                st = json.load(f)
+            live = st.get("live_strategy", {})
+            profile_name = live.get("profile", "?")
+            live_regime = live.get("market_regime", "?")
+
         mode = self._get_mode_from_env()
         mode_icon = "🟣" if mode == "futures" else "🔵"
 
         msg = (
-            f"<b>{mode_icon} CryptoBot v3 Report</b>\n"
+            f"<b>{mode_icon} CryptoBot v4 Report</b>\n"
             f"<b>{now}</b>\n\n"
             f"<b>STATUS</b>\n"
-            f"  Mode: {mode.upper()} | Signal: {sig_age}\n"
-            f"  Open: {len(open_t)} | Closed: {len(closed)}\n\n"
+            f"  Mode: {mode.upper()} | Profile: {profile_name} | Signal: {sig_age}\n"
+            f"  Regime: {live_regime} | Open: {len(open_t)} | Closed: {len(closed)}\n\n"
             f"<b>PERFORMANCE</b>\n"
             f"  WR: {wr} ({stats['wins']}W/{stats['losses']}L)\n"
             f"  Closed PnL: <b>${stats['total_pnl']:+.4f}</b>\n"
@@ -218,6 +229,10 @@ class TelegramNotifier:
                             "/restart":         self._cmd_restart,
                             "/stop":            self._cmd_stop,
                             "/mode":            self._cmd_current_mode,
+                            "/profile":         self._cmd_profile,
+                            "/profile_strict":  lambda: self._cmd_profile_set("STRICT"),
+                            "/profile_balanced": lambda: self._cmd_profile_set("BALANCED"),
+                            "/profile_aggressive": lambda: self._cmd_profile_set("AGGRESSIVE"),
                         }.get(text, lambda: None)()
 
                 self.offset = max_offset
@@ -227,7 +242,7 @@ class TelegramNotifier:
 
     def _cmd_help(self):
         self.send(
-            "<b>🤖 CryptoBot v3 Commands</b>\n\n"
+            "<b>🤖 CryptoBot v4 Commands</b>\n\n"
             "<b>📊 Monitoring:</b>\n"
             "/status  — Bot status check\n"
             "/mode    — Show current mode\n"
@@ -307,12 +322,30 @@ class TelegramNotifier:
                 age_sec   = int((datetime.now(timezone.utc) - last).total_seconds())
                 is_active = age_sec < 120
                 age_str   = f"{age_sec}s ago"
+                last_action = signals[-1].get("action", "?")
+                last_conf   = signals[-1].get("confidence", 0)
+                last_sym     = signals[-1].get("symbol", "?")
+                signal_desc  = f" ({last_action} {last_sym} @ {last_conf:.0%})"
             else:
                 is_active = False
                 age_str   = "never"
+                signal_desc = ""
 
             icon   = "✅" if is_active else "⚠️"
             status = "ACTIVE" if is_active else "IDLE"
+
+            # Profile + regime from state
+            profile_name = "?"
+            regime  = "?"
+            eff_min = "?"
+            p = DATA / "futures_state.json"
+            if p.exists():
+                with open(p) as f:
+                    st = json.load(f)
+                live = st.get("live_strategy", {})
+                profile_name = live.get("profile", "?")
+                regime  = live.get("market_regime", "?")
+                eff_min = live.get("eff_min_conf", "?")
 
             token_info = ""
             p = DATA / "token_budget.json"
@@ -329,8 +362,9 @@ class TelegramNotifier:
                     coins = json.load(f).get("top_coins", [])
 
             self.send(
-                f"{icon} <b>Bot: {status}</b>\n\n"
-                f"  Last signal: {age_str}\n"
+                f"{icon} <b>Bot: {status} | Profile: {profile_name}</b>\n\n"
+                f"  Last signal: {age_str}{signal_desc}\n"
+                f"  Regime: {regime} | eff_min: {eff_min}\n"
                 f"  Watching: {len(coins)} coins{token_info}\n"
                 f"  Top: {', '.join([c.replace('/USDT','') for c in coins[:5]])}"
             )
@@ -433,12 +467,22 @@ class TelegramNotifier:
             models = {
                 "RF":       "rf_model.pkl",
                 "LightGBM": "lgbm_model.pkl",
-                "LSTM":     "lstm_model.keras",
             }
             msg = "<b>🩺 System Health</b>\n\n<b>Models:</b>\n"
             for name, fname in models.items():
                 ok   = (DATA / fname).exists()
                 msg += f"  {'✅' if ok else '❌'} {name}\n"
+
+            # Profile + agent status
+            profile_name = "?"
+            p_state = DATA / "futures_state.json"
+            if p_state.exists():
+                with open(p_state) as f:
+                    st = json.load(f)
+                live = st.get("live_strategy", {})
+                profile_name = live.get("profile", "?")
+            msg += f"\n<b>Profile:</b> {profile_name}\n"
+            msg += f"<b>Agents:</b> SMC ✅ | Technical ✅ | Macro/Flow ⏳\n"
 
             _, signals, _ = self._load_combined()
             if signals:
@@ -469,6 +513,76 @@ class TelegramNotifier:
     def _is_docker(self):
         return Path("/.dockerenv").exists() or os.environ.get("DOCKER_CONTAINER") == "1"
 
+    def _cmd_profile(self):
+        """Show current trading profile with key settings."""
+        try:
+            profile_name = "BALANCED"
+            for cfg_path in (CFG_FUT, CFG_SPOT):
+                if cfg_path.exists():
+                    with open(cfg_path) as f:
+                        cfg = yaml.safe_load(f) or {}
+                    profile_name = cfg.get("strategy", {}).get("trading_profile", "BALANCED")
+
+            p = DATA / "futures_state.json"
+            eff_min = "?"
+            regime  = "UNKNOWN"
+            if p.exists():
+                with open(p) as f:
+                    st = json.load(f)
+                live = st.get("live_strategy", {})
+                eff_min = live.get("eff_min_conf", "?")
+                regime  = live.get("market_regime", "UNKNOWN")
+
+            try:
+                from engine.profiles import TradingProfile
+                pr = TradingProfile.load(profile_name)
+                self.send(
+                    f"🎯 <b>Trading Profile: {profile_name}</b>\n\n"
+                    f"  Min Confidence: {pr.min_confidence}\n"
+                    f"  Agent Agreement: {pr.min_agent_agreement}/3\n"
+                    f"  Net Score Threshold: ±{pr.net_score_threshold}\n"
+                    f"  SMC Sub-checks Min: {pr.smc_sub_checks_min}/5\n"
+                    f"  Position Size: {pr.position_size_pct*100:.1f}%\n"
+                    f"  Stop Loss: {pr.stop_loss_atr_mult}× ATR\n"
+                    f"  Take Profit: {pr.take_profit_atr_mult}× ATR\n"
+                    f"  HTF Filter: {pr.htf_filter_mode}\n\n"
+                    f"<b>Live:</b> eff_min={eff_min} | regime={regime}\n\n"
+                    f"/profile_strict  /profile_balanced  /profile_aggressive"
+                )
+            except Exception:
+                self.send(f"🎯 <b>Profile: {profile_name}</b>\n\neff_min={eff_min} | regime={regime}")
+        except Exception as e:
+            self.send(f"Profile error: {e}")
+
+    def _cmd_profile_set(self, profile_name: str):
+        """Switch to a different trading profile."""
+        try:
+            import fcntl
+            saved = False
+            for cfg_path in (CFG_SPOT, CFG_FUT):
+                if cfg_path.exists():
+                    with open(cfg_path) as f:
+                        cfg = yaml.safe_load(f) or {}
+                    cfg.setdefault("strategy", {})["trading_profile"] = profile_name
+                    tmp_path = cfg_path.with_suffix(".tmp.yaml")
+                    with open(tmp_path, "w") as f:
+                        fcntl.flock(f, fcntl.LOCK_EX)
+                        yaml.dump(cfg, f, default_flow_style=False, sort_keys=True)
+                        fcntl.flock(f, fcntl.LOCK_UN)
+                    tmp_path.replace(cfg_path)
+                    saved = True
+
+            if saved:
+                self.send(
+                    f"✅ <b>Profile switched to {profile_name}</b>\n"
+                    f"Bot will adopt on next sync cycle.\n"
+                    f"Use /profile to verify settings."
+                )
+            else:
+                self.send("❌ No config files found")
+        except Exception as e:
+            self.send(f"Profile switch error: {e}")
+
     def _cmd_current_mode(self):
         mode = self._get_mode_from_env()
         icons = {"spot": "🔵", "futures": "🟣", "unknown": "⚪"}
@@ -487,7 +601,7 @@ class TelegramNotifier:
         try:
             home = str(Path.home())
             subprocess.run(["screen", "-S", "cryptobot_v3_futures", "-X", "quit"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", "futures_bot.py"], timeout=10)
+            subprocess.run(["pkill", "-9", "-u", os.environ.get("USER", "root"), "-f", "futures_bot.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
@@ -514,7 +628,7 @@ class TelegramNotifier:
         try:
             home = str(Path.home())
             subprocess.run(["screen", "-S", "cryptobot_v3_spot", "-X", "quit"], timeout=10)
-            subprocess.run(["pkill", "-9", "-f", "spot_bot.py"], timeout=10)
+            subprocess.run(["pkill", "-9", "-u", os.environ.get("USER", "root"), "-f", "spot_bot.py"], timeout=10)
             time.sleep(3)
             subprocess.run(["screen", "-wipe"], timeout=5)
             time.sleep(2)
@@ -561,7 +675,7 @@ class TelegramNotifier:
         try:
             if self._is_docker():
                 subprocess.run(["screen", "-S", f"cryptobot_v3_{current}", "-X", "quit"], timeout=10)
-                subprocess.run(["pkill", "-9", "-f", f"{current}_bot.py"], timeout=10)
+                subprocess.run(["pkill", "-9", "-u", os.environ.get("USER", "root"), "-f", f"{current}_bot.py"], timeout=10)
             else:
                 subprocess.run(["systemctl", "stop", f"cryptobot-{current}"], timeout=10)
             self.send(f"✅ <b>{current.upper()} bot stopped.</b>\nStart again with /switch_spot or /switch_futures")

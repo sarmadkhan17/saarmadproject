@@ -9,10 +9,10 @@ joblib
 scipy
 groq
 ta
-tensorflow-cpu
 flask
 flask-cors
 websockets
 polars
 pyarrow
 hmmlearn
+ccxt
