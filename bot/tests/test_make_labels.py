@@ -54,3 +54,12 @@ def test_backward_compat_atr_k_none_raises():
     df = _make_df([100.0] * 30)
     with pytest.raises(TypeError):
         make_labels(df, forward_bars=1, atr_k=None)
+
+
+def test_short_dataframe_under_14_bars_returns_all_hold():
+    # ATR requires 14 bars (min_periods=14) — shorter dfs produce NaN ATR → all HOLD
+    df = _make_df([100.0 + i for i in range(10)])
+    labels = make_labels(df, forward_bars=1, atr_k=0.5)
+    assert set(labels.unique()).issubset({0, 1, 2})
+    # All values should be HOLD since ATR is NaN for all bars
+    assert (labels == 1).all(), f"Expected all HOLD for <14 bars, got: {labels.value_counts().to_dict()}"

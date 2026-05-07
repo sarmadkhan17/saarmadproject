@@ -176,12 +176,12 @@ def make_labels(df: pd.DataFrame, forward_bars: int = 1, atr_k: float = 0.5) -> 
     atr = tr.rolling(14, min_periods=14).mean()
 
     threshold = (atr / (close + 1e-9) * atr_k).clip(0.001, 0.02)
-    future    = close.shift(-forward_bars) / close - 1
+    future    = close.shift(-forward_bars) / (close + 1e-9) - 1
 
     labels = pd.Series(1, index=df.index, dtype=int)   # HOLD = 1
     labels[future >  threshold] = 2                      # BUY  = 2
     labels[future < -threshold] = 0                      # SELL = 0
-    labels = labels[future.notna()].dropna()
+    labels = labels[future.notna()]
 
     counts = labels.value_counts().sort_index()
     total  = len(labels)
