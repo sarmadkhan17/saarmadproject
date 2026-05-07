@@ -159,22 +159,37 @@ def make_features(df):
     return f.dropna()
 
 
-def make_labels(df, forward_bars=1):
+def make_labels(df: pd.DataFrame, forward_bars: int = 1, atr_k: float = 0.5) -> pd.Series:
     """
-    Binary labels: SELL(0) or BUY(1). No HOLD.
-    Every bar gets a direction — the model learns which way.
-    Risk layer decides whether to act.
+    ATR 3-class labels: SELL=0, HOLD=1, BUY=2.
+    Only labels bars where the forward move exceeds atr_k × ATR/close.
     """
     close  = df["close"]
-    future = close.shift(-forward_bars) / close - 1
-    labels = pd.Series(0, index=df.index)   # SELL = 0
-    labels[future > 0] = 1                    # BUY  = 1
-    labels = labels.dropna()
+    high   = df["high"]
+    low    = df["low"]
+
+    tr  = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=14).mean()
+
+    threshold = (atr / (close + 1e-9) * atr_k).clip(0.001, 0.02)
+    future    = close.shift(-forward_bars) / close - 1
+
+    labels = pd.Series(1, index=df.index, dtype=int)   # HOLD = 1
+    labels[future >  threshold] = 2                      # BUY  = 2
+    labels[future < -threshold] = 0                      # SELL = 0
+    labels = labels[future.notna()].dropna()
+
     counts = labels.value_counts().sort_index()
     total  = len(labels)
     log.info(
-        f"Labels (binary): SELL={counts.get(0,0)/total*100:.1f}% "
-        f"BUY={counts.get(1,0)/total*100:.1f}%"
+        f"Labels (ATR 3-class, k={atr_k}): "
+        f"SELL={counts.get(0,0)/total*100:.1f}% "
+        f"HOLD={counts.get(1,0)/total*100:.1f}% "
+        f"BUY={counts.get(2,0)/total*100:.1f}%"
     )
     return labels
 
