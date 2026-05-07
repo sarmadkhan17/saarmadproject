@@ -124,6 +124,7 @@ class RiskDecisionAgent:
                 reasons.append(f"smc={smc_sig.reasoning}")
 
         # ── Gate 4: Regime gate ──────────────────────────────────────
+        hmm_regime = "UNKNOWN"
         if regime_ctx:
             hmm_regime = regime_ctx.get("hmm_regime", "UNKNOWN")
             if not regime_ctx.get("gate", True):
