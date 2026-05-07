@@ -52,6 +52,18 @@ class TradingProfile:
     trailing_activation_atr: float = 1.0
     size_mult: float = 1.0
 
+    # ── Confluence Scoring (CONFLUENCE profile only) ──
+    use_confluence_scoring: bool = False
+    confluence_threshold_trending: float = 0.55
+    confluence_threshold_ranging: float = 0.70
+    confluence_threshold_high_vol: float = 0.75
+    confluence_threshold_crash: float = 0.90
+    w_ensemble_strength: float = 0.30
+    w_agent_agreement: float = 0.20
+    w_ml_confidence: float = 0.25
+    w_volume: float = 0.15
+    w_regime: float = 0.10
+
     @classmethod
     def load(cls, name: str) -> "TradingProfile":
         name_upper = name.upper()
