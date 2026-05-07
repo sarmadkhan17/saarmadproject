@@ -35,7 +35,8 @@ class RiskDecisionAgent:
         Returns (score, threshold).
         """
         # Dimension 1: ensemble strength (0-1)
-        d_ensemble = min(abs(ensemble.net_score) / 0.5, 1.0)
+        net_score = getattr(ensemble, 'net_score', 0.0) or 0.0
+        d_ensemble = min(abs(net_score) / 0.5, 1.0)
 
         # Dimension 2: agent agreement fraction (0-1)
         total = max(ensemble.agents_total, 1)
@@ -103,7 +104,7 @@ class RiskDecisionAgent:
             reasons.append(f"confluence={c_score:.3f} >= {c_threshold:.3f}")
             # Skip boolean gates 1-3; fall through to Gate 4 onwards
 
-        if not getattr(profile, 'use_confluence_scoring', False):
+        else:
             # ── Gate 1: Confidence ───────────────────────────────────────
             if conf < profile.min_confidence:
                 reasons.append(f"conf={conf:.2f} < {profile.min_confidence}")
