@@ -69,7 +69,8 @@ def setup_logging(config: dict, log_file: str = "bot.log"):
     logging.basicConfig(
         level    = logging.INFO,
         format   = "%(asctime)s [%(levelname)s] %(message)s",
-        handlers = [handler, logging.StreamHandler()],
+        handlers = [handler],
+        force    = True,
     )
 
 
@@ -382,7 +383,12 @@ class BaseBot:
                 self.htf_filter_mode = strat.get("htf_filter_mode", self.htf_filter_mode)
                 self.scan_interval = self.config.get("bot", {}).get("scan_interval_seconds", self.scan_interval)
                 self.max_open = risk.get("max_open_trades", self.max_open)
-                self.log.info(f"Config reloaded: min_conf={self.min_conf}, htf={self.htf_filter_mode}, max_open={self.max_open}")
+                new_profile_name = strat.get("trading_profile", self.profile.name)
+                if new_profile_name != self.profile.name:
+                    from engine.profiles import TradingProfile
+                    self.profile = TradingProfile.load(new_profile_name)
+                    self.log.info(f"Profile switched → {self.profile.name}")
+                self.log.info(f"Config reloaded: min_conf={self.min_conf}, htf={self.htf_filter_mode}, max_open={self.max_open}, profile={self.profile.name}")
         except Exception as e:
             self.log.warning(f"Config reload failed: {e}")
 
@@ -1030,6 +1036,7 @@ class BaseBot:
                 open_trades=open_trades, balance=balance,
                 get_price_fn=self.get_price, get_atr_fn=self.get_atr,
                 htf_bias=htf_bias,
+                all_trades=self.state.get_all_trades(),
             )
 
             # Log signal regardless of decision
@@ -1162,9 +1169,108 @@ class BaseBot:
         elif self.MODE == "spot":
             self._sync_spot()
 
+    def _import_exchange_positions(self, positions: list, d: dict) -> None:
+        """Import any exchange position not currently tracked as open in state.
+        No symbol blocklists — if the exchange has it, the bot should know about it.
+        """
+        import time as _time
+        our_syms = {t["symbol"] for t in d.get("trades", []) if t.get("status") == "open"}
+        for pos in positions:
+            sym = pos["symbol"]
+            if sym in our_syms or float(pos.get("amount", 0)) == 0:
+                continue
+            current_open = sum(1 for t in d.get("trades", []) if t.get("status") == "open")
+            if current_open >= self.max_open:
+                self.log.warning(f"Sync: skipping {sym} — max_open={self.max_open} reached ({current_open} open)")
+                continue
+            trade = {
+                "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
+                "symbol":          sym,
+                "side":            pos["side"],
+                "amount":          pos["amount"],
+                "price":           pos["entry_price"],
+                "mark_price":      pos.get("mark_price", 0),
+                "live_pnl":        round(pos["pnl"], 6),
+                "timestamp":       datetime.now(timezone.utc).isoformat(),
+                "strategy":        "synced_from_position",
+                "timeframe":       f"AUTO-{self.MODE}",
+                "status":          "open",
+                "mode":            self.MODE,
+                "leverage":        pos.get("leverage", 5),
+                "sl_order_id":     "",
+                "pnl":             0.0,
+                "close_price":     0.0,
+                "close_timestamp": ""
+            }
+            d["trades"].append(trade)
+            d["stats"]["total_trades"] += 1
+            self.log.info(f"Sync: imported {sym} {pos['side']} from exchange")
+
+    def _cleanup_ghost_trades(self, exchange_syms: set, d: dict) -> None:
+        """Cancel trades that are open in state but missing from the exchange for >24 hours.
+        Skips trades entered <60s ago (race condition grace).
+        Logs a warning for trades missing 1-24h so the user can see the drift.
+        """
+        now = datetime.now(timezone.utc)
+        for t in d.get("trades", []):
+            if t["status"] != "open":
+                continue
+            sym = t["symbol"]
+            if sym in exchange_syms:
+                continue
+            ts_str = t.get("timestamp", "")
+            age_s = None
+            try:
+                if ts_str:
+                    opened = datetime.fromisoformat(ts_str)
+                    if opened.tzinfo is None:
+                        opened = opened.replace(tzinfo=timezone.utc)
+                    age_s = (now - opened).total_seconds()
+            except (ValueError, TypeError):
+                pass
+            if age_s is not None and age_s < 60:
+                self.log.debug(f"Sync: {sym} entered <60s ago, skipping ghost check")
+                continue
+            if age_s is not None and age_s < 86400:
+                remaining_h = (86400 - age_s) / 3600
+                self.log.warning(f"Sync: {sym} open in state but missing from exchange — auto-cancel in {remaining_h:.1f}h")
+                continue
+            # 24h elapsed — cancel the ghost trade
+            close_price = float(t.get("price", 0))
+            trades_hist = []
+            try:
+                trades_hist = self.exchange.fetch_my_trades(sym, limit=10)
+                if trades_hist:
+                    close_price = max(trades_hist, key=lambda x: x["time"]).get("price", close_price)
+            except Exception:
+                pass
+            if not trades_hist:
+                try:
+                    close_price = self.exchange.fetch_ticker(sym)["last"]
+                except Exception:
+                    pass
+            pnl = self._calc_pnl(t, close_price)
+            t["status"]          = "closed"
+            t["close_price"]     = close_price
+            t["pnl"]             = round(pnl, 8)
+            t["close_timestamp"] = now.isoformat()
+            d["stats"]["total_pnl"] += round(pnl, 6)
+            if pnl > 0:   d["stats"]["wins"]   += 1
+            elif pnl < 0: d["stats"]["losses"] += 1
+            self.log.info(f"Sync: cancelled ghost trade {sym} (missing 24h+) pnl={pnl:+.4f}")
+            # NOTE: risk.record_trade_result intentionally excluded — ghost PnL is
+            # estimated from mark price, not a real fill, and must not trip the circuit breaker.
+            for fn in [
+                lambda: self._cancel_exchange_stop_loss(sym, t.get("sl_order_id", "")),
+                lambda: self.rl_agent.record_external_close(t["id"], pnl),
+                lambda: self.ai.record_trade_result(sym, pnl),
+                lambda: self.agents.record_trade_result(sym, pnl),
+            ]:
+                try: fn()
+                except Exception: pass
+
     def _sync_futures(self):
-        """Simple futures sync: cancel any open trade not on the exchange.
-        No re-adding, no grace period — position missing → cancel immediately."""
+        """Futures sync: update live PnL, import untracked positions, cancel 24h+ ghosts."""
         try:
             self.log.info("Sync running — mode=futures")
             try:
@@ -1183,11 +1289,12 @@ class BaseBot:
 
             d = self.state.state
             with self.state._lock:
+                # Update live PnL for tracked positions
                 for t in d.get("trades", []):
-                    if t["status"] != "open": continue
+                    if t["status"] != "open":
+                        continue
                     sym = t["symbol"]
                     if sym in exchange_syms:
-                        # Position exists — update live PnL
                         for pos in positions:
                             if pos["symbol"] == sym:
                                 t["amount"]     = pos["amount"]
@@ -1196,115 +1303,12 @@ class BaseBot:
                                 t["live_pnl"]   = round(pos["pnl"], 6)
                                 t["mark_price"] = pos.get("mark_price", 0)
                                 break
-                    else:
-                        # Position missing — close trade (after 60s grace)
-                        ts_str = t.get("timestamp", "")
-                        recent = False
-                        try:
-                            if ts_str:
-                                opened = datetime.fromisoformat(ts_str)
-                                if opened.tzinfo is None:
-                                    opened = opened.replace(tzinfo=timezone.utc)
-                                if (datetime.now(timezone.utc) - opened).total_seconds() < 60:
-                                    recent = True
-                        except (ValueError, TypeError):
-                            pass
-                        if recent:
-                            self.log.debug(f"Sync: skipping orphan {sym} (entered <60s ago)")
-                            continue
-                        # Try to get actual close price from trade history
-                        close_price = float(t["price"])
-                        trades = []
-                        try:
-                            trades = self.exchange.fetch_my_trades(sym, limit=10)
-                            if trades:
-                                close_price = max(trades, key=lambda x: x["time"]).get("price", close_price)
-                        except Exception:
-                            pass
-                        if not trades:
-                            try:
-                                close_price = self.exchange.fetch_ticker(sym)["last"]
-                            except Exception:
-                                pass
-                        pnl = self._calc_pnl(t, close_price)
-                        t["status"]          = "closed"
-                        t["close_price"]     = close_price
-                        t["pnl"]             = round(pnl, 8)
-                        t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
-                        d["stats"]["total_pnl"] += round(pnl, 6)
-                        if pnl > 0:  d["stats"]["wins"]   += 1
-                        elif pnl < 0: d["stats"]["losses"] += 1
-                        self.log.info(f"Sync: closed orphan {sym} pnl={pnl:+.4f}")
-                        try:
-                            self._cancel_exchange_stop_loss(sym, t.get("sl_order_id", ""))
-                        except Exception:
-                            pass
-                        try:
-                            self.rl_agent.record_external_close(t["id"], pnl)
-                        except Exception:
-                            pass
-                        try:
-                            self.ai.record_trade_result(sym, pnl)
-                        except Exception:
-                            pass
-                        try:
-                            self.agents.record_trade_result(sym, pnl)
-                        except Exception:
-                            pass
-                        try:
-                            self.risk.record_trade_result(pnl, usdt)
-                        except Exception:
-                            pass
 
-                # Add exchange positions the bot does not know about
-                our_syms = {t["symbol"] for t in d.get("trades", []) if t.get("status") == "open"}
-                recently_closed = set()
-                for t in d.get("trades", []):
-                    if t.get("status") == "closed":
-                        ts = t.get("close_timestamp", "")
-                        if ts:
-                            try:
-                                closed = datetime.fromisoformat(ts)
-                                if closed.tzinfo is None:
-                                    closed = closed.replace(tzinfo=timezone.utc)
-                                if (datetime.now(timezone.utc) - closed).total_seconds() < 86400:
-                                    recently_closed.add(t["symbol"])
-                            except (ValueError, TypeError):
-                                pass
-                import time as _time
-                for pos in positions:
-                    sym = pos["symbol"]
-                    if sym in our_syms or float(pos.get("amount", 0)) == 0:
-                        continue
-                    if sym in recently_closed:
-                        self.log.info(f"Sync: skipping {sym} — recently closed within 24h")
-                        continue
-                    current_open = sum(1 for t in d.get("trades", []) if t.get("status") == "open")
-                    if current_open >= self.max_open:
-                        self.log.warning(f"Sync: skipping {sym} — max_open={self.max_open} reached ({current_open} open)")
-                        continue
-                    trade = {
-                        "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
-                        "symbol":          sym,
-                        "side":            pos["side"],
-                        "amount":          pos["amount"],
-                        "price":           pos["entry_price"],
-                        "mark_price":      pos.get("mark_price", 0),
-                        "live_pnl":        round(pos["pnl"], 6),
-                        "timestamp":       datetime.now(timezone.utc).isoformat(),
-                        "strategy":        "synced_from_position",
-                        "timeframe":       f"AUTO-{self.MODE}",
-                        "status":          "open",
-                        "mode":            self.MODE,
-                        "leverage":        pos.get("leverage", 5),
-                        "sl_order_id":     "",
-                        "pnl":             0.0,
-                        "close_price":     0.0,
-                        "close_timestamp": ""
-                    }
-                    d["trades"].append(trade)
-                    d["stats"]["total_trades"] += 1
-                    self.log.info(f"Sync: imported {sym} {pos['side']} from exchange")
+                # Import any exchange position the bot doesn't know about
+                self._import_exchange_positions(positions, d)
+
+                # Cancel trades open in state but gone from exchange for >24h
+                self._cleanup_ghost_trades(exchange_syms, d)
 
             self.state.state["stats"]["balance"]   = round(usdt, 2)
             self.state.state["stats"]["last_sync"] = datetime.now(timezone.utc).isoformat()
@@ -1388,19 +1392,6 @@ class BaseBot:
                     watchlist_coins = set(self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols))
                 except Exception:
                     watchlist_coins = set()
-                recently_closed = set()
-                for t in d["trades"]:
-                    if t.get("status") in ("cancelled", "closed"):
-                        ts = t.get("close_timestamp", "")
-                        try:
-                            if ts:
-                                closed = datetime.fromisoformat(ts)
-                                if closed.tzinfo is None:
-                                    closed = closed.replace(tzinfo=timezone.utc)
-                                if (datetime.now(timezone.utc) - closed).total_seconds() < 86400:
-                                    recently_closed.add(t["symbol"])
-                        except (ValueError, TypeError):
-                            pass
                 for asset, free_val in bal.get("free", {}).items():
                     free = float(free_val)
                     if free <= 0:
@@ -1411,8 +1402,6 @@ class BaseBot:
                     if sym in all_syms:
                         continue
                     if sym not in watchlist_coins:
-                        continue
-                    if sym in recently_closed:
                         continue
                     try:
                         ticker = self.exchange.fetch_ticker(sym)

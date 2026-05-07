@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 import sys
@@ -224,6 +224,73 @@ def pnl_chart():
     return jsonify(data)
 
 
+@app.route("/api/circuit_breaker")
+def circuit_breaker_status():
+    p = DATA / "circuit_breaker.json"
+    try:
+        with open(p) as f:
+            cb = json.load(f)
+    except Exception:
+        return jsonify({"tripped": False, "reason": ""})
+
+    consec        = cb.get("consec_losses", 0)
+    pnl_history   = cb.get("pnl_history", {})
+    initial_bal   = cb.get("initial_balance") or 0
+    peak_bal      = cb.get("peak_balance") or initial_bal
+
+    # Read config thresholds
+    try:
+        import yaml
+        mode = _read_env_var("BOT_MODE") or "futures"
+        cfg_path = BASE_DIR / f"config_{mode}.yaml"
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        risk_cfg = cfg.get("risk", {})
+    except Exception:
+        risk_cfg = {}
+
+    max_consec   = risk_cfg.get("max_consecutive_losses", 10)
+    max_daily    = risk_cfg.get("max_daily_loss_pct", 0.05)
+    max_drawdown = risk_cfg.get("max_drawdown_pct", 0.10)
+    window_days  = 2
+
+    # Check consecutive losses
+    if consec >= max_consec:
+        return jsonify({
+            "tripped": True,
+            "reason": f"Consecutive losses: {consec}/{max_consec}"
+        })
+
+    # Check rolling loss
+    from datetime import timedelta
+    total_loss = sum(
+        pnl_history.get(str(date.today() - timedelta(days=i)), 0.0)
+        for i in range(window_days)
+    )
+    threshold = (initial_bal or 1) * max_daily * window_days
+    if total_loss < -threshold:
+        return jsonify({
+            "tripped": True,
+            "reason": f"Rolling {window_days}-day loss ${total_loss:.2f} (limit -${threshold:.2f})"
+        })
+
+    # Check drawdown
+    try:
+        state = load_state("futures_state.json") if _read_env_var("BOT_MODE") == "futures" else load_state("state.json")
+        balance = state.get("stats", {}).get("balance", 0) or 0
+    except Exception:
+        balance = 0
+    if peak_bal > 0 and balance > 0:
+        drawdown = (peak_bal - balance) / peak_bal
+        if drawdown > max_drawdown:
+            return jsonify({
+                "tripped": True,
+                "reason": f"Drawdown {drawdown*100:.1f}% from peak ${peak_bal:.0f} (limit {max_drawdown*100:.0f}%)"
+            })
+
+    return jsonify({"tripped": False, "reason": ""})
+
+
 @app.route("/api/health")
 def health():
     d    = load_combined()
@@ -388,7 +455,7 @@ def exchange_mode():
 @app.route("/api/training_data")
 def training_data():
     try:
-        from data_feed import TrainingDataStore
+        from data.feed import TrainingDataStore
         manifest = TrainingDataStore.get_manifest()
     except Exception:
         manifest = {"coins": [], "status": "error"}
@@ -935,7 +1002,7 @@ def set_strategy_config():
 
 # ── Trading Profile ──────────────────────────────────────────────────────────
 
-VALID_PROFILES = ("STRICT", "BALANCED", "AGGRESSIVE")
+VALID_PROFILES = ("STRICT", "BALANCED", "AGGRESSIVE", "CONFLUENCE")
 
 
 @app.route("/api/trading_profile", methods=["GET"])

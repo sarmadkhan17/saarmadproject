@@ -284,11 +284,12 @@ class KellyCriterionSizer:
             pct_returns = []
             for t in last_20:
                 entry_price = float(t.get("price", 0))
-                amount = float(t.get("amount", 0))
-                pnl = float(t.get("pnl", 0))
+                amount      = float(t.get("amount", 0))
+                pnl         = float(t.get("pnl", 0))
+                lev         = float(t.get("leverage", self.leverage) or 1)
                 if entry_price > 0 and amount > 0:
-                    notional = entry_price * amount
-                    pct_returns.append(pnl / notional)
+                    invested = (entry_price * amount) / lev  # margin, not notional
+                    pct_returns.append(pnl / (invested + 1e-9))
 
             if len(pct_returns) >= 5:
                 wins = [r for r in pct_returns if r > 0]
