@@ -112,9 +112,16 @@ class ExecutionEngine:
     def _place_sl(self, symbol: str, side: str, amount: float,
                    entry_price: float, atr: float) -> str:
         try:
-            sl_mult = 2.0
+            sl_mult = getattr(self, 'sl_atr_mult', 3.0)
+            sl_min_pct = getattr(self, 'sl_min_pct', 0.015)
             sl_price = (entry_price - sl_mult * atr) if side == "long" else (entry_price + sl_mult * atr)
-            sl_price = max(sl_price, entry_price * 0.75) if side == "long" else min(sl_price, entry_price * 1.25)
+            min_distance = entry_price * sl_min_pct
+            if side == "long":
+                sl_price = min(sl_price, entry_price - min_distance)
+                sl_price = max(sl_price, entry_price * 0.75)
+            else:
+                sl_price = max(sl_price, entry_price + min_distance)
+                sl_price = min(sl_price, entry_price * 1.25)
             order = self.exchange.create_stop_market_order(
                 symbol, "sell" if side == "long" else "buy", amount,
                 stop_price=sl_price, params={"closePosition": True}

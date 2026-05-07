@@ -294,6 +294,21 @@ nav.tabs {
 .notif.ok  { background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.4); color: var(--green); }
 .notif.err { background: rgba(239,68,68,0.12);  border-color: rgba(239,68,68,0.4);  color: var(--red);   }
 
+/* ─── CIRCUIT BREAKER BANNER ─── */
+.cb-banner {
+  display: none;
+  background: rgba(239,68,68,0.10);
+  border-bottom: 1px solid rgba(239,68,68,0.45);
+  color: #ef4444;
+  padding: 8px 20px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-align: center;
+}
+.cb-banner.show { display: block; animation: notif-in 0.3s ease; }
+
 /* ─── TAB PANELS ─── */
 .tab-panel { display: none; padding: 22px 24px; }
 .tab-panel.active { display: block; }
@@ -995,6 +1010,7 @@ td {
 <body>
 
 <div class="notif" id="notif"></div>
+<div class="cb-banner" id="cb-banner"></div>
 
 <!-- ═══════════ HEADER ═══════════ -->
 <header>
@@ -1170,10 +1186,11 @@ td {
             <th onclick="sortTable('sp','side')">Side</th>
             <th onclick="sortTable('sp','price')">Price</th>
             <th onclick="sortTable('sp','amount')">Qty</th>
+            <th>Margin</th>
             <th onclick="sortTable('sp','pnl')">Realized PnL</th>
             <th onclick="sortTable('sp','status')">Status</th>
           </tr></thead>
-          <tbody id="spTB"><tr><td colspan="8" class="empty">No spot trades</td></tr></tbody>
+          <tbody id="spTB"><tr><td colspan="9" class="empty">No spot trades</td></tr></tbody>
         </table>
       </div>
       <div class="pagination" id="spPager"></div>
@@ -1214,10 +1231,11 @@ td {
             <th onclick="sortTable('fu','side')">Side</th>
             <th onclick="sortTable('fu','price')">Price</th>
             <th onclick="sortTable('fu','amount')">Qty</th>
+            <th>Margin</th>
             <th onclick="sortTable('fu','pnl')">Realized PnL</th>
             <th onclick="sortTable('fu','status')">Status</th>
           </tr></thead>
-          <tbody id="fuTB"><tr><td colspan="8" class="empty">No futures trades</td></tr></tbody>
+          <tbody id="fuTB"><tr><td colspan="9" class="empty">No futures trades</td></tr></tbody>
         </table>
       </div>
       <div class="pagination" id="fuPager"></div>
@@ -1267,6 +1285,7 @@ td {
       <button class="profile-btn" id="profStrict" onclick="switchProfile('STRICT')">STRICT</button>
       <button class="profile-btn active" id="profBalanced" onclick="switchProfile('BALANCED')">BALANCED</button>
       <button class="profile-btn" id="profAggressive" onclick="switchProfile('AGGRESSIVE')">AGGRESSIVE</button>
+      <button class="profile-btn" id="profConfluence" onclick="switchProfile('CONFLUENCE')">CONFLUENCE</button>
     </div>
     <div class="profile-live" id="profileLiveInfo" style="display:none">
       <div class="profile-live-item">Eff Min Conf: <span id="plEffConf">-</span></div>
@@ -1439,6 +1458,7 @@ function closeAllPositions() {
 var currentMode = 'futures';
 var botRunning = false;
 var hasOpenTrades = false;
+var hasOpenFutures = false;
 
 function updateBotUI() {
   get('/api/bot_status', function(d) {
@@ -1529,7 +1549,7 @@ function loadStrategyConfig() {
 /* ─── PROFILE ─── */
 function loadProfile() {
   get('/api/trading_profile', function(d) {
-    ['STRICT','BALANCED','AGGRESSIVE'].forEach(function(p) {
+    ['STRICT','BALANCED','AGGRESSIVE','CONFLUENCE'].forEach(function(p) {
       var el = document.getElementById('prof'+p.charAt(0)+p.slice(1).toLowerCase());
       if (el) el.classList.toggle('active', d.name === p);
     });
@@ -1873,7 +1893,7 @@ function renderPagedTrades(mode) {
 
   var tb = document.getElementById(tbId);
   if (!slice.length) {
-    tb.innerHTML = "<tr><td colspan='8' class='empty'>No trades found</td></tr>";
+    tb.innerHTML = "<tr><td colspan='9' class='empty'>No trades found</td></tr>";
     document.getElementById(pagerId).innerHTML = '';
     return;
   }
@@ -1898,6 +1918,7 @@ function renderPagedTrades(mode) {
       "<td class='" + sideClass + "'>" + escapeHtml((t.side || '').toUpperCase()) + lev + "</td>" +
       "<td>" + Number(t.price  || 0).toFixed(4) + "</td>" +
       "<td>" + Number(t.amount || 0).toFixed(4) + "</td>" +
+      "<td>" + (Number(t.price || 0) * Number(t.amount || 0) / safeLev).toFixed(2) + " USDT</td>" +
       "<td>" + pnlCell + "</td>" +
       "<td><span class='sdot " + safeStatus + "'></span>" + safeStatus + "</td>" +
       "</tr>";
@@ -2052,11 +2073,25 @@ function updateLogs() {
   });
 }
 
+/* ─── CIRCUIT BREAKER BANNER ─── */
+function updateCircuitBreaker() {
+  get('/api/circuit_breaker', function(d) {
+    var el = document.getElementById('cb-banner');
+    if (d.tripped) {
+      el.textContent = '⚠ CIRCUIT BREAKER ACTIVE — ' + d.reason;
+      el.classList.add('show');
+    } else {
+      el.classList.remove('show');
+    }
+  });
+}
+
 /* ─── REFRESH ─── */
 var _refreshInProgress = false;
 function refresh() {
   if (_refreshInProgress) return;
   _refreshInProgress = true;
+  updateCircuitBreaker();
   updateStats();
   updateChart();
   updateSignals();

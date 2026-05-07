@@ -34,6 +34,8 @@ class CoinScanner:
         sc             = cfg.get("scanner", {})
         self.top_n     = sc.get("top_n", 10)
         self.min_vol   = sc.get("min_volume_usdt", 10_000_000)
+        self.min_price = sc.get("min_price", 0.50)
+        self.max_daily_vol_pct = sc.get("max_daily_volatility_pct", 15)
         self.rescan_h  = sc.get("rescan_hours", 4)
         self.blacklist = sc.get("blacklist", BLACKLIST)
         self.top_coins = []
@@ -172,9 +174,9 @@ class CoinScanner:
             if sym.endswith("/USDT")
             and sym not in self.blacklist
             and sym not in bad
-            and float(t.get("quoteVolume", 0) or 0) >= self.min_vol
-            and float(t.get("last", 0) or 0) >= 0.10
-            and is_valid(sym)
+and float(t.get("quoteVolume", 0) or 0) >= self.min_vol
+                and float(t.get("last", 0) or 0) >= self.min_price
+                and is_valid(sym)
             and len(sym.replace("/USDT","")) >= 2
             and sym.replace("/USDT","").isascii()
         ]
@@ -195,6 +197,19 @@ class CoinScanner:
             except Exception:
                 df = None
             sc = self.score(ticker, df)
+            # Filter by daily volatility (price range over last 24h)
+            if df is not None and len(df) >= 24:
+                try:
+                    high_24h = float(df["high"].iloc[-24:].max())
+                    low_24h  = float(df["low"].iloc[-24:].min())
+                    price    = float(ticker.get("last", 0) or 0)
+                    if price > 0:
+                        daily_range_pct = (high_24h - low_24h) / low_24h * 100
+                        if daily_range_pct > self.max_daily_vol_pct:
+                            log.info(f"Skipping {sym}: daily vol {daily_range_pct:.1f}% > {self.max_daily_vol_pct}%")
+                            return sym, -999, False
+                except Exception:
+                    pass
             return sym, sc, sc < 0
 
         with ThreadPoolExecutor(max_workers=10) as executor:

@@ -17,12 +17,14 @@ ml:
 risk:
   max_consecutive_losses: 10
   max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.1
   max_open_trades: 5
-  max_portfolio_heat: 0.6
+  max_portfolio_heat: 0.5
   max_position_pct: 0.03
-  stop_loss_atr_multiplier: 2.0
-  take_profit_atr_multiplier: 2.5
-  take_profit_pct: 0.02
+  stop_loss_atr_multiplier: 1.5
+  stop_loss_min_pct: 0.01
+  take_profit_atr_multiplier: 3.0
+  take_profit_pct: 0.03
 scanner:
   blacklist:
   - USDC/USDT
@@ -31,6 +33,8 @@ scanner:
   - FDUSD/USDT
   - DAI/USDT
   - USDD/USDT
+  max_daily_volatility_pct: 15
+  min_price: 0.5
   min_volume_usdt: 30000000
   rescan_hours: 2
   top_n: 40
@@ -38,6 +42,7 @@ strategy:
   htf_filter_mode: soft
   min_confidence: 0.42
   min_votes: 2
+  trading_profile: CONFLUENCE
 training:
   atr_k: 0.45
   max_rows: 200000
