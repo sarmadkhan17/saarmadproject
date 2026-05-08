@@ -20,7 +20,7 @@ import threading
 import logging
 import logging.handlers
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -186,6 +186,35 @@ class StateManager:
 
     def _do_save_locked(self):
         """Write state to disk. Caller must hold self._lock."""
+        archive_path = self.path.with_name(self.path.stem + "_archive.json")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+        to_archive = []
+        to_keep = []
+        for t in self.state.get("trades", []):
+            if t.get("status") == "closed" and t.get("close_timestamp"):
+                try:
+                    ct = datetime.fromisoformat(t["close_timestamp"])
+                    if ct.tzinfo is None:
+                        ct = ct.replace(tzinfo=timezone.utc)
+                    if ct < cutoff:
+                        to_archive.append(t)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            to_keep.append(t)
+        if to_archive:
+            existing = []
+            if archive_path.exists():
+                try:
+                    with open(archive_path) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+            arc_tmp = archive_path.with_suffix(".tmp.json")
+            with open(arc_tmp, "w") as f:
+                json.dump(existing + to_archive, f, indent=2, default=str)
+            arc_tmp.replace(archive_path)
+            self.state["trades"] = to_keep
         tmp_path = self.path.with_suffix(".tmp.json")
         with open(tmp_path, "w") as f:
             json.dump(self.state, f, indent=2, default=str)
@@ -195,7 +224,7 @@ class StateManager:
                          str(self.path.with_suffix(".backup.json")))
         except Exception:
             pass
-            self._last_flush = time.time()
+        self._last_flush = time.time()
 
     def add_trade(self, trade: Trade):
         self.state["trades"].append(asdict(trade))
@@ -251,7 +280,15 @@ class StateManager:
         return [t for t in self.state["trades"] if t["status"] == "open"]
 
     def get_all_trades(self):
-        return self.state["trades"]
+        trades = list(self.state["trades"])
+        archive_path = self.path.with_name(self.path.stem + "_archive.json")
+        if archive_path.exists():
+            try:
+                with open(archive_path) as f:
+                    trades.extend(json.load(f))
+            except Exception:
+                pass
+        return trades
 
 
 class BaseBot:
