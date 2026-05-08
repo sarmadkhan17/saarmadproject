@@ -1264,9 +1264,9 @@ class BaseBot:
             self.log.info(f"Sync: imported {sym} {pos['side']} from exchange")
 
     def _cleanup_ghost_trades(self, exchange_syms: set, d: dict) -> None:
-        """Cancel trades that are open in state but missing from the exchange for >24 hours.
+        """Cancel trades that are open in state but missing from the exchange for >60s.
         Skips trades entered <60s ago (race condition grace).
-        Logs a warning for trades missing 1-24h so the user can see the drift.
+        Trades missing >60s are immediately closed as ghost trades.
         """
         now = datetime.now(timezone.utc)
         for t in d.get("trades", []):
@@ -1288,11 +1288,7 @@ class BaseBot:
             if age_s is not None and age_s < 60:
                 self.log.debug(f"Sync: {sym} entered <60s ago, skipping ghost check")
                 continue
-            if age_s is not None and age_s < 86400:
-                remaining_h = (86400 - age_s) / 3600
-                self.log.warning(f"Sync: {sym} open in state but missing from exchange — auto-cancel in {remaining_h:.1f}h")
-                continue
-            # 24h elapsed — cancel the ghost trade
+            # >60s missing from exchange — cancel the ghost trade immediately
             close_price = float(t.get("price", 0))
             trades_hist = []
             try:
@@ -1314,7 +1310,7 @@ class BaseBot:
             d["stats"]["total_pnl"] += round(pnl, 6)
             if pnl > 0:   d["stats"]["wins"]   += 1
             elif pnl < 0: d["stats"]["losses"] += 1
-            self.log.info(f"Sync: cancelled ghost trade {sym} (missing 24h+) pnl={pnl:+.4f}")
+            self.log.info(f"Sync: cancelled ghost trade {sym} (missing >60s) pnl={pnl:+.4f}")
             # NOTE: risk.record_trade_result intentionally excluded — ghost PnL is
             # estimated from mark price, not a real fill, and must not trip the circuit breaker.
             for fn in [
