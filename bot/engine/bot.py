@@ -1323,7 +1323,7 @@ class BaseBot:
                 except Exception: pass
 
     def _sync_futures(self):
-        """Futures sync: update live PnL, import untracked positions, cancel 24h+ ghosts."""
+        """Futures sync: update live PnL, import untracked positions, cancel 60s+ ghosts."""
         try:
             self.log.info("Sync running — mode=futures")
             try:
@@ -1360,7 +1360,7 @@ class BaseBot:
                 # Import any exchange position the bot doesn't know about
                 self._import_exchange_positions(positions, d)
 
-                # Cancel trades open in state but gone from exchange for >24h
+                # Cancel trades open in state but gone from exchange for >60s
                 self._cleanup_ghost_trades(exchange_syms, d)
 
             self.state.state["stats"]["balance"]   = round(usdt, 2)
