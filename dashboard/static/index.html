@@ -513,12 +513,17 @@ nav.tabs {
 .signal-action.HOLD { background: rgba(99,102,241,0.07); color: var(--text2); border-color: var(--border2); }
 
 .signal-symbol   { font-size: 13px; font-weight: 600; color: var(--text4); }
-.signal-strategy { font-size: 10px; color: var(--text2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.signal-reason   { font-size: 10px; color: var(--text2); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .signal-conf { font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right; }
 .signal-conf.buy,  .signal-conf.long  { color: var(--green); }
 .signal-conf.sell, .signal-conf.short { color: var(--red); }
 .signal-conf.hold { color: var(--text2); }
+
+.signal-status { font-family: var(--mono); font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 3px; border: 1px solid; white-space: nowrap; }
+.signal-status.taken    { background: rgba(16,185,129,0.12); color: var(--green); border-color: rgba(16,185,129,0.3); }
+.signal-status.rejected { background: rgba(239,68,68,0.08);  color: var(--red);   border-color: rgba(239,68,68,0.2); }
+.signal-status.hold     { background: rgba(99,102,241,0.07); color: var(--text2); border-color: var(--border2); }
 
 /* ─── FILTER BAR ─── */
 .filter-bar {
@@ -1801,11 +1806,15 @@ function updateSignals() {
       var s      = sigs[i];
       var pct    = Math.round((s.confidence || 0) * 100);
       var action = s.action || 'HOLD';
+      var status = s.status || 'hold';
+      var reason = s.reason || (s.indicators && s.indicators.reasons ? s.indicators.reasons.join(' | ') : '');
       var cc     = (action === 'BUY' || action === 'LONG') ? 'buy' : (action === 'SELL' || action === 'SHORT') ? 'sell' : 'hold';
+      var statusLabel = status === 'taken' ? 'TAKEN' : status === 'rejected' ? 'REJECTED' : 'HOLD';
       h += "<div class='signal-item'>" +
         "<div class='signal-action " + escapeHtml(action) + "'>" + escapeHtml(action) + "</div>" +
-        "<div><div class='signal-symbol'>"    + escapeHtml(s.symbol || '') + "</div>" +
-        "<div class='signal-strategy'>"       + escapeHtml((s.strategy || '').slice(0, 30)) + "</div></div>" +
+        "<div><div class='signal-symbol'>" + escapeHtml(s.symbol || '') +
+          " <span class='signal-status " + escapeHtml(status) + "'>" + statusLabel + "</span></div>" +
+        "<div class='signal-reason'>" + escapeHtml(reason.slice(0, 60)) + "</div></div>" +
         "<div class='signal-conf " + cc + "'>" + pct + "%</div>" +
         "</div>";
     }

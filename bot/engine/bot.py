@@ -1062,6 +1062,7 @@ class BaseBot:
             if ensemble.action == "HOLD":
                 self.state.add_signal({
                     "symbol": symbol, "action": "HOLD", "confidence": ensemble.confidence,
+                    "status": "hold", "reason": f"net={ensemble.net_score:+.3f}",
                     "strategy": f"ensemble:{ensemble.net_score:+.3f}",
                     "timeframe": "AUTO",
                     "indicators": {"buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
@@ -1086,23 +1087,34 @@ class BaseBot:
                 all_trades=self.state.get_all_trades(),
             )
 
-            # Log signal regardless of decision
+            if not decision.approved:
+                self.log.info(f"SIGNAL {symbol} → {ensemble.action} | conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total} | REJECTED: {' | '.join(decision.reasons)}")
+                self.state.add_signal({
+                    "symbol": symbol, "action": ensemble.action,
+                    "confidence": ensemble.confidence,
+                    "status": "rejected", "reason": " | ".join(decision.reasons),
+                    "strategy": f"ensemble:{ensemble.net_score:+.3f}",
+                    "timeframe": "AUTO",
+                    "indicators": {
+                        "buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
+                        "agents_agree": ensemble.agents_agreeing, "profile": self.profile.name,
+                    },
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                return
+
             self.state.add_signal({
-                "symbol": symbol, "action": ensemble.action if decision.approved else "HOLD",
-                "confidence": decision.adjusted_conf if decision.approved else ensemble.confidence,
+                "symbol": symbol, "action": ensemble.action,
+                "confidence": decision.adjusted_conf,
+                "status": "taken",
                 "strategy": f"ensemble:{ensemble.net_score:+.3f}",
                 "timeframe": "AUTO",
                 "indicators": {
                     "buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
-                    "agents_agree": ensemble.agents_agreeing,
-                    "profile": self.profile.name, "reasons": decision.reasons,
+                    "agents_agree": ensemble.agents_agreeing, "profile": self.profile.name,
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-
-            if not decision.approved:
-                self.log.info(f"SIGNAL {symbol} → {ensemble.action} | conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total} | REJECTED: {' | '.join(decision.reasons)}")
-                return
 
             # ── Layer 3: Execution ─────────────────────────────────────
             if not price or price <= 0:
