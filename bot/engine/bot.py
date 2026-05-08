@@ -1458,14 +1458,16 @@ class BaseBot:
                     trade_value = float(t["amount"]) * float(t["price"])
                     if held < min_held or trade_value < 1.0:
                         close_price = float(t["price"])
-                        trades = []
                         try:
-                            trades = self.exchange.fetch_my_trades(t["symbol"], limit=10)
-                            if trades:
-                                close_price = max(trades, key=lambda x: x["time"]).get("price", close_price)
+                            closing_side = "sell"   # spot is always long; closed by a sell
+                            fills = self.exchange.fetch_my_trades(t["symbol"], limit=10)
+                            closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
+                            if closing_fills:
+                                best = max(closing_fills, key=lambda x: x["time"])
+                                close_price = float(best.get("price", close_price))
+                            elif fills:
+                                close_price = self.exchange.fetch_ticker(t["symbol"])["last"]
                         except Exception:
-                            pass
-                        if not trades:
                             try:
                                 close_price = self.exchange.fetch_ticker(t["symbol"])["last"]
                             except Exception:
