@@ -159,22 +159,37 @@ def make_features(df):
     return f.dropna()
 
 
-def make_labels(df, forward_bars=1):
+def make_labels(df: pd.DataFrame, forward_bars: int = 1, atr_k: float = 0.5) -> pd.Series:
     """
-    Binary labels: SELL(0) or BUY(1). No HOLD.
-    Every bar gets a direction — the model learns which way.
-    Risk layer decides whether to act.
+    ATR 3-class labels: SELL=0, HOLD=1, BUY=2.
+    Only labels bars where the forward move exceeds atr_k × ATR/close.
     """
     close  = df["close"]
-    future = close.shift(-forward_bars) / close - 1
-    labels = pd.Series(0, index=df.index)   # SELL = 0
-    labels[future > 0] = 1                    # BUY  = 1
-    labels = labels.dropna()
+    high   = df["high"]
+    low    = df["low"]
+
+    tr  = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=14).mean()
+
+    threshold = (atr / (close + 1e-9) * atr_k).clip(0.001, 0.02)
+    future    = close.shift(-forward_bars) / (close + 1e-9) - 1
+
+    labels = pd.Series(1, index=df.index, dtype=int)   # HOLD = 1
+    labels[future >  threshold] = 2                      # BUY  = 2
+    labels[future < -threshold] = 0                      # SELL = 0
+    labels = labels[future.notna()]
+
     counts = labels.value_counts().sort_index()
     total  = len(labels)
     log.info(
-        f"Labels (binary): SELL={counts.get(0,0)/total*100:.1f}% "
-        f"BUY={counts.get(1,0)/total*100:.1f}%"
+        f"Labels (ATR 3-class, k={atr_k}): "
+        f"SELL={counts.get(0,0)/total*100:.1f}% "
+        f"HOLD={counts.get(1,0)/total*100:.1f}% "
+        f"BUY={counts.get(2,0)/total*100:.1f}%"
     )
     return labels
 
@@ -183,6 +198,13 @@ def compute_decay_weights(n: int, gamma: float = 0.995) -> np.ndarray:
     """Exponential decay weights: older samples get lower weight."""
     w = gamma ** np.arange(n - 1, -1, -1, dtype=np.float64)
     return (w / w.sum() * n).astype(np.float32)
+
+
+def _make_sample_weights(y_arr: np.ndarray, class_weights: dict) -> "Optional[np.ndarray]":
+    """Convert {class_int: weight} dict to per-sample float32 weights."""
+    if class_weights is None:
+        return None
+    return np.vectorize(lambda c: class_weights.get(int(c), 1.0))(y_arr).astype(np.float32)
 
 
 class OnlineBuffer:
@@ -230,11 +252,13 @@ class OnlineBuffer:
 
 
 class RandomForestStrategy:
-    def __init__(self):
-        self.model_path   = DATA / "rf_model.pkl"
-        self.scaler_path  = DATA / "rf_scaler.pkl"
-        self.feat_path    = DATA / "rf_features.pkl"
-        self.meta_path    = DATA / "rf_meta.json"
+    def __init__(self, mode: str = None):
+        data_dir = DATA_DIR / (mode or BOT_MODE)
+        data_dir.mkdir(exist_ok=True)
+        self.model_path   = data_dir / "rf_model.pkl"
+        self.scaler_path  = data_dir / "rf_scaler.pkl"
+        self.feat_path    = data_dir / "rf_features.pkl"
+        self.meta_path    = data_dir / "rf_meta.json"
         self.model        = None
         self.scaler       = StandardScaler()
         self.feature_cols = None
@@ -259,14 +283,15 @@ class RandomForestStrategy:
 
     def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None,
               forward_bars: int = 1, timeframe: str = "15m",
-              min_confidence: float = 0.52, min_votes: int = 2, n_jobs: int = 4):
+              min_confidence: float = 0.52, min_votes: int = 2, n_jobs: int = 4,
+              atr_k: float = 0.5, class_weights: dict = None):
         log.info("Training Random Forest (walk-forward)...")
         if feat_df is not None and labels_s is not None:
             feat   = feat_df
             labels = labels_s
         else:
             feat   = make_features(df)
-            labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
+            labels = make_labels(df, forward_bars=forward_bars, atr_k=atr_k).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
         if len(feat) < 300:
             return {"error": "need 300+ bars"}
@@ -284,6 +309,9 @@ class RandomForestStrategy:
             Xtr = sc.fit_transform(X[tr_idx])
             Xte = sc.transform(X[te_idx])
             sw_fold = sw[tr_idx] if sw is not None else None
+            cw_fold = _make_sample_weights(y[tr_idx], class_weights)
+            if cw_fold is not None:
+                sw_fold = cw_fold if sw_fold is None else sw_fold * cw_fold
             m = RandomForestClassifier(n_estimators=200, max_depth=10,
                                         min_samples_leaf=5,
                                         random_state=42, n_jobs=n_jobs)
@@ -297,6 +325,9 @@ class RandomForestStrategy:
         Xtr   = self.scaler.transform(X[:split])
         Xte   = self.scaler.transform(X[split:])
         sw_tr = sw[:split] if sw is not None else None
+        cw_tr = _make_sample_weights(y[:split], class_weights)
+        if cw_tr is not None:
+            sw_tr = cw_tr if sw_tr is None else sw_tr * cw_tr
         new_model = RandomForestClassifier(
             n_estimators=500, max_depth=8, min_samples_leaf=8,
             min_samples_split=15, max_features="log2",
@@ -309,7 +340,8 @@ class RandomForestStrategy:
         if new_acc < 0.40:
             log.warning(f"RF new ({new_acc:.2%}) below floor — discarding")
             self._load()
-            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor"}
+            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor",
+                    "n_classes": int(len(np.unique(y)))}
 
         self.model      = new_model
         self.is_trained = True
@@ -323,6 +355,7 @@ class RandomForestStrategy:
             "min_votes":    min_votes,
             "trained_at":   datetime.now(timezone.utc).isoformat(),
             "n_samples":    len(X),
+            "n_classes":    int(len(np.unique(y))),
         }
         joblib.dump(self.model,        self.model_path)
         joblib.dump(self.scaler,       self.scaler_path)
@@ -334,36 +367,50 @@ class RandomForestStrategy:
 
     def predict(self, df):
         if not self.is_trained:
-            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
         feat = make_features(df)
         if len(feat) == 0:
-            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
-        last   = feat.iloc[[-1]][self.feature_cols]
-        probs  = self.model.predict_proba(self.scaler.transform(last.values))[0]
-        # Binary: [SELL_prob, BUY_prob]
-        label = 1 if probs[1] >= probs[0] else 0
-        return {"action": "BUY" if label == 1 else "SELL",
-                "confidence": round(float(probs[label]), 4),
-                "probs": [float(probs[0]), float(probs[1])]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
+        try:
+            X        = self.scaler.transform(feat.values[-1:])
+            probs    = self.model.predict_proba(X)[0]
+            classes  = self.model.classes_
+            prob_map = {int(c): float(p) for c, p in zip(classes, probs)}
+            sell_p   = prob_map.get(0, 0.0)
+            hold_p   = prob_map.get(1, 0.0)
+            buy_p    = prob_map.get(2, 0.0)
+            best     = max(prob_map, key=prob_map.get)
+            action   = {0: "SELL", 1: "HOLD", 2: "BUY"}.get(best, "HOLD")
+            return {"action": action, "confidence": round(prob_map[best], 4),
+                    "probs": [sell_p, hold_p, buy_p]}
+        except Exception as e:
+            log.warning(f"RF predict error: {e}")
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
 
     def predict_numpy(self, X: "np.ndarray"):
         """Predict from pre-scaled numpy array (1 row × N features). No make_features() involved."""
         if not self.is_trained:
             raise RuntimeError("RF model not trained")
-        probs = self.model.predict_proba(X)[0]
-        # Binary: [SELL_prob, BUY_prob]
-        label = 1 if probs[1] >= probs[0] else 0
-        return {"action": "BUY" if label == 1 else "SELL",
-                "confidence": round(float(probs[label]), 4),
-                "probs": [float(probs[0]), float(probs[1])]}
+        probs    = self.model.predict_proba(X)[0]
+        classes  = self.model.classes_
+        prob_map = {int(c): float(p) for c, p in zip(classes, probs)}
+        sell_p   = prob_map.get(0, 0.0)
+        hold_p   = prob_map.get(1, 0.0)
+        buy_p    = prob_map.get(2, 0.0)
+        best     = max(prob_map, key=prob_map.get)
+        action   = {0: "SELL", 1: "HOLD", 2: "BUY"}.get(best, "HOLD")
+        return {"action": action, "confidence": round(prob_map[best], 4),
+                "probs": [sell_p, hold_p, buy_p]}
 
 
 class LightGBMStrategy:
-    def __init__(self):
-        self.model_path   = DATA / "lgbm_model.pkl"
-        self.scaler_path  = DATA / "lgbm_scaler.pkl"
-        self.feat_path    = DATA / "lgbm_features.pkl"
-        self.meta_path    = DATA / "lgbm_meta.json"
+    def __init__(self, mode: str = None):
+        data_dir = DATA_DIR / (mode or BOT_MODE)
+        data_dir.mkdir(exist_ok=True)
+        self.model_path   = data_dir / "lgbm_model.pkl"
+        self.scaler_path  = data_dir / "lgbm_scaler.pkl"
+        self.feat_path    = data_dir / "lgbm_features.pkl"
+        self.meta_path    = data_dir / "lgbm_meta.json"
         self.model        = None
         self.scaler       = StandardScaler()
         self.feature_cols = None
@@ -388,14 +435,15 @@ class LightGBMStrategy:
 
     def train(self, df, use_decay_weights: bool = False, feat_df=None, labels_s=None,
               forward_bars: int = 1, timeframe: str = "15m",
-              min_confidence: float = 0.52, min_votes: int = 2, n_jobs: int = 4):
+              min_confidence: float = 0.52, min_votes: int = 2, n_jobs: int = 4,
+              atr_k: float = 0.5, class_weights: dict = None):
         log.info("Training LightGBM (walk-forward)...")
         if feat_df is not None and labels_s is not None:
             feat   = feat_df
             labels = labels_s
         else:
             feat   = make_features(df)
-            labels = make_labels(df, forward_bars=forward_bars).reindex(feat.index).dropna()
+            labels = make_labels(df, forward_bars=forward_bars, atr_k=atr_k).reindex(feat.index).dropna()
             feat   = feat.loc[labels.index]
         if len(feat) < 300:
             return {"error": "need 300+ bars"}
@@ -421,6 +469,9 @@ class LightGBMStrategy:
             Xte_fold = sc.transform(X[te_idx])
             val_sp   = int(len(tr_idx) * 0.85)
             sw_fold  = sw[tr_idx] if sw is not None else None
+            cw_fold  = _make_sample_weights(y[tr_idx], class_weights)
+            if cw_fold is not None:
+                sw_fold = cw_fold if sw_fold is None else sw_fold * cw_fold
             m = lgb.LGBMClassifier(**lgbm_params)
             m.fit(Xtr_fold[:val_sp], y[tr_idx[:val_sp]],
                   sample_weight=sw_fold[:val_sp] if sw_fold is not None else None,
@@ -438,6 +489,9 @@ class LightGBMStrategy:
         Xval = self.scaler.transform(X[val_sp:sp])
         Xte  = self.scaler.transform(X[sp:])
         sw_tr = sw[:val_sp] if sw is not None else None
+        cw_tr = _make_sample_weights(y[:val_sp], class_weights)
+        if cw_tr is not None:
+            sw_tr = cw_tr if sw_tr is None else sw_tr * cw_tr
         new_model = lgb.LGBMClassifier(**lgbm_params)
         new_model.fit(Xtr, y[:val_sp], sample_weight=sw_tr,
                       eval_set=[(Xval, y[val_sp:sp])],
@@ -449,7 +503,8 @@ class LightGBMStrategy:
         if new_acc < 0.40:
             log.warning(f"LightGBM new ({new_acc:.2%}) below floor — discarding")
             self._load()
-            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor"}
+            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor",
+                    "n_classes": int(len(np.unique(y)))}
 
         self.model      = new_model
         self.is_trained = True
@@ -463,6 +518,7 @@ class LightGBMStrategy:
             "min_votes":     min_votes,
             "trained_at":    datetime.now(timezone.utc).isoformat(),
             "n_samples":     len(X),
+            "n_classes":     int(len(np.unique(y))),
         }
         joblib.dump(self.model,        self.model_path)
         joblib.dump(self.scaler,       self.scaler_path)
@@ -474,28 +530,40 @@ class LightGBMStrategy:
 
     def predict(self, df):
         if not self.is_trained:
-            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
         feat = make_features(df)
         if len(feat) == 0:
-            return {"action": "HOLD", "confidence": 0.30, "probs": [0.35, 0.35]}
-        last  = feat.iloc[[-1]][self.feature_cols]
-        probs = self.model.predict_proba(self.scaler.transform(last.values))[0]
-        # Binary: [SELL_prob, BUY_prob]
-        label = 1 if probs[1] >= probs[0] else 0
-        return {"action": "BUY" if label == 1 else "SELL",
-                "confidence": round(float(probs[label]), 4),
-                "probs": list(probs)}
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
+        try:
+            X        = self.scaler.transform(feat.values[-1:])
+            probs    = self.model.predict_proba(X)[0]
+            classes  = self.model.classes_
+            prob_map = {int(c): float(p) for c, p in zip(classes, probs)}
+            sell_p   = prob_map.get(0, 0.0)
+            hold_p   = prob_map.get(1, 0.0)
+            buy_p    = prob_map.get(2, 0.0)
+            best     = max(prob_map, key=prob_map.get)
+            action   = {0: "SELL", 1: "HOLD", 2: "BUY"}.get(best, "HOLD")
+            return {"action": action, "confidence": round(prob_map[best], 4),
+                    "probs": [sell_p, hold_p, buy_p]}
+        except Exception as e:
+            log.warning(f"LightGBM predict error: {e}")
+            return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
 
     def predict_numpy(self, X: "np.ndarray"):
         """Predict from pre-scaled numpy array (1 row × N features). No make_features() involved."""
         if not self.is_trained:
             raise RuntimeError("LightGBM model not trained")
-        probs = self.model.predict_proba(X)[0]
-        # Binary: [SELL_prob, BUY_prob]
-        label = 1 if probs[1] >= probs[0] else 0
-        return {"action": "BUY" if label == 1 else "SELL",
-                "confidence": round(float(probs[label]), 4),
-                "probs": list(probs)}
+        probs    = self.model.predict_proba(X)[0]
+        classes  = self.model.classes_
+        prob_map = {int(c): float(p) for c, p in zip(classes, probs)}
+        sell_p   = prob_map.get(0, 0.0)
+        hold_p   = prob_map.get(1, 0.0)
+        buy_p    = prob_map.get(2, 0.0)
+        best     = max(prob_map, key=prob_map.get)
+        action   = {0: "SELL", 1: "HOLD", 2: "BUY"}.get(best, "HOLD")
+        return {"action": action, "confidence": round(prob_map[best], 4),
+                "probs": [sell_p, hold_p, buy_p]}
 
 class AIStrategyEngine:
     def __init__(self):
@@ -513,18 +581,21 @@ class AIStrategyEngine:
                   use_decay_weights: bool = False, btc_rows: int = 0,
                   forward_bars: int = 1, timeframe: str = "15m",
                   min_confidence: float = 0.52, min_votes: int = 2,
-                  quick: bool = False, n_jobs: int = 4, progress_fn=None):
+                  quick: bool = False, n_jobs: int = 4, progress_fn=None,
+                  atr_k: float = 0.5, class_weights: dict = None):
         """All modes train RF+LGBM only (LSTM/Meta/TFT removed)."""
         r = {}
         r["rf"]   = self.rf.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights,
                                     forward_bars=forward_bars, timeframe=timeframe,
-                                    min_confidence=min_confidence, min_votes=min_votes, n_jobs=n_jobs)
+                                    min_confidence=min_confidence, min_votes=min_votes, n_jobs=n_jobs,
+                                    atr_k=atr_k, class_weights=class_weights)
         if progress_fn:
             try: progress_fn(50)
             except Exception: pass
         r["lgbm"] = self.lgbm.train(df, feat_df=feat_df, labels_s=labels_s, use_decay_weights=use_decay_weights,
                                       forward_bars=forward_bars, timeframe=timeframe,
-                                      min_confidence=min_confidence, min_votes=min_votes, n_jobs=n_jobs)
+                                      min_confidence=min_confidence, min_votes=min_votes, n_jobs=n_jobs,
+                                      atr_k=atr_k, class_weights=class_weights)
         if progress_fn:
             try: progress_fn(100)
             except Exception: pass
@@ -560,11 +631,11 @@ class AIStrategyEngine:
         rf_p   = self.rf.predict(df)
         lgbm_p = self.lgbm.predict(df)
 
-        rf_probs   = np.array(rf_p["probs"])      # [SELL_prob, BUY_prob]
+        rf_probs   = np.array(rf_p["probs"])      # [SELL_prob, HOLD_prob, BUY_prob]
         lgbm_probs = np.array(lgbm_p["probs"])
 
         w_rf, w_lgbm = self._get_dynamic_weights()
-        buy_prob  = rf_probs[1] * w_rf + lgbm_probs[1] * w_lgbm
+        buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
         sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
 
         if rf_p.get("action") == "HOLD" or lgbm_p.get("action") == "HOLD":
@@ -580,7 +651,7 @@ class AIStrategyEngine:
             action, conf = "SELL", min(sell_prob, 0.95)
 
         conf = round(float(conf), 4)
-        strat = f"bin:RF={rf_probs[1]:.2f}|{rf_probs[0]:.2f} LGBM={lgbm_probs[1]:.2f}|{lgbm_probs[0]:.2f}"
+        strat = f"bin:RF={rf_probs[2]:.2f}|{rf_probs[0]:.2f} LGBM={lgbm_probs[2]:.2f}|{lgbm_probs[0]:.2f}"
         ts = datetime.now(timezone.utc).isoformat()
 
         self._unc_buffer.append({
@@ -610,11 +681,11 @@ class AIStrategyEngine:
         rf_p   = self.rf.predict_numpy(X)
         lgbm_p = self.lgbm.predict_numpy(X)
 
-        rf_probs   = np.array(rf_p["probs"])   # [SELL_prob, BUY_prob]
+        rf_probs   = np.array(rf_p["probs"])   # [SELL_prob, HOLD_prob, BUY_prob]
         lgbm_probs = np.array(lgbm_p["probs"])
 
         w_rf, w_lgbm = 0.40, 0.60
-        buy_prob  = rf_probs[1] * w_rf + lgbm_probs[1] * w_lgbm
+        buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
         sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
 
         if buy_prob >= sell_prob:
@@ -623,7 +694,7 @@ class AIStrategyEngine:
             action, conf = "SELL", min(sell_prob, 0.95)
 
         conf = round(float(conf), 4)
-        strat = f"bin:RF={rf_probs[1]:.2f}|{rf_probs[0]:.2f} LGBM={lgbm_probs[1]:.2f}|{lgbm_probs[0]:.2f}"
+        strat = f"bin:RF={rf_probs[2]:.2f}|{rf_probs[0]:.2f} LGBM={lgbm_probs[2]:.2f}|{lgbm_probs[0]:.2f}"
 
         return {
             "symbol": symbol, "action": action, "confidence": conf,

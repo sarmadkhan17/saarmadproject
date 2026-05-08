@@ -24,9 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+
+import numpy as np
 import yaml
 from dataclasses import dataclass, asdict
-import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -51,6 +53,32 @@ from engine.risk_agent     import RiskDecisionAgent
 from engine.execution_engine import ExecutionEngine
 
 DATA = DATA_DIR
+
+
+def _compute_class_weights(closed_trades: list) -> dict:
+    """
+    Precision-adaptive class weights from recent closed trades.
+    Returns {SELL(0): w, HOLD(1): 1.0, BUY(2): w}.
+    Falls back to {0: 2.0, 1: 1.0, 2: 2.0} if fewer than 20 trades per side.
+    """
+    import numpy as np
+    BUY_SIDES  = {"buy", "long"}
+    SELL_SIDES = {"sell", "short"}
+    FALLBACK   = {0: 2.0, 1: 1.0, 2: 2.0}
+
+    buy_trades  = [t for t in closed_trades if t.get("side", "") in BUY_SIDES]
+    sell_trades = [t for t in closed_trades if t.get("side", "") in SELL_SIDES]
+
+    if len(buy_trades) < 20 or len(sell_trades) < 20:
+        return FALLBACK
+
+    buy_prec  = sum(1 for t in buy_trades  if t.get("pnl", 0) > 0) / len(buy_trades)
+    sell_prec = sum(1 for t in sell_trades if t.get("pnl", 0) > 0) / len(sell_trades)
+
+    buy_w  = float(np.clip(1.0 / (buy_prec  + 1e-9), 1.0, 4.0))
+    sell_w = float(np.clip(1.0 / (sell_prec + 1e-9), 1.0, 4.0))
+
+    return {0: sell_w, 1: 1.0, 2: buy_w}
 
 
 def setup_logging(config: dict, log_file: str = "bot.log"):
@@ -411,6 +439,7 @@ class BaseBot:
         ml_cfg       = self.config.get("ml", {})
         tf           = ml_cfg.get("timeframe", "15m")
         fb           = ml_cfg.get("forward_bars", 2)
+        atr_k        = training_cfg.get("atr_k", 0.5)
         mc           = self.config.get("strategy", {}).get("min_confidence", 0.52)
         mv           = self.config.get("strategy", {}).get("min_votes", 1)
         n_jobs       = training_cfg.get("n_jobs", 4)
@@ -456,7 +485,7 @@ class BaseBot:
                 primary_df = self.training_feed.fetch_ohlcv(sym_api, primary_tf, limit=0)
                 if primary_df is None or len(primary_df) < 50:
                     return None
-                labels = make_labels(primary_df, forward_bars=fb)
+                labels = make_labels(primary_df, forward_bars=fb, atr_k=atr_k)
                 common = f.index.intersection(labels.index)
                 if len(common) < 50:
                     self.log.warning(f"  {sym_api}: {len(common)} clean rows (<50) — skip")
@@ -491,6 +520,21 @@ class BaseBot:
         combined_feats  = pd.concat(feat_parts,  ignore_index=True).dropna()
         combined_labels = pd.concat(label_parts, ignore_index=True).loc[combined_feats.index]
 
+        # ── HOLD undersampling: cap HOLD at 40% of original row count ──
+        hold_mask = combined_labels == 1
+        hold_frac = hold_mask.sum() / len(combined_labels)
+        if hold_frac > 0.40:
+            target_hold = int(len(combined_labels) * 0.40)
+            hold_idx    = combined_labels[hold_mask].index
+            rng         = np.random.default_rng(42)
+            drop_idx    = rng.choice(hold_idx, size=len(hold_idx) - target_hold, replace=False)
+            combined_feats  = combined_feats.drop(index=drop_idx).reset_index(drop=True)
+            combined_labels = combined_labels.drop(index=drop_idx).reset_index(drop=True)
+            self.log.info(
+                f"HOLD undersampled: {hold_frac:.1%} → "
+                f"{(combined_labels==1).mean():.1%} of {len(combined_labels)} rows"
+            )
+
         # Cap dataset size
         max_rows = training_cfg.get("max_rows", 200000)
         if len(combined_feats) > max_rows:
@@ -515,6 +559,10 @@ class BaseBot:
 
         # ── Train models on scaled features ──────────────────────────
         self._write_training_status("running", source="pipeline", progress=20)
+        closed_trades = [t for t in self.state.state.get("trades", []) if t.get("status") == "closed"]
+        closed_trades = closed_trades[-50:]
+        class_weights = _compute_class_weights(closed_trades)
+        self.log.info(f"Class weights: {class_weights} (from {len(closed_trades)} closed trades)")
         results = self.ai.train_all(
             combined_feats,
             feat_df=pd.DataFrame(X_scaled, columns=feature_cols),
@@ -526,6 +574,8 @@ class BaseBot:
             min_votes=mv,
             quick=quick,
             n_jobs=n_jobs,
+            atr_k=atr_k,
+            class_weights=class_weights,
             progress_fn=lambda p: self._write_training_status("running", source="pipeline", progress=p),
         )
         self.log.info(f"Training complete: {results}")
