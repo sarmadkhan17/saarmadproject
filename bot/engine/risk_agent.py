@@ -137,6 +137,38 @@ class RiskDecisionAgent:
                 reasons.append(f"shorts blocked in {regime_ctx.get('regime','?')}")
                 return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
 
+        # ── Gate 4b: Contra-trend breadth confidence penalty ─────────
+        # When market breadth is 50–60% bullish (not enough to fully block shorts,
+        # but enough to demand higher confidence for counter-trend entries).
+        # Penalty scales: +0% at 50% breadth → +15% at 60%+.
+        if regime_ctx:
+            breadth      = regime_ctx.get("breadth",      0.5)
+            bear_breadth = regime_ctx.get("bear_breadth", 0.5)
+            if action == "SELL" and breadth > 0.50:
+                penalty = min(0.15, (breadth - 0.50) * 1.5)
+                penalised_floor = round(min(
+                    max(getattr(profile, 'min_confidence', 0.45),
+                        regime_ctx.get("min_conf", 0.45)) + penalty,
+                    0.80,
+                ), 4)
+                if conf < penalised_floor:
+                    reasons.append(
+                        f"short penalised: bullish breadth={breadth:.0%} → need conf>={penalised_floor:.2f}"
+                    )
+                    return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+            elif action == "BUY" and bear_breadth > 0.50:
+                penalty = min(0.15, (bear_breadth - 0.50) * 1.5)
+                penalised_floor = round(min(
+                    max(getattr(profile, 'min_confidence', 0.45),
+                        regime_ctx.get("min_conf", 0.45)) + penalty,
+                    0.80,
+                ), 4)
+                if conf < penalised_floor:
+                    reasons.append(
+                        f"long penalised: bearish breadth={bear_breadth:.0%} → need conf>={penalised_floor:.2f}"
+                    )
+                    return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+
         # ── Gate 5: Confidence (post-regime effective) ───────────────
         eff_conf = max(
             getattr(profile, 'min_confidence', 0.50),

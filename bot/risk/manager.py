@@ -122,36 +122,45 @@ class MarketRegimeGate:
             return dict(regime="CRASH", gate=False,
                         allow_longs=False, allow_shorts=True,
                         min_conf=0.65, size_mult=0.4,
-                        breadth=breadth, vol_ratio=vol_ratio, adx=adx_val)
+                        breadth=breadth, bear_breadth=bear_breadth,
+                        vol_ratio=vol_ratio, adx=adx_val)
 
         if vol_ratio > 2.0:
             return dict(regime="HIGH_VOLATILITY", gate=False,
                         allow_longs=False, allow_shorts=False,
                         min_conf=0.70, size_mult=0.3,
-                        breadth=breadth, vol_ratio=vol_ratio, adx=adx_val)
+                        breadth=breadth, bear_breadth=bear_breadth,
+                        vol_ratio=vol_ratio, adx=adx_val)
 
         if adx_val > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
+            # Only allow trades in the direction the trend is running
             return dict(regime="STRONG_TREND", gate=True,
-                        allow_longs=True, allow_shorts=True,
+                        allow_longs=btc_bullish,
+                        allow_shorts=btc_bearish,
                         min_conf=0.45, size_mult=1.2,
-                        breadth=breadth, vol_ratio=vol_ratio, adx=adx_val)
+                        breadth=breadth, bear_breadth=bear_breadth,
+                        vol_ratio=vol_ratio, adx=adx_val)
 
         if adx_val < 20 and vol_ratio < 0.8 and 0.30 < breadth < 0.60:
             return dict(regime="RANGING", gate=True,
                         allow_longs=True, allow_shorts=True,
                         min_conf=0.58, size_mult=0.6,
-                        breadth=breadth, vol_ratio=vol_ratio, adx=adx_val)
+                        breadth=breadth, bear_breadth=bear_breadth,
+                        vol_ratio=vol_ratio, adx=adx_val)
 
+        # WEAK_TREND: block the contra-trend direction when breadth is clearly one-sided
         return dict(regime="WEAK_TREND", gate=True,
-                    allow_longs=True, allow_shorts=True,
+                    allow_longs=bear_breadth < 0.60,
+                    allow_shorts=breadth < 0.60,
                     min_conf=0.45, size_mult=0.9,
-                    breadth=breadth, vol_ratio=vol_ratio, adx=adx_val)
+                    breadth=breadth, bear_breadth=bear_breadth,
+                    vol_ratio=vol_ratio, adx=adx_val)
 
     def _neutral(self) -> dict:
         return dict(regime="UNKNOWN", gate=True,
                     allow_longs=True, allow_shorts=True,
                     min_conf=0.52, size_mult=0.8,
-                    breadth=0.5, vol_ratio=1.0, adx=25.0)
+                    breadth=0.5, bear_breadth=0.5, vol_ratio=1.0, adx=25.0)
 
     def _calc_adx(self, high, low, close, period=14):
         try:
