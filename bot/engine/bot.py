@@ -1051,6 +1051,9 @@ class BaseBot:
                 pass
             except Exception as e:
                 self.log.error(f"[{symbol}] Feature build FAILED — no ML signal: {e}")
+                if "does not have market symbol" in str(e):
+                    self.feed.mark_invalid(symbol)
+                    self.log.warning(f"[{symbol}] Marked invalid — excluded from watchlist")
 
             ensemble = self.ensemble.run(symbol, df_1h, self.profile)
 
