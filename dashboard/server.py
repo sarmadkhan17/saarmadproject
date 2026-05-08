@@ -1094,7 +1094,7 @@ def set_trading_profile():
     if not saved:
         return jsonify({"error": "No config files found"}), 500
 
-    return jsonify({"status": "ok", "profile": profile_name, "message": f"Switched to {profile_name} — bot reloads on next cycle"})
+    return jsonify({"status": "ok", "profile": profile_name, "message": f"Switched to {profile_name} — takes effect within 30 s"})
 
 
 @app.route("/api/retrain", methods=["POST"])

@@ -459,6 +459,22 @@ class BaseBot:
         except Exception as e:
             self.log.warning(f"Config reload failed: {e}")
 
+    def _maybe_swap_profile(self):
+        """Hot-swap trading profile if the config YAML changed without a full retrain."""
+        try:
+            cfg_path = BOT_ROOT / self.config_file
+            if not cfg_path.exists():
+                return
+            with open(cfg_path) as f:
+                raw = yaml.safe_load(f) or {}
+            new_name = raw.get("strategy", {}).get("trading_profile", self.profile.name)
+            if new_name != self.profile.name:
+                from engine.profiles import TradingProfile
+                self.profile = dataclasses.replace(TradingProfile.load(new_name))
+                self.log.info(f"Profile hot-swapped → {self.profile.name}")
+        except Exception as e:
+            self.log.warning(f"Profile hot-swap check failed: {e}")
+
     def _train_with_pipeline(self, quick: bool = False, force: bool = False):
         """v5 training: build multi-TF dataset via build_features(), save FeatureScaler
         for predict-time use. Single feature function for both train and predict.
@@ -1752,6 +1768,7 @@ class BaseBot:
 
     def run_once(self):
         """One scan cycle — identical for both modes."""
+        self._maybe_swap_profile()
         self.sync_with_exchange()
         self.check_exits()
 
