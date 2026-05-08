@@ -851,6 +851,28 @@ class BaseBot:
         elif votes.count("SELL") >= 1 and "BUY" not in votes: return "SELL"
         return "NEUTRAL"
 
+    def _resolve_close_pnl(self, trade: dict, symbol: str, detection_price: float, fraction: float) -> tuple:
+        """
+        After a close order is placed, look up the actual fill to get the real exit
+        price and PnL. For futures fills that carry realizedPnl, use it directly.
+        Falls back to detection_price if no matching fill is found.
+        Returns (pnl, actual_price).
+        """
+        try:
+            closing_side = "sell" if trade["side"] == "long" else "buy"
+            fills = self.exchange.fetch_my_trades(symbol, limit=10)
+            closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
+            if closing_fills:
+                best = max(closing_fills, key=lambda x: x["time"])
+                actual_price = float(best.get("price", detection_price))
+                rpnl = float(best.get("realizedPnl", 0))
+                if rpnl != 0:
+                    return rpnl * fraction, actual_price
+                return self._calc_pnl(trade, actual_price) * fraction, actual_price
+        except Exception:
+            pass
+        return self._calc_pnl(trade, detection_price) * fraction, detection_price
+
     def check_exits(self):
         """
         Check open trades for exit conditions.
@@ -875,8 +897,7 @@ class BaseBot:
                 trade["symbol"], close_amount, trade["side"]
             )
             if order:
-                full_pnl = self._calc_pnl(trade, price)
-                pnl      = full_pnl * fraction
+                pnl, price = self._resolve_close_pnl(trade, trade["symbol"], price, fraction)
                 if fraction >= 1.0:
                     self.state.close_trade(trade["id"], price, pnl)
                     self.risk.cleanup_trade(trade["id"])
