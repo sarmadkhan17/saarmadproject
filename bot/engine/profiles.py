@@ -2,7 +2,7 @@
 import os
 import yaml
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +66,7 @@ class TradingProfile:
 
     @classmethod
     def load(cls, name: str) -> "TradingProfile":
+        """Return the canonical preset (read-only reference). Use from_config() for a mutable copy."""
         name_upper = name.upper()
         if name_upper in _PRESETS:
             return _PRESETS[name_upper]
@@ -74,13 +75,12 @@ class TradingProfile:
 
     @classmethod
     def from_config(cls, config: dict) -> "TradingProfile":
-        from dataclasses import replace as _dc_replace
         name = config.get("strategy", {}).get("trading_profile", "BALANCED")
-        profile = _dc_replace(cls.load(name))   # shallow copy — never mutates _PRESETS
+        profile = dc_replace(cls.load(name))   # shallow copy — never mutates _PRESETS
         overrides = config.get("training", {}).get("profile_overrides", {})
         for key, value in overrides.items():
             if hasattr(profile, key):
-                object.__setattr__(profile, key, value)
+                setattr(profile, key, value)
         return profile
 
 

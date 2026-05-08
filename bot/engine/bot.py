@@ -28,6 +28,7 @@ import sys
 
 import numpy as np
 import yaml
+import dataclasses
 from dataclasses import dataclass, asdict
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -414,7 +415,7 @@ class BaseBot:
                 new_profile_name = strat.get("trading_profile", self.profile.name)
                 if new_profile_name != self.profile.name:
                     from engine.profiles import TradingProfile
-                    self.profile = TradingProfile.load(new_profile_name)
+                    self.profile = dataclasses.replace(TradingProfile.load(new_profile_name))
                     self.log.info(f"Profile switched → {self.profile.name}")
                 self.log.info(f"Config reloaded: min_conf={self.min_conf}, htf={self.htf_filter_mode}, max_open={self.max_open}, profile={self.profile.name}")
         except Exception as e:

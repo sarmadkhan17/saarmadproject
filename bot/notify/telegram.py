@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import dataclasses
 import yaml
 from core.config import get_telegram_config, DATA_DIR
 
@@ -535,7 +536,7 @@ class TelegramNotifier:
 
             try:
                 from engine.profiles import TradingProfile
-                pr = TradingProfile.load(profile_name)
+                pr = dataclasses.replace(TradingProfile.load(profile_name))
                 self.send(
                     f"🎯 <b>Trading Profile: {profile_name}</b>\n\n"
                     f"  Min Confidence: {pr.min_confidence}\n"
