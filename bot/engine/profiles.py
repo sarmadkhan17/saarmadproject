@@ -74,13 +74,13 @@ class TradingProfile:
 
     @classmethod
     def from_config(cls, config: dict) -> "TradingProfile":
+        from dataclasses import replace as _dc_replace
         name = config.get("strategy", {}).get("trading_profile", "BALANCED")
-        profile = cls.load(name)
+        profile = _dc_replace(cls.load(name))   # shallow copy — never mutates _PRESETS
         overrides = config.get("training", {}).get("profile_overrides", {})
-        if overrides:
-            for key, value in overrides.items():
-                if hasattr(profile, key):
-                    setattr(profile, key, value)
+        for key, value in overrides.items():
+            if hasattr(profile, key):
+                object.__setattr__(profile, key, value)
         return profile
 
 
