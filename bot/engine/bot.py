@@ -24,9 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sys
+
+import numpy as np
 import yaml
 from dataclasses import dataclass, asdict
-import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
