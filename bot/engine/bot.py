@@ -1354,6 +1354,7 @@ class BaseBot:
                 continue
             # >60s missing from exchange — cancel the ghost trade immediately
             close_price = float(t.get("price", 0))
+            raw_rpnl = None
             try:
                 # Look for the closing fill: the side opposite to the position
                 # (long was closed by a sell fill; short was closed by a buy fill)
@@ -1361,9 +1362,9 @@ class BaseBot:
                 fills = self.exchange.fetch_my_trades(sym, limit=20)
                 closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
                 if closing_fills:
-                    # Use the most recent closing-side fill as the exit price
                     best = max(closing_fills, key=lambda x: x["time"])
                     close_price = float(best.get("price", close_price))
+                    raw_rpnl = best.get("realizedPnl")
                 elif fills:
                     # No closing fill found — fall back to ticker
                     close_price = self.exchange.fetch_ticker(sym)["last"]
@@ -1372,7 +1373,7 @@ class BaseBot:
                     close_price = self.exchange.fetch_ticker(sym)["last"]
                 except Exception:
                     pass
-            pnl = self._calc_pnl(t, close_price)
+            pnl = float(raw_rpnl) if raw_rpnl is not None else self._calc_pnl(t, close_price)
             t["status"]          = "closed"
             t["close_price"]     = close_price
             t["pnl"]             = round(pnl, 8)
