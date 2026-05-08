@@ -1367,11 +1367,13 @@ class BaseBot:
         """Futures sync: update live PnL, import untracked positions, cancel 60s+ ghosts."""
         try:
             self.log.info("Sync running — mode=futures")
+            position_fetch_ok = True
             try:
                 positions = self.exchange.get_position()
             except Exception as pe:
-                self.log.warning(f"get_position failed: {pe}")
+                self.log.warning(f"Sync: get_position failed ({pe}) — skipping ghost cleanup this cycle")
                 positions = []
+                position_fetch_ok = False
             if not positions:
                 positions = []
 
@@ -1402,7 +1404,8 @@ class BaseBot:
                 self._import_exchange_positions(positions, d)
 
                 # Cancel trades open in state but gone from exchange for >60s
-                self._cleanup_ghost_trades(exchange_syms, d)
+                if position_fetch_ok:
+                    self._cleanup_ghost_trades(exchange_syms, d)
 
             self.state.state["stats"]["balance"]   = round(usdt, 2)
             self.state.state["stats"]["last_sync"] = datetime.now(timezone.utc).isoformat()

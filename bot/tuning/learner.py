@@ -58,7 +58,7 @@ class SelfLearner:
             if archive_p.exists():
                 try:
                     with open(archive_p) as f:
-                        trades.extend(json.load(f).get("trades", []))
+                        trades.extend(json.load(f))
                 except Exception:
                     pass
         return trades
