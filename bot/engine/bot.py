@@ -864,13 +864,15 @@ class BaseBot:
             closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
             if closing_fills:
                 best = max(closing_fills, key=lambda x: x["time"])
+                # Bot enforces one open trade per symbol (risk manager correlation filter),
+                # so the most-recent closing fill unambiguously belongs to this trade.
                 actual_price = float(best.get("price", detection_price))
-                rpnl = float(best.get("realizedPnl", 0))
-                if rpnl != 0:
-                    return rpnl * fraction, actual_price
+                raw_rpnl = best.get("realizedPnl")
+                if raw_rpnl is not None:
+                    return float(raw_rpnl) * fraction, actual_price
                 return self._calc_pnl(trade, actual_price) * fraction, actual_price
-        except Exception:
-            pass
+        except Exception as e:
+            self.log.debug(f"_resolve_close_pnl fallback to detection_price for {symbol}: {e}")
         return self._calc_pnl(trade, detection_price) * fraction, detection_price
 
     def check_exits(self):

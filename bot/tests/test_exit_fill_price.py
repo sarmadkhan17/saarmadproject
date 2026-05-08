@@ -1,7 +1,8 @@
 # bot/tests/test_exit_fill_price.py
 
 def _calc_pnl_stub(trade, price):
-    return (price - trade["price"]) * trade["amount"] * trade.get("leverage", 1)
+    direction = -1 if trade.get("side") == "short" else 1
+    return direction * (price - trade["price"]) * trade["amount"] * trade.get("leverage", 1)
 
 
 def _get_close_pnl(trade, fills, fraction):
@@ -51,6 +52,7 @@ def test_short_trade_uses_buy_fill():
     ]
     pnl, price = _get_close_pnl(trade, fills, fraction=1.0)
     assert price == 95.0  # buy fill, not sell
+    assert pnl == 25.0   # (100-95)*1*5
 
 
 def test_partial_close_scales_pnl_by_fraction():
@@ -58,3 +60,25 @@ def test_partial_close_scales_pnl_by_fraction():
     fills = [{"side": "sell", "price": "110.0", "realizedPnl": "50.0", "time": 999}]
     pnl, price = _get_close_pnl(trade, fills, fraction=0.5)
     assert pnl == 25.0  # 50.0 * 0.5
+
+
+def test_resolve_close_pnl_uses_realized_pnl_directly():
+    """The actual BaseBot._resolve_close_pnl must use exchange realizedPnl when available."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from engine.bot import BaseBot
+
+    class FakeExchange:
+        def fetch_my_trades(self, symbol, limit=10):
+            return [{"side": "sell", "price": "105.0", "realizedPnl": "24.5", "time": 999}]
+
+    bot = object.__new__(BaseBot)
+    bot.exchange = FakeExchange()
+    bot.log = type("L", (), {"debug": lambda self, *a, **k: None})()
+
+    trade = {"side": "long", "price": 100.0, "amount": 1.0, "leverage": 5,
+             "pnl": 0.0}
+    pnl, price = bot._resolve_close_pnl(trade, "BTC/USDT", detection_price=103.0, fraction=1.0)
+    assert pnl == 24.5
+    assert price == 105.0
