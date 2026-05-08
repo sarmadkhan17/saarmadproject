@@ -520,12 +520,13 @@ class BinanceDemoClient:
             r.raise_for_status()
             return [
                 {
-                    "symbol":  symbol,
-                    "price":   float(t.get("price", 0)),
-                    "qty":     float(t.get("qty", 0)),
-                    "quoteQty": float(t.get("quoteQty", 0)),
-                    "side":    t.get("side", "").lower(),
-                    "time":    t.get("time", 0),
+                    "symbol":      symbol,
+                    "price":       float(t.get("price", 0)),
+                    "qty":         float(t.get("qty", 0)),
+                    "quoteQty":    float(t.get("quoteQty", 0)),
+                    "side":        t.get("side", "").lower(),
+                    "time":        t.get("time", 0),
+                    "realizedPnl": float(t.get("realizedPnl", 0)),
                 }
                 for t in r.json()
             ]
