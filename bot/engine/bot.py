@@ -346,6 +346,7 @@ class BaseBot:
         self.training_feed = TrainingFeed()  # v4: real Binance data for training
 
         self._balance_cache: Optional[float] = None
+        self._symbol_loss_cooldown: dict = {}  # symbol → datetime of last loss
 
         # ── v5: Four-layer architecture ──────────────────────────────────────
         self.profile = TradingProfile.from_config(self.config)
@@ -927,6 +928,8 @@ class BaseBot:
                 self.agents.record_trade_result(trade["symbol"], pnl)
                 self.risk.record_trade_result(pnl, self.get_usdt_balance())
                 self.rl_agent.record_external_close(trade["id"], pnl)
+                if pnl < 0:
+                    self._symbol_loss_cooldown[trade["symbol"]] = datetime.now(timezone.utc)
                 icon    = "TP" if pnl > 0 else "SL"
                 pct_str = f" ({fraction*100:.0f}%)" if fraction < 1.0 else ""
                 self.log.info(f"{icon} EXIT{pct_str} {trade['symbol']} | PnL={pnl:+.4f} | {reason}")
@@ -1069,6 +1072,16 @@ class BaseBot:
                         pre_multi=None, pre_train=None):
         """Decision pipeline: Ensemble → Risk Agent → Execution. v5 layered architecture."""
         try:
+            # Per-symbol cooldown: skip 30 min after a loss to prevent consecutive entries
+            cooldown_until = self._symbol_loss_cooldown.get(symbol)
+            if cooldown_until:
+                elapsed = (datetime.now(timezone.utc) - cooldown_until).total_seconds()
+                if elapsed < 1800:
+                    self.log.debug(f"[{symbol}] cooldown {(1800-elapsed)/60:.0f}m remaining after loss")
+                    return
+                else:
+                    del self._symbol_loss_cooldown[symbol]
+
             # Use pre-fetched data if available, otherwise fetch
             if pre_multi:
                 dfs = pre_multi

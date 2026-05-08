@@ -246,11 +246,14 @@ class ATRTrailingStop:
         partial   = self.partial.get(trade_id, {"tier1": False, "tier2": False})
         gain      = (entry - price) if is_short else (price - entry)
 
+        # PARTIAL_TP1 removed: closing 40% at +1×ATR produced near-zero wins (~$0.01 avg)
+        # because the remaining 60% frequently got stopped at break-even, netting a loss.
+        # Mark tier1 silently so the tier2 check can still fire.
         if not partial["tier1"] and gain >= entry_atr:
             self.partial[trade_id]["tier1"] = True
             self._dirty = True
-            return 0.4, "PARTIAL_TP1 +1×ATR"
 
+        # Partial exit at +2×ATR: take 50% off, let remainder trail to full TP
         if partial["tier1"] and not partial["tier2"] and gain >= 2 * entry_atr:
             self.partial[trade_id]["tier2"] = True
             self._dirty = True
@@ -276,9 +279,10 @@ class ATRTrailingStop:
 
 class KellyCriterionSizer:
     KELLY_FRACTION = 0.25
-    MIN_PCT        = 0.02
-    MAX_PCT        = 0.15
-    BASE_PCT       = 0.05
+    # pos_pct is margin as fraction of balance; usdt = balance * pos_pct * leverage (notional)
+    MIN_PCT        = 0.005   # 0.5% margin floor — prevents micro-trades
+    MAX_PCT        = 0.04    # 4% margin hard ceiling
+    BASE_PCT       = 0.015   # 1.5% margin when < 10 closed trades
 
     def __init__(self, config=None):
         cfg = config or {}
@@ -295,9 +299,10 @@ class KellyCriterionSizer:
                 entry_price = float(t.get("price", 0))
                 amount      = float(t.get("amount", 0))
                 pnl         = float(t.get("pnl", 0))
-                lev         = float(t.get("leverage", self.leverage) or 1)
                 if entry_price > 0 and amount > 0:
-                    invested = (entry_price * amount) / lev  # margin, not notional
+                    # Use notional (not margin) so leverage doesn't inflate the payoff ratio.
+                    # pct_return is the actual price-movement return, comparable across leverage levels.
+                    invested = entry_price * amount
                     pct_returns.append(pnl / (invested + 1e-9))
 
             if len(pct_returns) >= 5:
@@ -320,22 +325,25 @@ class KellyCriterionSizer:
         elif atr_pct > 0.02:  pos_pct *= 0.8
         pos_pct *= regime.get("size_mult", 1.0)
 
-        recent_5 = [t for t in recent_trades[-5:] if t.get("status") == "closed"]
+        # Losing streak: halve size if 3 of last 5 closed trades are losses
+        recent_5 = [t for t in recent_trades if t.get("status") == "closed"][-5:]
         if len(recent_5) >= 3:
             if sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 3:
                 pos_pct *= 0.5
                 log.warning(f"Losing streak — reducing size to {pos_pct*100:.1f}%")
 
+        # Hard caps: pos_pct is margin fraction; notional = pos_pct * leverage * balance
+        # At 5x leverage: 2.5% margin cap → 12.5% notional → ~$500 max on $4k balance
         if all_agree and confidence >= 0.70 and regime.get("regime") == "STRONG_TREND":
-            cap = 0.15
+            cap = 0.040
         elif all_agree and confidence >= 0.60:
-            cap = 0.12
+            cap = 0.030
         else:
-            cap = 0.10
+            cap = 0.025
         pos_pct = max(self.MIN_PCT, min(cap, pos_pct))
         usdt    = balance * pos_pct * self.leverage
         amount  = usdt / price
-        log.debug(f"Kelly size: {pos_pct*100:.1f}% × {self.leverage}× lev = ${usdt:.2f} cap={cap*100:.0f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
+        log.debug(f"Kelly size: {pos_pct*100:.2f}% margin × {self.leverage}× lev = ${usdt:.2f} notional cap={cap*100:.1f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
         return amount, usdt
 
 
