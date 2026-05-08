@@ -93,7 +93,8 @@ class ExecutionEngine:
         )
         self.state.add_trade(trade)
 
-        log.info(f"{side.upper()} {symbol} | ${est_usdt:.2f} | conf={decision.adjusted_conf:.2f}")
+        direction = "BUY" if side in ("buy", "long") else "SELL"
+        log.info(f"SIGNAL {symbol} → {direction} | conf={decision.adjusted_conf:.2f} | TAKEN ${est_usdt:.0f} @ ${fill_price:.4f} ({side})")
         profile_name = getattr(decision, 'profile', '?')
         self.notifier.send_alert(
             f"{side.upper()} {symbol} [{profile_name}]\n"

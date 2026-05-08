@@ -94,7 +94,7 @@ class RiskDecisionAgent:
         if getattr(profile, 'use_confluence_scoring', False):
             c_score, c_threshold = self._confluence_score(ensemble, df_1h, regime_ctx or {}, profile)
             hmm_for_log = (regime_ctx or {}).get("hmm_regime", (regime_ctx or {}).get("regime", "?"))
-            log.info(f"Confluence score={c_score:.3f} threshold={c_threshold:.3f} regime={hmm_for_log}")
+            log.debug(f"Confluence score={c_score:.3f} threshold={c_threshold:.3f} regime={hmm_for_log}")
             if conf < profile.min_confidence:
                 reasons.append(f"conf floor: {conf:.2f} < {profile.min_confidence}")
                 return RiskDecision(False, reasons, conf, profile=profile.name)

@@ -326,7 +326,7 @@ class KellyCriterionSizer:
         pos_pct = max(self.MIN_PCT, min(cap, pos_pct))
         usdt    = balance * pos_pct * self.leverage
         amount  = usdt / price
-        log.info(f"Kelly size: {pos_pct*100:.1f}% × {self.leverage}× lev = ${usdt:.2f} cap={cap*100:.0f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
+        log.debug(f"Kelly size: {pos_pct*100:.1f}% × {self.leverage}× lev = ${usdt:.2f} cap={cap*100:.0f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
         return amount, usdt
 
 
@@ -530,7 +530,7 @@ class RiskManager:
         tr    = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
         atr   = tr.rolling(14).mean().iloc[-1]
         atr_pct = float(atr / (df["close"].iloc[-1] + 1e-9))
-        log.info(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f}")
+        log.debug(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f}")
         return self.sizer.calculate(confidence, balance, price, atr_pct, regime, recent_trades, all_agree=all_agree)
 
     def record_trade_result(self, pnl, balance):

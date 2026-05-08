@@ -1054,10 +1054,10 @@ class BaseBot:
 
             ensemble = self.ensemble.run(symbol, df_1h, self.profile)
 
-            # Log signals for dashboard
+            # Log per-agent detail at DEBUG only
             for s in ensemble.signals:
-                self.log.info(f"AGENT {symbol} | {s.agent}: net={s.net_score:+.3f} buy={s.buy_score:.2f} sell={s.sell_score:.2f} | {s.reasoning[:90]}")
-            self.log.info(f"ENSEMBLE {symbol} | action={ensemble.action} net={ensemble.net_score:+.3f} conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total}")
+                self.log.debug(f"AGENT {symbol} | {s.agent}: net={s.net_score:+.3f} buy={s.buy_score:.2f} sell={s.sell_score:.2f} | {s.reasoning[:90]}")
+            self.log.debug(f"ENSEMBLE {symbol} | action={ensemble.action} net={ensemble.net_score:+.3f} conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total}")
 
             if ensemble.action == "HOLD":
                 self.state.add_signal({
@@ -1068,10 +1068,7 @@ class BaseBot:
                                    "agents_agree": ensemble.agents_agreeing},
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
-                self.log.info(f"{symbol} | HOLD | conv={ensemble.confidence:.2f} | "
-                              f"net={ensemble.net_score:+.3f} | "
-                              f"agree={ensemble.agents_agreeing}/{ensemble.agents_total} | "
-                              f"regime={hmm_regime}")
+                self.log.info(f"SIGNAL {symbol} → HOLD | conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total} | HOLD (net={ensemble.net_score:+.3f} regime={hmm_regime})")
                 return
 
             # HTF bias for risk agent
@@ -1104,9 +1101,7 @@ class BaseBot:
             })
 
             if not decision.approved:
-                self.log.info(f"{symbol} | REJECTED {ensemble.action} | "
-                              f"conf={ensemble.confidence:.2f} | "
-                              f"{' | '.join(decision.reasons)}")
+                self.log.info(f"SIGNAL {symbol} → {ensemble.action} | conf={ensemble.confidence:.2f} agree={ensemble.agents_agreeing}/{ensemble.agents_total} | REJECTED: {' | '.join(decision.reasons)}")
                 return
 
             # ── Layer 3: Execution ─────────────────────────────────────
