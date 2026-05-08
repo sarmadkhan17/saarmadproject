@@ -45,13 +45,22 @@ class SelfLearner:
             json.dump(self.insights, f, indent=2)
 
     def _load_trades(self):
-        # Load from both spot and futures state files
+        # Load from both spot and futures state files, including archives
         trades = []
         for fname in ["state.json", "futures_state.json"]:
             p = DATA / fname
             if p.exists():
                 with open(p) as f:
                     trades.extend(json.load(f).get("trades", []))
+            # Also load from the corresponding archive file
+            archive_fname = fname.replace(".json", "_archive.json")
+            archive_p = DATA / archive_fname
+            if archive_p.exists():
+                try:
+                    with open(archive_p) as f:
+                        trades.extend(json.load(f).get("trades", []))
+                except Exception:
+                    pass
         return trades
 
     def should_run(self):

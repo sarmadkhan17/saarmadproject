@@ -597,7 +597,7 @@ class BaseBot:
 
         # ── Train models on scaled features ──────────────────────────
         self._write_training_status("running", source="pipeline", progress=20)
-        closed_trades = [t for t in self.state.state.get("trades", []) if t.get("status") == "closed"]
+        closed_trades = [t for t in self.state.get_all_trades() if t.get("status") == "closed"]
         closed_trades = closed_trades[-50:]
         class_weights = _compute_class_weights(closed_trades)
         self.log.info(f"Class weights: {class_weights} (from {len(closed_trades)} closed trades)")
