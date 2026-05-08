@@ -1051,9 +1051,9 @@ class BaseBot:
                 pass
             except Exception as e:
                 self.log.error(f"[{symbol}] Feature build FAILED — no ML signal: {e}")
+                # ccxt BadSymbol: "binance does not have market symbol X/USDT" — permanently invalid
                 if "does not have market symbol" in str(e):
-                    self.feed.mark_invalid(symbol)
-                    self.log.warning(f"[{symbol}] Marked invalid — excluded from watchlist")
+                    self.feed.mark_invalid(symbol)  # mark_invalid() logs its own warning
 
             ensemble = self.ensemble.run(symbol, df_1h, self.profile)
 
