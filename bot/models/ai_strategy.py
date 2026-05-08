@@ -340,7 +340,8 @@ class RandomForestStrategy:
         if new_acc < 0.40:
             log.warning(f"RF new ({new_acc:.2%}) below floor — discarding")
             self._load()
-            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor"}
+            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor",
+                    "n_classes": int(len(np.unique(y)))}
 
         self.model      = new_model
         self.is_trained = True
@@ -502,7 +503,8 @@ class LightGBMStrategy:
         if new_acc < 0.40:
             log.warning(f"LightGBM new ({new_acc:.2%}) below floor — discarding")
             self._load()
-            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor"}
+            return {"accuracy": self.metadata.get("test_accuracy", 0), "status": "below_floor",
+                    "n_classes": int(len(np.unique(y)))}
 
         self.model      = new_model
         self.is_trained = True
