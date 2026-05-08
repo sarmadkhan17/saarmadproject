@@ -1331,14 +1331,20 @@ class BaseBot:
                 continue
             # >60s missing from exchange — cancel the ghost trade immediately
             close_price = float(t.get("price", 0))
-            trades_hist = []
             try:
-                trades_hist = self.exchange.fetch_my_trades(sym, limit=10)
-                if trades_hist:
-                    close_price = max(trades_hist, key=lambda x: x["time"]).get("price", close_price)
+                # Look for the closing fill: the side opposite to the position
+                # (long was closed by a sell fill; short was closed by a buy fill)
+                closing_side = "sell" if t["side"] == "long" else "buy"
+                fills = self.exchange.fetch_my_trades(sym, limit=20)
+                closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
+                if closing_fills:
+                    # Use the most recent closing-side fill as the exit price
+                    best = max(closing_fills, key=lambda x: x["time"])
+                    close_price = float(best.get("price", close_price))
+                elif fills:
+                    # No closing fill found — fall back to ticker
+                    close_price = self.exchange.fetch_ticker(sym)["last"]
             except Exception:
-                pass
-            if not trades_hist:
                 try:
                     close_price = self.exchange.fetch_ticker(sym)["last"]
                 except Exception:
