@@ -41,9 +41,9 @@ scanner:
   top_n: 15
 strategy:
   htf_filter_mode: soft
-  min_confidence: 0.52
+  min_confidence: 0.42
   min_votes: 2
-  trading_profile: CONFLUENCE
+  trading_profile: AGGRESSIVE
 training:
   atr_k: 0.45
   max_rows: 200000

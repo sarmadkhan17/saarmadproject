@@ -5,6 +5,7 @@ Extracted from BaseBot.place_order_with_confirmation and related methods.
 
 import time
 import logging
+import threading
 from typing import Optional
 from datetime import datetime, timezone
 
@@ -20,6 +21,14 @@ class ExecutionEngine:
         self.notifier    = notifier
         self.mode        = mode
         self._get_leverage = get_leverage_fn or (lambda: 1)
+        self._sym_locks: dict = {}
+        self._lock_registry = threading.Lock()
+
+    def _get_sym_lock(self, symbol: str) -> threading.Lock:
+        with self._lock_registry:
+            if symbol not in self._sym_locks:
+                self._sym_locks[symbol] = threading.Lock()
+            return self._sym_locks[symbol]
 
     def place_with_confirmation(self, symbol: str, side: str, amount: float,
                                  params: dict = None, max_retries: int = 3) -> Optional[dict]:
@@ -62,6 +71,20 @@ class ExecutionEngine:
     def execute_entry(self, decision, symbol: str, action: str, price: float,
                       get_atr_fn, place_buy_fn, place_sell_fn,
                       strat: str = "") -> Optional[Trade]:
+        lock = self._get_sym_lock(symbol)
+        if not lock.acquire(blocking=False):
+            log.warning(f"[{symbol}] Concurrent execution blocked — already in flight")
+            return None
+        try:
+            return self._execute_entry_locked(
+                decision, symbol, action, price, get_atr_fn, place_buy_fn, place_sell_fn, strat
+            )
+        finally:
+            lock.release()
+
+    def _execute_entry_locked(self, decision, symbol: str, action: str, price: float,
+                               get_atr_fn, place_buy_fn, place_sell_fn,
+                               strat: str = "") -> Optional[Trade]:
         amount = decision.position_size
         est_usdt = decision.est_usdt
 

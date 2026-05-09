@@ -62,10 +62,13 @@ class CoinScanner:
             json.dump({"top_coins": self.top_coins,
                        "last_scan": self.last_scan.isoformat()}, f, indent=2)
 
-    def needs_scan(self):
+    def needs_scan(self, current_atr_ratio: float = 1.0):
         if not self.top_coins or not self.last_scan:
             return True
-        return (datetime.now(timezone.utc) - self.last_scan).total_seconds() >= self.rescan_h * 3600
+        interval = self.rescan_h * 3600
+        if current_atr_ratio > 1.5:   # high volatility → scan twice as often
+            interval = interval / 2
+        return (datetime.now(timezone.utc) - self.last_scan).total_seconds() >= interval
 
     def is_fake_volume(self, ticker, df):
         """
@@ -251,8 +254,8 @@ and float(t.get("quoteVolume", 0) or 0) >= self.min_vol
             log.info(f"  {i:2}. {sym:<12} score={sc:.0f}")
         return self.top_coins
 
-    def get_coins(self, exchange, invalid_symbols=None):
-        if self.needs_scan():
+    def get_coins(self, exchange, invalid_symbols=None, current_atr_ratio: float = 1.0):
+        if self.needs_scan(current_atr_ratio=current_atr_ratio):
             return self.scan(exchange, invalid_symbols=invalid_symbols)
         # Filter cached list against current invalid set
         bad = set(invalid_symbols or [])

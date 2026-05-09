@@ -241,6 +241,15 @@ def _make_features_polars(df: pl.DataFrame) -> pl.DataFrame:
         - ((close < ema9) & (close < ema21) & (close < ema50) & (close < ema96)).cast(pl.Int8)
     ).alias("htf_align"))
 
+    # funding_rate_momentum proxy: hourly return velocity relative to volume activity
+    _vol_sma24 = vol.rolling_mean(window_size=24, min_periods=1)
+    _vol_norm  = vol / (_vol_sma24 + 1e-9)
+    _hour_ret  = close.pct_change(n=1)
+    exprs.append((
+        _hour_ret.rolling_mean(window_size=8, min_periods=1)
+        / (_vol_norm.rolling_mean(window_size=8, min_periods=1) + 1e-9)
+    ).clip(-1.0, 1.0).alias("funding_rate_momentum"))
+
     return df.select(exprs).drop_nulls()
 
 

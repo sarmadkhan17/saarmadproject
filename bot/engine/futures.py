@@ -75,16 +75,68 @@ class FuturesBot(BaseBot):
         except Exception as e:
             log.warning(f"Leverage setup failed: {e}")
 
+    def _liquidation_safe(self, symbol: str, side: str) -> bool:
+        """Return False if current price is within 2×ATR of estimated liquidation price."""
+        try:
+            price = self.get_price(symbol)
+            atr   = self.get_atr(symbol)
+            lev   = self._get_leverage()
+            if not price or not atr or lev <= 0:
+                return True
+            dist = price / lev  # distance to liquidation ≈ price / leverage
+            if dist < 2.0 * atr:
+                log.warning(f"[{symbol}] Liq too close: dist={dist:.4f} < 2×ATR={2*atr:.4f} — blocked")
+                return False
+            return True
+        except Exception:
+            return True  # fail-open
+
+    def _effective_leverage(self, regime: str) -> int:
+        """Halve leverage during HIGH_VOL or CRASH regimes."""
+        if regime in ("HIGH_VOL", "CRASH"):
+            return max(1, self.leverage // 2)
+        return self.leverage
+
     def _place_buy(self, symbol, amount):
         """Open LONG position."""
-        return self.place_order_with_confirmation(symbol, "buy", amount)
+        if not self._liquidation_safe(symbol, "buy"):
+            return None
+        regime = getattr(self, '_current_regime', 'RANGING')
+        lev = self._effective_leverage(regime)
+        if lev != self.leverage:
+            try:
+                self.exchange.set_leverage(lev, symbol)
+            except Exception:
+                pass
+        result = self.place_order_with_confirmation(symbol, "buy", amount)
+        if lev != self.leverage:
+            try:
+                self.exchange.set_leverage(self.leverage, symbol)
+            except Exception:
+                pass
+        return result
 
     def _post_scan(self, symbols):
         self._setup_leverage_for_symbols(symbols)
 
     def _place_sell(self, symbol, amount):
         """Open SHORT position."""
-        return self.place_order_with_confirmation(symbol, "sell", amount)
+        if not self._liquidation_safe(symbol, "sell"):
+            return None
+        regime = getattr(self, '_current_regime', 'RANGING')
+        lev = self._effective_leverage(regime)
+        if lev != self.leverage:
+            try:
+                self.exchange.set_leverage(lev, symbol)
+            except Exception:
+                pass
+        result = self.place_order_with_confirmation(symbol, "sell", amount)
+        if lev != self.leverage:
+            try:
+                self.exchange.set_leverage(self.leverage, symbol)
+            except Exception:
+                pass
+        return result
 
     def _place_close(self, symbol, amount, side):
         """

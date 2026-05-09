@@ -22,6 +22,7 @@ class RiskDecision:
     htf_bias: str = "NEUTRAL"
     hmm_regime: str = "UNKNOWN"
     profile: str = "BALANCED"
+    quality_score: float = 0.0
 
 
 class RiskDecisionAgent:
@@ -30,22 +31,51 @@ class RiskDecisionAgent:
         self.gnn        = gnn
         self.hmm_model  = hmm_regime_model
 
+    # ── Quality Score ─────────────────────────────────────────────────────────
+    def _compute_quality_score(self, ensemble, df_1h, regime_ctx: dict) -> float:
+        """
+        Composite quality score: confidence × trend_strength × volume_factor × regime_factor.
+        Replaces confidence-only gating. All profiles use this; CONFLUENCE also applies
+        its weighted scoring on top.
+        """
+        ctx = regime_ctx or {}
+        adx = ctx.get("adx", 25.0)
+        vol_ratio = ctx.get("vol_ratio", 1.0)
+
+        # Trend strength (ADX 15→40 maps to 0.2→1.0)
+        trend_factor = min(1.0, max(0.2, (adx - 15.0) / 25.0))
+
+        # Volume factor (vol_ratio 0.5→2.0 maps to 0.3→1.0)
+        volume_factor = min(1.0, max(0.3, (vol_ratio - 0.5) / 1.5))
+
+        # Regime factor — rewards trending, penalises choppy
+        regime_scores = {
+            "STRONG_TREND":   1.00,
+            "TRENDING":       0.90,
+            "WEAK_TREND":     0.72,
+            "RANGING":        0.52,
+            "HIGH_VOLATILITY":0.32,
+            "CHOPPY":         0.10,
+            "CRASH":          0.08,
+        }
+        regime = ctx.get("hmm_regime", ctx.get("regime", "RANGING"))
+        regime_factor = regime_scores.get(regime, 0.52)
+
+        return round(ensemble.confidence * trend_factor * volume_factor * regime_factor, 4)
+
+    # ── Confluence Score (CONFLUENCE profile) ─────────────────────────────────
     def _confluence_score(self, ensemble, df_1h, regime_ctx: dict, profile) -> tuple:
         """Compute weighted confluence score and regime-dynamic threshold.
         Returns (score, threshold).
         """
-        # Dimension 1: ensemble strength (0-1)
         net_score = getattr(ensemble, 'net_score', 0.0) or 0.0
         d_ensemble = min(abs(net_score) / 0.5, 1.0)
 
-        # Dimension 2: agent agreement fraction (0-1)
         total = max(ensemble.agents_total, 1)
         d_agreement = ensemble.agents_agreeing / total
 
-        # Dimension 3: ML confidence normalised from [0.35, 0.95] → [0,1]
         d_ml = max(0.0, min(1.0, (ensemble.confidence - 0.35) / 0.60))
 
-        # Dimension 4: volume spike normalised (current bar vs 20-bar mean)
         try:
             vol_series = df_1h["volume"].dropna()
             if len(vol_series) >= 21:
@@ -58,9 +88,9 @@ class RiskDecisionAgent:
             vol_ratio = 1.0
         d_volume = max(0.0, min((vol_ratio - 1.0) / 2.0, 1.0))
 
-        # Dimension 5: regime alignment score
         regime_scores = {"TRENDING": 1.0, "STRONG_TREND": 1.0,
-                         "RANGING": 0.7, "HIGH_VOL": 0.4, "CRASH": 0.1}
+                         "WEAK_TREND": 0.65, "RANGING": 0.6,
+                         "HIGH_VOLATILITY": 0.35, "CRASH": 0.1, "CHOPPY": 0.05}
         hmm = regime_ctx.get("hmm_regime", regime_ctx.get("regime", "RANGING"))
         d_regime = regime_scores.get(hmm, 0.5)
 
@@ -73,9 +103,12 @@ class RiskDecisionAgent:
         thresholds = {
             "TRENDING":     profile.confluence_threshold_trending,
             "STRONG_TREND": profile.confluence_threshold_trending,
+            "WEAK_TREND":   profile.confluence_threshold_ranging,
             "RANGING":      profile.confluence_threshold_ranging,
             "HIGH_VOL":     profile.confluence_threshold_high_vol,
+            "HIGH_VOLATILITY": profile.confluence_threshold_high_vol,
             "CRASH":        profile.confluence_threshold_crash,
+            "CHOPPY":       profile.confluence_threshold_crash,
         }
         threshold = thresholds.get(hmm, profile.confluence_threshold_ranging)
 
@@ -90,6 +123,19 @@ class RiskDecisionAgent:
         action = ensemble.action
         conf   = ensemble.confidence
 
+        # ── Gate 0: Stale data check ─────────────────────────────────
+        try:
+            import pandas as pd
+            last_idx = df_1h.index[-1]
+            if hasattr(last_idx, 'tzinfo') and last_idx.tzinfo is None:
+                last_idx = last_idx.tz_localize("UTC")
+            candle_age_h = (pd.Timestamp.now(tz="UTC") - last_idx).total_seconds() / 3600
+            if candle_age_h > 4:
+                reasons.append(f"stale data: last candle {candle_age_h:.1f}h ago")
+                return RiskDecision(False, reasons, conf, profile=profile.name)
+        except Exception:
+            pass
+
         # ── Confluence Gate (CONFLUENCE profile only) ────────────────
         if getattr(profile, 'use_confluence_scoring', False):
             c_score, c_threshold = self._confluence_score(ensemble, df_1h, regime_ctx or {}, profile)
@@ -102,7 +148,7 @@ class RiskDecisionAgent:
                 reasons.append(f"confluence={c_score:.3f} < {c_threshold:.3f} ({hmm_for_log})")
                 return RiskDecision(False, reasons, conf, profile=profile.name)
             reasons.append(f"confluence={c_score:.3f} >= {c_threshold:.3f}")
-            # Skip boolean gates 1-3; fall through to Gate 4 onwards
+            # Skip boolean gates 1-3; fall through to Gate 3.5 onwards
 
         else:
             # ── Gate 1: Confidence ───────────────────────────────────────
@@ -115,16 +161,22 @@ class RiskDecisionAgent:
                 reasons.append(
                     f"agents={ensemble.agents_agreeing}/{ensemble.agents_total} < {profile.min_agent_agreement}"
                 )
-                if profile.name != "AGGRESSIVE":
-                    return RiskDecision(False, reasons, conf, profile=profile.name)
+                return RiskDecision(False, reasons, conf, profile=profile.name)
 
             # ── Gate 3: SMC sub-checks minimum ───────────────────────────
             smc_sig = next((s for s in ensemble.signals if s.agent == "smc"), None)
             if smc_sig and smc_sig.confidence == 0 and "sub-checks" in smc_sig.reasoning:
                 reasons.append(f"smc={smc_sig.reasoning}")
 
+        # ── Gate 3.5: ADX minimum (per-profile trend quality gate) ───
+        hmm_regime = (regime_ctx or {}).get("hmm_regime", "UNKNOWN")
+        adx = (regime_ctx or {}).get("adx", 25.0)
+        adx_min = getattr(profile, 'adx_min', 20.0)
+        if adx < adx_min:
+            reasons.append(f"ADX={adx:.1f} < profile_min={adx_min:.0f} ({profile.name})")
+            return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+
         # ── Gate 4: Regime gate ──────────────────────────────────────
-        hmm_regime = "UNKNOWN"
         if regime_ctx:
             hmm_regime = regime_ctx.get("hmm_regime", "UNKNOWN")
             if not regime_ctx.get("gate", True):
@@ -138,9 +190,6 @@ class RiskDecisionAgent:
                 return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
 
         # ── Gate 4b: Contra-trend breadth confidence penalty ─────────
-        # When market breadth is 50–60% bullish (not enough to fully block shorts,
-        # but enough to demand higher confidence for counter-trend entries).
-        # Penalty scales: +0% at 50% breadth → +15% at 60%+.
         if regime_ctx:
             breadth      = regime_ctx.get("breadth",      0.5)
             bear_breadth = regime_ctx.get("bear_breadth", 0.5)
@@ -211,7 +260,8 @@ class RiskDecisionAgent:
 
         amount, est_usdt = self.risk.get_position_size(
             confidence=conf, balance=balance, price=price,
-            df=df_1h, recent_trades=all_trades or [], regime_ctx=regime_ctx, all_agree=(ensemble.agents_agreeing >= 3),
+            df=df_1h, recent_trades=all_trades or [], regime_ctx=regime_ctx,
+            all_agree=(ensemble.agents_agreeing >= 3), open_trades=open_trades,
         )
         if est_usdt < 10:
             reasons.append(f"size too small: ${est_usdt:.2f}")
@@ -233,9 +283,18 @@ class RiskDecisionAgent:
             reasons.append(f"gnn: {gnn_msg}")
             return RiskDecision(False, reasons, conf, profile=profile.name, htf_bias=htf_bias, hmm_regime=hmm_regime)
 
+        # ── Gate 11: Composite quality score (all profiles) ──────────
+        # quality = confidence × trend_strength × volume_factor × regime_factor
+        quality = self._compute_quality_score(ensemble, df_1h, regime_ctx)
+        min_quality = getattr(profile, 'min_quality_score', 0.40)
+        if quality < min_quality:
+            reasons.append(f"quality={quality:.3f} < min={min_quality:.2f} ({profile.name})")
+            return RiskDecision(False, reasons, conf, profile=profile.name,
+                                htf_bias=htf_bias, hmm_regime=hmm_regime, quality_score=quality)
+
         # ── ALL PASSED ─────────────────────────────────────────────
         return RiskDecision(
             approved=True, reasons=reasons if reasons else ["all checks passed"],
             adjusted_conf=conf, position_size=amount, est_usdt=est_usdt,
-            htf_bias=htf_bias, hmm_regime=hmm_regime,
+            htf_bias=htf_bias, hmm_regime=hmm_regime, quality_score=quality,
         )

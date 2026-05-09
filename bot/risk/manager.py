@@ -23,16 +23,22 @@ BOT_MODE = os.environ.get("BOT_MODE", "spot")
 
 
 class CorrelationFilter:
+    # btc_correlated is a cross-group limit: max 2 of these highly-correlated majors simultaneously
     GROUPS = {
-        "large_cap": ["BTC/USDT","ETH/USDT"],
-        "layer1":    ["SOL/USDT","ADA/USDT","AVAX/USDT","DOT/USDT"],
-        "defi":      ["LINK/USDT","UNI/USDT","AAVE/USDT"],
-        "meme":      ["DOGE/USDT","SHIB/USDT"],
-        "exchange":  ["BNB/USDT"],
-        "payments":  ["XRP/USDT","XLM/USDT"],
-        "layer2":    ["MATIC/USDT","OP/USDT","ARB/USDT"],
+        "btc_correlated": ["BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","AVAX/USDT","XRP/USDT"],
+        "large_cap":      ["BTC/USDT","ETH/USDT"],
+        "layer1":         ["SOL/USDT","ADA/USDT","AVAX/USDT","DOT/USDT"],
+        "defi":           ["LINK/USDT","UNI/USDT","AAVE/USDT"],
+        "meme":           ["DOGE/USDT","SHIB/USDT"],
+        "exchange":       ["BNB/USDT"],
+        "payments":       ["XRP/USDT","XLM/USDT"],
+        "layer2":         ["MATIC/USDT","OP/USDT","ARB/USDT"],
     }
-    MAX_PER_GROUP = {"large_cap":1,"layer1":2,"defi":1,"meme":1,"exchange":1,"payments":1,"layer2":1}
+    MAX_PER_GROUP = {
+        "btc_correlated": 2,
+        "large_cap": 1, "layer1": 2, "defi": 1,
+        "meme": 1, "exchange": 1, "payments": 1, "layer2": 1,
+    }
 
     def is_allowed(self, symbol, open_trades):
         open_symbols = [t["symbol"] for t in open_trades]
@@ -141,10 +147,18 @@ class MarketRegimeGate:
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
 
-        if adx_val < 20 and vol_ratio < 0.8 and 0.30 < breadth < 0.60:
+        # CHOPPY: truly directionless low-momentum market — no new entries allowed
+        if adx_val < 18 or (adx_val < 22 and vol_ratio < 0.85 and abs(breadth - 0.5) < 0.12):
+            return dict(regime="CHOPPY", gate=False,
+                        allow_longs=False, allow_shorts=False,
+                        min_conf=0.75, size_mult=0.0,
+                        breadth=breadth, bear_breadth=bear_breadth,
+                        vol_ratio=vol_ratio, adx=adx_val)
+
+        if adx_val < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.60:
             return dict(regime="RANGING", gate=True,
                         allow_longs=True, allow_shorts=True,
-                        min_conf=0.58, size_mult=0.6,
+                        min_conf=0.62, size_mult=0.55,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
 
@@ -152,9 +166,39 @@ class MarketRegimeGate:
         return dict(regime="WEAK_TREND", gate=True,
                     allow_longs=bear_breadth < 0.60,
                     allow_shorts=breadth < 0.60,
-                    min_conf=0.45, size_mult=0.9,
+                    min_conf=0.50, size_mult=0.85,
                     breadth=breadth, bear_breadth=bear_breadth,
                     vol_ratio=vol_ratio, adx=adx_val)
+
+    def _compute_from_values(self, adx: float, vol_ratio: float, breadth: float,
+                             bear_breadth: float, chg_4h: float, chg_24h: float,
+                             btc_bullish: bool = False, btc_bearish: bool = False) -> dict:
+        """Test helper: run classification logic without fetching live data."""
+        if chg_4h < -0.05 or chg_24h < -0.10:
+            return dict(regime="CRASH", gate=False, allow_longs=False, allow_shorts=True,
+                        min_conf=0.65, size_mult=0.4,
+                        breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
+        if vol_ratio > 2.0:
+            return dict(regime="HIGH_VOLATILITY", gate=False, allow_longs=False, allow_shorts=False,
+                        min_conf=0.70, size_mult=0.3,
+                        breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
+        if adx > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
+            return dict(regime="STRONG_TREND", gate=True,
+                        allow_longs=btc_bullish, allow_shorts=btc_bearish,
+                        min_conf=0.45, size_mult=1.2,
+                        breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
+        if adx < 18 or (adx < 22 and vol_ratio < 0.85 and abs(breadth - 0.5) < 0.12):
+            return dict(regime="CHOPPY", gate=False, allow_longs=False, allow_shorts=False,
+                        min_conf=0.75, size_mult=0.0,
+                        breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
+        if adx < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.60:
+            return dict(regime="RANGING", gate=True, allow_longs=True, allow_shorts=True,
+                        min_conf=0.62, size_mult=0.55,
+                        breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
+        return dict(regime="WEAK_TREND", gate=True,
+                    allow_longs=bear_breadth < 0.60, allow_shorts=breadth < 0.60,
+                    min_conf=0.50, size_mult=0.85,
+                    breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
 
     def _neutral(self) -> dict:
         return dict(regime="UNKNOWN", gate=True,
@@ -278,73 +322,133 @@ class ATRTrailingStop:
 
 
 class KellyCriterionSizer:
-    KELLY_FRACTION = 0.25
-    # pos_pct is margin as fraction of balance; usdt = balance * pos_pct * leverage (notional)
-    MIN_PCT        = 0.005   # 0.5% margin floor — prevents micro-trades
-    MAX_PCT        = 0.04    # 4% margin hard ceiling
-    BASE_PCT       = 0.015   # 1.5% margin when < 10 closed trades
+    """
+    Volatility-adjusted fractional Kelly position sizer.
+
+    pos_pct = base_risk × kelly_scale × vol_factor × regime_factor × conf_factor × corr_factor × streak_factor
+
+    base_risk  — mode-calibrated starting point (spot=0.8%, futures=0.4% of balance as margin)
+    kelly_scale — derived from last 20 closed trades, capped at [0.10, 0.25] fractional Kelly
+    vol_factor  — smooth ATR-aware reduction (2% ATR→1.0; 4% ATR→0.5; 6%+→0.4)
+    regime_factor — regime size_mult + ADX modifier; capped at [0.30, 1.20]
+    conf_factor — narrow [0.85, 1.0]; confidence contributes at most ±15%
+    corr_factor — 10% per open position (portfolio concentration penalty)
+    streak_factor — 0.5 if ≥3 of last 5 closed trades are losses
+    """
+
+    KELLY_FRAC_MIN     = 0.10
+    KELLY_FRAC_MAX     = 0.25
+    KELLY_FRAC_DEFAULT = 0.15   # cold-start (< 10 closed trades)
+
+    MIN_PCT = 0.003   # 0.3% margin floor — prevents sub-$10 trades
+
+    BASE_PCT = {"spot": 0.008, "futures": 0.004}  # baseline margin % of balance
+    MAX_PCT  = {"spot": 0.020, "futures": 0.015}  # hard cap per mode
+
+    # Reduce effective notional in risky regimes without touching exchange leverage
+    _REGIME_LEV_SCALE = {
+        "STRONG_TREND":    1.00,
+        "TRENDING":        1.00,
+        "WEAK_TREND":      0.85,
+        "RANGING":         0.80,
+        "HIGH_VOLATILITY": 0.65,
+        "CRASH":           0.55,
+        "CHOPPY":          0.50,
+    }
 
     def __init__(self, config=None):
         cfg = config or {}
         self.leverage = cfg.get("risk", {}).get("leverage", 1)
 
-    def calculate(self, confidence, balance, price, atr_pct, regime, recent_trades, all_agree=False):
+    def calculate(self, confidence, balance, price, atr_pct, regime, recent_trades,
+                  open_trades=None, all_agree=False):
+        mode = BOT_MODE
+        base = self.BASE_PCT.get(mode, 0.008)
+
+        # ── 1. Fractional Kelly (0.10–0.25 from trade history) ────────
+        kelly_frac = self._kelly_fraction(recent_trades)
+        kelly_scale = kelly_frac / self.KELLY_FRAC_DEFAULT   # 1.0 at cold-start
+
+        # ── 2. Volatility factor (smooth ATR-aware) ───────────────────
+        # 2% ATR → 1.0 | 4% → 0.5 | 6%+ → 0.4 floor | <2% → capped at 1.0
+        vol_factor = round(max(0.40, min(1.0, 0.02 / max(atr_pct, 0.001))), 4)
+
+        # ── 3. Regime factor (size_mult + ADX modifier) ───────────────
+        size_mult = regime.get("size_mult", 1.0)
+        adx = regime.get("adx", 25.0)
+        if   adx >= 35: adx_mod =  0.15
+        elif adx >= 28: adx_mod =  0.05
+        elif adx <  20: adx_mod = -0.20
+        elif adx <  25: adx_mod = -0.10
+        else:           adx_mod =  0.00
+        regime_factor = round(max(0.30, min(1.20, size_mult + adx_mod)), 4)
+
+        # ── 4. Confidence factor (narrow band — never dominant) ────────
+        # conf=0.50 → 0.85 | conf=0.80 → 1.0 | max swing ±15%
+        conf_factor = round(0.85 + min(0.15, max(0.0, (confidence - 0.50) * 0.5)), 4)
+
+        # ── 5. Correlation / concentration factor ─────────────────────
+        n_open = len(open_trades) if open_trades else 0
+        corr_factor = round(max(0.60, 1.0 - n_open * 0.10), 4)
+
+        # ── 6. Losing streak guard ─────────────────────────────────────
+        recent_5 = [t for t in recent_trades if t.get("status") == "closed"][-5:]
+        if len(recent_5) >= 3 and sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 3:
+            streak_factor = 0.5
+            log.warning("Losing streak — sizing halved")
+        else:
+            streak_factor = 1.0
+
+        # ── Combine ────────────────────────────────────────────────────
+        pos_pct = (base * kelly_scale * vol_factor * regime_factor
+                   * conf_factor * corr_factor * streak_factor)
+
+        # ── Hard cap (mode-aware, slight bonus on all-agree STRONG_TREND) ──
+        cap = self.MAX_PCT.get(mode, 0.015)
+        if all_agree and confidence >= 0.68 and regime.get("regime") == "STRONG_TREND":
+            cap = min(cap * 1.15, cap + 0.004)
+        pos_pct = max(self.MIN_PCT, min(cap, pos_pct))
+
+        # ── Leverage scaling by regime ─────────────────────────────────
+        regime_name = regime.get("regime", "RANGING")
+        lev_scale   = self._REGIME_LEV_SCALE.get(regime_name, 0.85)
+        effective_lev = self.leverage * lev_scale
+
+        usdt   = balance * pos_pct * effective_lev
+        amount = usdt / price
+
+        log.debug(
+            f"Sizer [{mode}]: base={base*100:.2f}% kelly={kelly_frac:.2f}(×{kelly_scale:.2f}) "
+            f"vol={vol_factor:.2f} regime={regime_factor:.2f} conf={conf_factor:.2f} "
+            f"corr={corr_factor:.2f} streak={streak_factor:.1f} "
+            f"→ {pos_pct*100:.3f}% × {effective_lev:.1f}x = ${usdt:.2f} "
+            f"(cap={cap*100:.1f}% adx={adx:.0f} {regime_name})"
+        )
+        return amount, usdt
+
+    def _kelly_fraction(self, recent_trades: list) -> float:
+        """Fractional Kelly from last 20 closed trades, capped at [0.10, 0.25]."""
         closed = [t for t in recent_trades if t.get("status") == "closed"]
         if len(closed) < 10:
-            pos_pct = self.BASE_PCT * (0.6 + confidence * 0.8)
-        else:
-            last_20 = closed[-20:]
-            pct_returns = []
-            for t in last_20:
-                entry_price = float(t.get("price", 0))
-                amount      = float(t.get("amount", 0))
-                pnl         = float(t.get("pnl", 0))
-                if entry_price > 0 and amount > 0:
-                    # Use notional (not margin) so leverage doesn't inflate the payoff ratio.
-                    # pct_return is the actual price-movement return, comparable across leverage levels.
-                    invested = entry_price * amount
-                    pct_returns.append(pnl / (invested + 1e-9))
-
-            if len(pct_returns) >= 5:
-                wins = [r for r in pct_returns if r > 0]
-                losses = [abs(r) for r in pct_returns if r <= 0]
-                if wins and losses:
-                    wr = len(wins) / len(pct_returns)
-                    avg_win = np.mean(wins)
-                    avg_los = np.mean(losses)
-                    payoff_ratio = avg_win / (avg_los + 1e-9)
-                    kelly = (wr * payoff_ratio - (1 - wr)) / (payoff_ratio + 1e-9)
-                    kelly = max(0, kelly)
-                    pos_pct = kelly * self.KELLY_FRACTION * (0.5 + confidence * 0.5)
-                else:
-                    pos_pct = self.BASE_PCT
-            else:
-                pos_pct = self.BASE_PCT * (0.6 + confidence * 0.8)
-
-        if atr_pct > 0.04:    pos_pct *= 0.6
-        elif atr_pct > 0.02:  pos_pct *= 0.8
-        pos_pct *= regime.get("size_mult", 1.0)
-
-        # Losing streak: halve size if 3 of last 5 closed trades are losses
-        recent_5 = [t for t in recent_trades if t.get("status") == "closed"][-5:]
-        if len(recent_5) >= 3:
-            if sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 3:
-                pos_pct *= 0.5
-                log.warning(f"Losing streak — reducing size to {pos_pct*100:.1f}%")
-
-        # Hard caps: pos_pct is margin fraction; notional = pos_pct * leverage * balance
-        # At 5x leverage: 2.5% margin cap → 12.5% notional → ~$500 max on $4k balance
-        if all_agree and confidence >= 0.70 and regime.get("regime") == "STRONG_TREND":
-            cap = 0.040
-        elif all_agree and confidence >= 0.60:
-            cap = 0.030
-        else:
-            cap = 0.025
-        pos_pct = max(self.MIN_PCT, min(cap, pos_pct))
-        usdt    = balance * pos_pct * self.leverage
-        amount  = usdt / price
-        log.debug(f"Kelly size: {pos_pct*100:.2f}% margin × {self.leverage}× lev = ${usdt:.2f} notional cap={cap*100:.1f}% (conf={confidence:.2f} agree={all_agree} regime={regime.get('regime','?')})")
-        return amount, usdt
+            return self.KELLY_FRAC_DEFAULT
+        last_20 = closed[-20:]
+        pct_returns = []
+        for t in last_20:
+            ep  = float(t.get("price", 0))
+            amt = float(t.get("amount", 0))
+            pnl = float(t.get("pnl", 0))
+            if ep > 0 and amt > 0:
+                pct_returns.append(pnl / (ep * amt + 1e-9))
+        if len(pct_returns) < 5:
+            return self.KELLY_FRAC_DEFAULT
+        wins   = [r for r in pct_returns if r > 0]
+        losses = [abs(r) for r in pct_returns if r <= 0]
+        if not wins or not losses:
+            return self.KELLY_FRAC_DEFAULT
+        wr     = len(wins) / len(pct_returns)
+        payoff = np.mean(wins) / (np.mean(losses) + 1e-9)
+        full_k = max(0.0, (wr * payoff - (1 - wr)) / (payoff + 1e-9))
+        return round(max(self.KELLY_FRAC_MIN, min(self.KELLY_FRAC_MAX, full_k)), 4)
 
 
 class PortfolioHeatTracker:
@@ -539,16 +643,20 @@ class RiskManager:
     def detect_market_regime(self, feed, watchlist: list) -> dict:
         return self.market_gate.detect(feed, watchlist)
 
-    def get_position_size(self, confidence, balance, price, df, recent_trades, regime_ctx=None, all_agree=False):
-        regime = dict(regime_ctx) if regime_ctx else self.market_gate._neutral()
-        high  = df["high"]
-        low   = df["low"]
-        close = df["close"]
-        tr    = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        atr   = tr.rolling(14).mean().iloc[-1]
+    def get_position_size(self, confidence, balance, price, df, recent_trades,
+                           regime_ctx=None, all_agree=False, open_trades=None):
+        regime  = dict(regime_ctx) if regime_ctx else self.market_gate._neutral()
+        high    = df["high"]
+        low     = df["low"]
+        close   = df["close"]
+        tr      = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr     = tr.rolling(14).mean().iloc[-1]
         atr_pct = float(atr / (df["close"].iloc[-1] + 1e-9))
         log.debug(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f}")
-        return self.sizer.calculate(confidence, balance, price, atr_pct, regime, recent_trades, all_agree=all_agree)
+        return self.sizer.calculate(
+            confidence, balance, price, atr_pct, regime, recent_trades,
+            open_trades=open_trades, all_agree=all_agree,
+        )
 
     def record_trade_result(self, pnl, balance):
         self.breaker.record_trade(pnl, balance)

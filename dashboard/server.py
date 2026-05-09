@@ -618,6 +618,131 @@ def detailed_health():
     })
 
 
+@app.route("/api/agent_votes")
+def api_agent_votes():
+    """Per-symbol breakdown of agent buy/sell/agree scores from recent signals."""
+    combined = {}
+    for fname in ("state.json", "futures_state.json"):
+        state = load_state(fname)
+        for sig in state.get("signals", []):
+            sym = sig.get("symbol", "")
+            ind = sig.get("indicators", {})
+            if not sym:
+                continue
+            if sym not in combined:
+                combined[sym] = {"buy_score": [], "sell_score": [], "agree": [], "action": []}
+            combined[sym]["buy_score"].append(float(ind.get("buy_score", 0)))
+            combined[sym]["sell_score"].append(float(ind.get("sell_score", 0)))
+            combined[sym]["agree"].append(int(ind.get("agents_agree", 0)))
+            combined[sym]["action"].append(sig.get("action", "HOLD"))
+    result = {}
+    for sym, d in combined.items():
+        n = len(d["action"]) or 1
+        result[sym] = {
+            "avg_buy_score":  round(sum(d["buy_score"]) / n, 4),
+            "avg_sell_score": round(sum(d["sell_score"]) / n, 4),
+            "avg_agree":      round(sum(d["agree"]) / n, 2),
+            "buy_pct":        round(d["action"].count("BUY") / n * 100, 1),
+            "sell_pct":       round(d["action"].count("SELL") / n * 100, 1),
+            "hold_pct":       round(d["action"].count("HOLD") / n * 100, 1),
+            "count":          n,
+        }
+    return jsonify(result)
+
+
+@app.route("/api/confidence_heatmap")
+def api_confidence_heatmap():
+    """Per-symbol mean confidence and action distribution across last 200 signals."""
+    combined = {}
+    for fname in ("state.json", "futures_state.json"):
+        state = load_state(fname)
+        for sig in state.get("signals", [])[-200:]:
+            sym = sig.get("symbol", "")
+            if not sym:
+                continue
+            if sym not in combined:
+                combined[sym] = {"conf": [], "action": []}
+            combined[sym]["conf"].append(float(sig.get("confidence", 0)))
+            combined[sym]["action"].append(sig.get("action", "HOLD"))
+    result = {}
+    for sym, d in combined.items():
+        n = len(d["action"]) or 1
+        result[sym] = {
+            "mean_confidence": round(sum(d["conf"]) / n, 4),
+            "buy_pct":         round(d["action"].count("BUY") / n * 100, 1),
+            "sell_pct":        round(d["action"].count("SELL") / n * 100, 1),
+            "hold_pct":        round(d["action"].count("HOLD") / n * 100, 1),
+            "count":           n,
+        }
+    return jsonify(result)
+
+
+@app.route("/api/liquidation_monitor")
+def api_liquidation_monitor():
+    """Estimated liquidation price and distance % for each open futures trade."""
+    state = load_state("futures_state.json")
+    result = []
+    for t in state.get("trades", []):
+        if t.get("status") != "open":
+            continue
+        try:
+            entry   = float(t.get("price", 0))
+            lev     = float(t.get("leverage", 5))
+            side    = t.get("side", "long")
+            symbol  = t.get("symbol", "")
+            if entry <= 0 or lev <= 0:
+                continue
+            if side == "long":
+                liq_price = entry * (1.0 - 1.0 / lev)
+                dist_pct  = (entry - liq_price) / entry * 100
+            else:
+                liq_price = entry * (1.0 + 1.0 / lev)
+                dist_pct  = (liq_price - entry) / entry * 100
+            result.append({
+                "symbol":       symbol,
+                "side":         side,
+                "entry_price":  entry,
+                "leverage":     lev,
+                "liq_price":    round(liq_price, 6),
+                "dist_pct":     round(dist_pct, 2),
+                "trade_id":     t.get("id", ""),
+            })
+        except Exception:
+            continue
+    return jsonify(result)
+
+
+@app.route("/api/execution_queue")
+def api_execution_queue():
+    """Return pending bot control commands from bot_control.json."""
+    p = DATA / "bot_control.json"
+    if not p.exists():
+        return jsonify({})
+    try:
+        with open(p) as f:
+            return jsonify(json.load(f))
+    except Exception:
+        return jsonify({})
+
+
+@app.route("/api/regime_detail")
+def api_regime_detail():
+    """Full regime context dict from live_strategy in state files."""
+    result = {}
+    for fname, mode in (("state.json", "spot"), ("futures_state.json", "futures")):
+        state = load_state(fname)
+        ls = state.get("live_strategy", {})
+        result[mode] = {
+            "regime":        ls.get("market_regime", "UNKNOWN"),
+            "hmm_regime":    ls.get("hmm_regime", "UNKNOWN"),
+            "eff_min_conf":  ls.get("eff_min_conf"),
+            "eff_size_mult": ls.get("eff_size_mult"),
+            "profile":       ls.get("profile"),
+            "updated_at":    ls.get("updated_at"),
+        }
+    return jsonify(result)
+
+
 ENV_PATH = Path.home() / "cryptobot_v3" / ".env"
 BOT_ROOT_PATH = Path.home() / "cryptobot_v3"
 

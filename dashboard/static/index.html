@@ -1153,6 +1153,38 @@ td {
     </div>
   </div>
 
+  <div class="section-label">Confidence Heatmap</div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Signal Confidence by Symbol</span>
+      <span class="panel-badge">Last 200 Signals</span>
+    </div>
+    <div class="table-wrap" style="max-height:220px">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Mean Conf</th><th>BUY%</th><th>SELL%</th><th>HOLD%</th><th>Count</th>
+        </tr></thead>
+        <tbody id="confHeatBody"><tr><td colspan="6" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section-label" id="liqMonLabel" style="display:none">Liquidation Monitor</div>
+  <div class="panel" id="liqMonPanel" style="display:none">
+    <div class="panel-header">
+      <span class="panel-title">Open Futures Positions — Liq Distance</span>
+      <span class="panel-badge" id="liqCount">—</span>
+    </div>
+    <div class="table-wrap" style="max-height:200px">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Side</th><th>Entry</th><th>Leverage</th><th>Liq Price</th><th>Dist%</th>
+        </tr></thead>
+        <tbody id="liqBody"><tr><td colspan="6" class="empty">No open futures positions</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
 </div>
 
 <!-- ═══════════ TRADES TAB ═══════════ -->
@@ -1279,6 +1311,33 @@ td {
     </div>
   </div>
 
+  <div class="section-label">Agent Analytics</div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Agent Vote Breakdown</span>
+      <span class="panel-badge">Per Symbol</span>
+    </div>
+    <div class="table-wrap" style="max-height:220px">
+      <table>
+        <thead><tr>
+          <th>Symbol</th><th>Avg Buy</th><th>Avg Sell</th><th>Avg Agree</th><th>BUY%</th><th>SELL%</th><th>HOLD%</th>
+        </tr></thead>
+        <tbody id="agentVotesBody"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section-label">Execution Queue</div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Pending Bot Commands</span>
+      <span class="panel-badge" id="eqBadge">Empty</span>
+    </div>
+    <div id="execQueueBody" style="padding:10px 16px;font-family:var(--mono);font-size:11px;color:var(--text2)">
+      No pending commands
+    </div>
+  </div>
+
   <div class="section-label">Strategy Configuration</div>
   <div class="panel">
     <div class="panel-header">
@@ -1294,8 +1353,10 @@ td {
     </div>
     <div class="profile-live" id="profileLiveInfo" style="display:none">
       <div class="profile-live-item">Eff Min Conf: <span id="plEffConf">-</span></div>
-      <div class="profile-live-item">Regime: <span id="plRegime">-</span></div>
+      <div class="profile-live-item">Market Regime: <span id="plRegime">-</span></div>
+      <div class="profile-live-item">HMM Regime: <span id="plHmmRegime">-</span></div>
       <div class="profile-live-item">Size Mult: <span id="plSize">-</span></div>
+      <div class="profile-live-item">Profile: <span id="plProfileName">-</span></div>
       <div class="profile-live-item">Updated: <span id="plUpdated">-</span></div>
     </div>
     <div class="cfg-actions" style="justify-content:center">
@@ -2095,6 +2156,105 @@ function updateCircuitBreaker() {
   });
 }
 
+/* ─── CONFIDENCE HEATMAP ─── */
+function updateConfHeatmap() {
+  get('/api/confidence_heatmap', function(d) {
+    var rows = Object.entries(d).sort(function(a,b){ return b[1].mean_confidence - a[1].mean_confidence; });
+    var html = rows.map(function(entry) {
+      var sym = entry[0], v = entry[1];
+      var c = v.mean_confidence >= 0.65 ? '#22c55e' : v.mean_confidence >= 0.50 ? '#f59e0b' : '#ef4444';
+      return '<tr><td style="font-weight:600">' + sym.replace('/USDT','') + '</td>' +
+        '<td style="color:' + c + '">' + (v.mean_confidence*100).toFixed(1) + '%</td>' +
+        '<td style="color:var(--buy)">' + v.buy_pct.toFixed(1) + '%</td>' +
+        '<td style="color:var(--sell)">' + v.sell_pct.toFixed(1) + '%</td>' +
+        '<td style="color:var(--text2)">' + v.hold_pct.toFixed(1) + '%</td>' +
+        '<td style="color:var(--text2)">' + v.count + '</td></tr>';
+    }).join('');
+    document.getElementById('confHeatBody').innerHTML = html || '<tr><td colspan="6" class="empty">No signal data yet</td></tr>';
+  });
+}
+
+/* ─── LIQUIDATION MONITOR ─── */
+function updateLiqMonitor() {
+  get('/api/liquidation_monitor', function(d) {
+    var panel = document.getElementById('liqMonPanel');
+    var label = document.getElementById('liqMonLabel');
+    if (!d || d.length === 0) {
+      if (panel) panel.style.display = 'none';
+      if (label) label.style.display = 'none';
+      return;
+    }
+    if (panel) panel.style.display = '';
+    if (label) label.style.display = '';
+    document.getElementById('liqCount').textContent = d.length + ' position' + (d.length > 1 ? 's' : '');
+    var html = d.map(function(t) {
+      var dc = t.dist_pct < 5 ? '#ef4444' : t.dist_pct < 10 ? '#f59e0b' : '#22c55e';
+      return '<tr>' +
+        '<td style="font-weight:600">' + t.symbol.replace('/USDT','') + '</td>' +
+        '<td style="color:' + (t.side === 'long' ? 'var(--buy)' : 'var(--sell)') + '">' + t.side.toUpperCase() + '</td>' +
+        '<td>' + t.entry_price.toFixed(4) + '</td>' +
+        '<td>' + t.leverage + 'x</td>' +
+        '<td style="color:#ef4444">' + t.liq_price.toFixed(4) + '</td>' +
+        '<td style="color:' + dc + ';font-weight:600">' + t.dist_pct.toFixed(2) + '%</td></tr>';
+    }).join('');
+    document.getElementById('liqBody').innerHTML = html;
+  });
+}
+
+/* ─── AGENT VOTES ─── */
+function updateAgentVotes() {
+  get('/api/agent_votes', function(d) {
+    var rows = Object.entries(d).sort(function(a,b){ return b[1].buy_pct - a[1].buy_pct; });
+    var html = rows.map(function(entry) {
+      var sym = entry[0], v = entry[1];
+      return '<tr>' +
+        '<td style="font-weight:600">' + sym.replace('/USDT','') + '</td>' +
+        '<td style="color:var(--buy)">'  + (v.avg_buy_score  * 100).toFixed(1) + '%</td>' +
+        '<td style="color:var(--sell)">' + (v.avg_sell_score * 100).toFixed(1) + '%</td>' +
+        '<td>' + v.avg_agree.toFixed(1) + '</td>' +
+        '<td style="color:var(--buy)">'  + v.buy_pct.toFixed(0)  + '%</td>' +
+        '<td style="color:var(--sell)">' + v.sell_pct.toFixed(0) + '%</td>' +
+        '<td style="color:var(--text2)">'+ v.hold_pct.toFixed(0) + '%</td></tr>';
+    }).join('');
+    document.getElementById('agentVotesBody').innerHTML = html || '<tr><td colspan="7" class="empty">No vote data yet</td></tr>';
+  });
+}
+
+/* ─── EXECUTION QUEUE ─── */
+function updateExecQueue() {
+  get('/api/execution_queue', function(d) {
+    var el    = document.getElementById('execQueueBody');
+    var badge = document.getElementById('eqBadge');
+    var keys  = d ? Object.keys(d) : [];
+    if (keys.length === 0) {
+      if (el)    el.textContent = 'No pending commands';
+      if (badge) badge.textContent = 'Empty';
+      return;
+    }
+    if (badge) badge.textContent = keys.length + ' command' + (keys.length > 1 ? 's' : '');
+    if (el) el.innerHTML = '<pre style="margin:0;white-space:pre-wrap;font-size:11px">' + JSON.stringify(d, null, 2) + '</pre>';
+  });
+}
+
+/* ─── REGIME DETAIL ─── */
+function updateRegimeDetail() {
+  get('/api/regime_detail', function(d) {
+    if (!d) return;
+    var modeEl = document.getElementById('exchangeMode');
+    var mode = (modeEl && modeEl.textContent.includes('FUTURES')) ? 'futures' : 'spot';
+    var r = d[mode] || d['spot'] || {};
+    var pi = document.getElementById('profileLiveInfo');
+    if (pi) pi.style.display = '';
+    function set(id, val) { var el = document.getElementById(id); if (el) el.textContent = val != null ? val : '-'; }
+    set('plEffConf',     r.eff_min_conf   ? (r.eff_min_conf * 100).toFixed(1) + '%' : '-');
+    set('plRegime',      r.regime);
+    set('plHmmRegime',   r.hmm_regime);
+    set('plSize',        r.eff_size_mult  ? r.eff_size_mult.toFixed(2) + 'x' : '-');
+    set('plProfileName', r.profile);
+    set('plUpdated',     r.updated_at ? r.updated_at.replace('T',' ').slice(0,19) + ' UTC' : '-');
+  });
+}
+
 /* ─── REFRESH ─── */
 var _refreshInProgress = false;
 function refresh() {
@@ -2112,6 +2272,11 @@ function refresh() {
   updateTrainingData();
   updateExchangeMode();
   updateBotUI();
+  updateConfHeatmap();
+  updateLiqMonitor();
+  updateAgentVotes();
+  updateExecQueue();
+  updateRegimeDetail();
   loadStrategyConfig();
   // Only poll retrain status if no dedicated poll interval running
   if (!retrainPollInterval) updateRetrainStatus();

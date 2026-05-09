@@ -20,6 +20,10 @@ class TradingProfile:
     ml_prob_threshold: float = 0.65
     smc_sub_checks_min: int = 2
 
+    # ── Trend Quality Gate ──
+    adx_min: float = 20.0            # minimum ADX at entry
+    min_quality_score: float = 0.40  # minimum composite quality score
+
     # ── SMC Rules ──
     smc_liquidity_sweep_pct: float = 0.005
     smc_bos_body_pct: float = 0.60
@@ -85,91 +89,115 @@ class TradingProfile:
 
 
 _PRESETS = {
+    # ── STRICT: 1–2 day swing trades, elite quality only ──────────────────────
+    # High ADX requirement + 3-agent consensus + large RR target.
+    # Designed for 3–5 trades/week at high win-rate, not frequency.
     "STRICT": TradingProfile(
         name="STRICT",
-        # Signal requirements — all agents, high conviction
-        min_confidence=0.72, min_agent_agreement=3, net_score_threshold=0.45,
+        # Requires all 3 agents in agreement at high confidence
+        min_confidence=0.70, min_agent_agreement=3, net_score_threshold=0.48,
         ml_prob_threshold=0.78, smc_sub_checks_min=4,
-        # SMC — near-complete setup required
-        smc_liquidity_sweep_pct=0.01, smc_bos_body_pct=0.70,
+        # Hard trend requirement — no chop trades
+        adx_min=28.0, min_quality_score=0.58,
+        # Near-complete SMC structure
+        smc_liquidity_sweep_pct=0.008, smc_bos_body_pct=0.65,
         smc_fvg_required=True, smc_volume_spike_ratio=2.0, smc_pattern_completion=0.85,
-        # Entry — FVG only, no market orders
+        # FVG entries only — no chasing
         allow_market_entry=False, entry_at_fvg=True, entry_at_retracement=False,
-        # Macro / funding — all filters on
+        # All filters on for swing context
         funding_filter_enabled=True, funding_extreme_required=True,
         flow_imbalance_ratio=2.0, macro_alignment_required=True, sentiment_standalone=False,
-        # HTF / BTC
+        # Strict HTF alignment
         htf_filter_mode="strict", btc_momentum_filter=True,
-        # Risk — tight SL, wide TP for full-day hold (R/R 1:3)
-        position_size_pct=0.025, stop_loss_atr_mult=1.5, take_profit_atr_mult=4.5,
-        max_correlation=0.35, max_portfolio_heat=0.25, trailing_activation_atr=2.0, size_mult=0.8,
+        # Wide TP for multi-day swing (1:3+ RR), tight max heat
+        position_size_pct=0.022, stop_loss_atr_mult=1.8, take_profit_atr_mult=5.0,
+        max_correlation=0.35, max_portfolio_heat=0.20, trailing_activation_atr=2.0, size_mult=0.85,
     ),
+
+    # ── BALANCED: 10–12h intraday, steady compounding ─────────────────────────
+    # Medium conviction with 2-agent agreement, moderate ADX floor.
+    # Good for consistent daily compounding without over-trading.
     "BALANCED": TradingProfile(
         name="BALANCED",
-        # Signal requirements — 2 agents, moderate conviction
-        min_confidence=0.55, min_agent_agreement=2, net_score_threshold=0.28,
+        # 2-agent agreement, solid confidence
+        min_confidence=0.58, min_agent_agreement=2, net_score_threshold=0.32,
         ml_prob_threshold=0.68, smc_sub_checks_min=2,
-        # SMC — 2 checks, volume confirmation
-        smc_liquidity_sweep_pct=0.002, smc_bos_body_pct=0.40,
-        smc_fvg_required=False, smc_volume_spike_ratio=1.6, smc_pattern_completion=0.65,
-        # Entry — retracement, no market orders
+        # Moderate trend quality gate
+        adx_min=22.0, min_quality_score=0.45,
+        # SMC with volume confirmation
+        smc_liquidity_sweep_pct=0.003, smc_bos_body_pct=0.45,
+        smc_fvg_required=False, smc_volume_spike_ratio=1.6, smc_pattern_completion=0.68,
+        # Retracement entries
         allow_market_entry=False, entry_at_fvg=False, entry_at_retracement=True,
-        # Macro / funding
+        # Standard filters
         funding_filter_enabled=True, funding_extreme_required=False,
-        flow_imbalance_ratio=1.2, macro_alignment_required=False, sentiment_standalone=False,
-        # HTF / BTC
+        flow_imbalance_ratio=1.4, macro_alignment_required=False, sentiment_standalone=False,
+        # Soft HTF bias
         htf_filter_mode="soft", btc_momentum_filter=True,
-        # Risk — 1:2 R/R for 1-3 hour holds
-        position_size_pct=0.022, stop_loss_atr_mult=1.5, take_profit_atr_mult=3.0,
-        max_correlation=0.55, max_portfolio_heat=0.45, trailing_activation_atr=1.5, size_mult=1.0,
+        # 1:2 RR for intraday holds
+        position_size_pct=0.022, stop_loss_atr_mult=1.6, take_profit_atr_mult=3.2,
+        max_correlation=0.50, max_portfolio_heat=0.40, trailing_activation_atr=1.5, size_mult=1.0,
     ),
+
+    # ── AGGRESSIVE: momentum scalp, breakout/volume-driven ────────────────────
+    # Volume spike + ADX confirmation required. Avoids sideways completely.
+    # Still quality-filtered — NOT a "take everything" mode.
     "AGGRESSIVE": TradingProfile(
         name="AGGRESSIVE",
-        # Signal requirements — speed priority, volume is main gate
-        min_confidence=0.50, min_agent_agreement=1, net_score_threshold=0.22,
-        ml_prob_threshold=0.60, smc_sub_checks_min=1,
-        # SMC — volume spike is primary confirmation
-        smc_liquidity_sweep_pct=0.0025, smc_bos_body_pct=0.15,
-        smc_fvg_required=False, smc_volume_spike_ratio=1.8, smc_pattern_completion=0.40,
-        # Entry — market orders allowed for fast fills
+        # Requires 2-agent consensus even for scalps (1 was too permissive)
+        min_confidence=0.54, min_agent_agreement=2, net_score_threshold=0.28,
+        ml_prob_threshold=0.62, smc_sub_checks_min=1,
+        # Breakout focus: ADX floor + volume spike primary signal
+        adx_min=20.0, min_quality_score=0.38,
+        # Volume spike is the primary confirmation
+        smc_liquidity_sweep_pct=0.003, smc_bos_body_pct=0.20,
+        smc_fvg_required=False, smc_volume_spike_ratio=2.0, smc_pattern_completion=0.45,
+        # Allow market entry for fast breakout fills
         allow_market_entry=True, entry_at_fvg=False, entry_at_retracement=True,
-        # Macro / funding — all off (too slow for scalping)
+        # Minimal macro filtering — too slow for scalping
         funding_filter_enabled=False, funding_extreme_required=False,
         flow_imbalance_ratio=0.0, macro_alignment_required=False, sentiment_standalone=True,
-        # HTF / BTC — off for scalping speed
-        htf_filter_mode="none", btc_momentum_filter=False,
-        # Risk — very tight SL/TP for scalping (R/R 1:1.5)
-        position_size_pct=0.015, stop_loss_atr_mult=0.8, take_profit_atr_mult=1.2,
-        max_correlation=0.65, max_portfolio_heat=0.60, trailing_activation_atr=0.5, size_mult=1.2,
+        # Soft HTF (not "none" — blind to daily trend causes outsized losses)
+        htf_filter_mode="soft", btc_momentum_filter=True,
+        # Tight SL/TP for scalp (1:1.6 RR), conservative sizing
+        position_size_pct=0.015, stop_loss_atr_mult=0.9, take_profit_atr_mult=1.6,
+        max_correlation=0.55, max_portfolio_heat=0.50, trailing_activation_atr=0.6, size_mult=1.0,
     ),
+
+    # ── CONFLUENCE: quality overlay — highest bar, all dimensions required ─────
+    # Not an "aggression" mode. Uses weighted confluence scoring across all
+    # dimensions: ensemble strength, agent agreement, ML confidence, volume, regime.
+    # Only fires when everything aligns. Best for high-conviction swing setups.
     "CONFLUENCE": TradingProfile(
         name="CONFLUENCE",
-        # Confluence scoring — replaces boolean gates
+        # Confluence scoring replaces boolean gates
         use_confluence_scoring=True,
         confluence_threshold_trending=0.55,
-        confluence_threshold_ranging=0.70,
-        confluence_threshold_high_vol=0.75,
-        confluence_threshold_crash=0.90,
-        w_ensemble_strength=0.30,
-        w_agent_agreement=0.20,
+        confluence_threshold_ranging=0.72,
+        confluence_threshold_high_vol=0.78,
+        confluence_threshold_crash=0.92,
+        w_ensemble_strength=0.28,
+        w_agent_agreement=0.22,
         w_ml_confidence=0.25,
         w_volume=0.15,
         w_regime=0.10,
-        # Floor confidence regardless of score
-        min_confidence=0.45, min_agent_agreement=1, net_score_threshold=0.15,
-        ml_prob_threshold=0.60, smc_sub_checks_min=1,
-        # SMC defaults (not primary gate — score handles it)
-        smc_liquidity_sweep_pct=0.003, smc_bos_body_pct=0.30,
-        smc_fvg_required=False, smc_volume_spike_ratio=1.4, smc_pattern_completion=0.55,
-        # Entry
+        # Hard floor even with confluence scoring
+        min_confidence=0.52, min_agent_agreement=2, net_score_threshold=0.28,
+        ml_prob_threshold=0.65, smc_sub_checks_min=2,
+        # Trend quality overlay
+        adx_min=22.0, min_quality_score=0.52,
+        # SMC structure required
+        smc_liquidity_sweep_pct=0.004, smc_bos_body_pct=0.35,
+        smc_fvg_required=False, smc_volume_spike_ratio=1.5, smc_pattern_completion=0.60,
+        # Retracement entries
         allow_market_entry=False, entry_at_fvg=False, entry_at_retracement=True,
-        # Macro / funding
+        # Full macro stack
         funding_filter_enabled=True, funding_extreme_required=False,
-        flow_imbalance_ratio=1.2, macro_alignment_required=False, sentiment_standalone=False,
-        # HTF / BTC
-        htf_filter_mode="soft", btc_momentum_filter=True,
-        # Risk — 1:2 R/R, adaptive position sizing
-        position_size_pct=0.020, stop_loss_atr_mult=1.8, take_profit_atr_mult=3.6,
-        max_correlation=0.50, max_portfolio_heat=0.40, trailing_activation_atr=1.5, size_mult=1.0,
+        flow_imbalance_ratio=1.4, macro_alignment_required=False, sentiment_standalone=False,
+        # HTF required for confluence validity
+        htf_filter_mode="hard", btc_momentum_filter=True,
+        # 1:2.5 RR, conservative heat
+        position_size_pct=0.020, stop_loss_atr_mult=1.8, take_profit_atr_mult=3.8,
+        max_correlation=0.45, max_portfolio_heat=0.38, trailing_activation_atr=1.5, size_mult=1.0,
     ),
 }

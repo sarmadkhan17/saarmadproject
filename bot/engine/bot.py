@@ -347,6 +347,8 @@ class BaseBot:
 
         self._balance_cache: Optional[float] = None
         self._symbol_loss_cooldown: dict = {}  # symbol → datetime of last loss
+        self._symbol_locks: dict = {}           # per-symbol order placement locks
+        self._symbol_locks_guard = threading.Lock()
 
         # ── v5: Four-layer architecture ──────────────────────────────────────
         self.profile = TradingProfile.from_config(self.config)
@@ -832,6 +834,12 @@ class BaseBot:
                     time.sleep(2)
         return None
 
+    def _get_symbol_lock(self, symbol: str) -> threading.Lock:
+        with self._symbol_locks_guard:
+            if symbol not in self._symbol_locks:
+                self._symbol_locks[symbol] = threading.Lock()
+            return self._symbol_locks[symbol]
+
     def get_price(self, symbol) -> float:
         price = self.feed.get_live_price(symbol)
         return price or 0.0
@@ -912,9 +920,13 @@ class BaseBot:
         exits = self.risk.check_exits(trades, self.get_price, _get_atr_cached)
         for trade, price, reason, fraction in exits:
             close_amount = trade["amount"] * fraction
-            order = self._place_close(
-                trade["symbol"], close_amount, trade["side"]
-            )
+            _sym_lk = self._get_symbol_lock(trade["symbol"])
+            with _sym_lk:
+                if trade["id"] not in {t["id"] for t in self.state.get_open_trades()}:
+                    continue  # already closed by RL or another path
+                order = self._place_close(
+                    trade["symbol"], close_amount, trade["side"]
+                )
             if order:
                 pnl, price = self._resolve_close_pnl(trade, trade["symbol"], price, fraction)
                 if fraction >= 1.0:
@@ -1009,31 +1021,9 @@ class BaseBot:
                     continue
 
                 elif action == "CLOSE":
-                    order = self._place_close(symbol, trade["amount"], trade["side"])
-                    if order:
-                        pnl = self._calc_pnl(trade, current_price)
-                        self.state.close_trade(trade["id"], current_price, pnl)
-                        self.risk.cleanup_trade(trade["id"])
-                        self._cancel_exchange_stop_loss(
-                            symbol, trade.get("sl_order_id", "")
-                        )
-                        self.ai.record_trade_result(symbol, pnl)
-                        self.agents.record_trade_result(symbol, pnl)
-                        self.risk.record_trade_result(pnl, balance)
-                        self.rl_agent.record_step(trade["id"], current_price, atr, done=True, final_pnl=pnl)
-                        self.log.info(f"RL CLOSE {symbol} | PnL={pnl:+.4f}")
-                        self.notifier.send_alert(f"RL CLOSE {symbol}\nPnL: ${pnl:+.4f}")
-                    else:
-                        pnl = self._calc_pnl(trade, current_price)
-                        self.log.warning(f"RL CLOSE {symbol} FAILED — closing locally (order rejected)")
-                        self.state.close_trade(trade["id"], current_price, pnl)
-                        self.risk.cleanup_trade(trade["id"])
-                        self._cancel_exchange_stop_loss(symbol, trade.get("sl_order_id", ""))
-                        self.ai.record_trade_result(symbol, pnl)
-                        self.agents.record_trade_result(symbol, pnl)
-                        self.risk.record_trade_result(pnl, balance)
-                        self.rl_agent.record_step(trade["id"], current_price, atr, done=True, final_pnl=pnl)
-                        self.notifier.send_alert(f"RL CLOSE {symbol} FAILED (local)\nPnL: ${pnl:+.4f}")
+                    # RL CLOSE suppressed — check_exits() owns all full exits.
+                    self.log.debug(f"RL CLOSE {symbol} → suppressed (exits owned by check_exits)")
+                    continue
 
                 elif action == "SCALE_OUT":
                     close_amt = trade["amount"] * 0.25
@@ -1145,7 +1135,8 @@ class BaseBot:
                 if "does not have market symbol" in str(e):
                     self.feed.mark_invalid(symbol)  # mark_invalid() logs its own warning
 
-            ensemble = self.ensemble.run(symbol, df_1h, self.profile)
+            self._current_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
+            ensemble = self.ensemble.run(symbol, df_1h, self.profile, market_ctx=regime_ctx)
 
             # Log per-agent detail at DEBUG only
             for s in ensemble.signals:
@@ -1191,6 +1182,9 @@ class BaseBot:
                     "indicators": {
                         "buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
                         "agents_agree": ensemble.agents_agreeing, "profile": self.profile.name,
+                        "adx":           round((regime_ctx or {}).get("adx", 0.0), 1),
+                        "quality_score": round(getattr(decision, "quality_score", 0.0), 3),
+                        "regime":        (regime_ctx or {}).get("regime", "?"),
                     },
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
@@ -1205,6 +1199,10 @@ class BaseBot:
                 "indicators": {
                     "buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
                     "agents_agree": ensemble.agents_agreeing, "profile": self.profile.name,
+                    "adx":           round((regime_ctx or {}).get("adx", 0.0), 1),
+                    "quality_score": round(getattr(decision, "quality_score", 0.0), 3),
+                    "regime":        (regime_ctx or {}).get("regime", "?"),
+                    "vol_ratio":     round((regime_ctx or {}).get("vol_ratio", 1.0), 2),
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
@@ -1328,10 +1326,6 @@ class BaseBot:
         for pos in positions:
             sym = pos["symbol"]
             if sym in our_syms or float(pos.get("amount", 0)) == 0:
-                continue
-            current_open = sum(1 for t in d.get("trades", []) if t.get("status") == "open")
-            if current_open >= self.max_open:
-                self.log.warning(f"Sync: skipping {sym} — max_open={self.max_open} reached ({current_open} open)")
                 continue
             trade = {
                 "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
@@ -1768,6 +1762,7 @@ class BaseBot:
 
     def run_once(self):
         """One scan cycle — identical for both modes."""
+        regime_ctx  = None   # initialise early; assigned after symbol scan
         self._maybe_swap_profile()
         self.sync_with_exchange()
         self.check_exits()
@@ -1797,7 +1792,9 @@ class BaseBot:
             self.log.warning(f"Circuit breaker: {reason}")
 
         max_reached = len(open_trades) >= self.max_open
-        symbols     = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols)
+        _vol_ratio  = (regime_ctx or {}).get("vol_ratio", 1.0)
+        symbols     = self.scanner.get_coins(self.exchange, invalid_symbols=self.feed.invalid_symbols,
+                                             current_atr_ratio=_vol_ratio)
         self._post_scan(symbols)
         self.feed.subscribe_many(symbols)   # ensure WS + REST monitor tracking
         self.log.info(f"[{self.MODE.upper()}] Watching: {symbols}")
@@ -1941,6 +1938,8 @@ class BaseBot:
             self.analyze_symbol(symbol, balance, open_trades, regime_ctx, btc_1h_return,
                                pre_multi=multi_cache.get(symbol),
                                pre_train=train_cache.get(symbol))
+            open_trades = self.state.get_open_trades()
+            max_reached = len(open_trades) >= self.max_open
 
 
     def run(self):

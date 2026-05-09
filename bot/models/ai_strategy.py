@@ -156,6 +156,14 @@ def make_features(df):
         - ((close < ema9) & (close < ema21) & (close < ema50) & (close < ema96)).astype(int)
     )
 
+    # funding_rate_momentum: proxy via hourly return velocity relative to volume activity.
+    # Positive → price rising with thin volume (longs squeezing), Negative → falling with thin volume.
+    _hour_ret = close.pct_change(1)
+    _vol_norm = vol / (vol.rolling(24).mean() + 1e-9)
+    f["funding_rate_momentum"] = (
+        _hour_ret.rolling(8).mean() / (_vol_norm.rolling(8).mean() + 1e-9)
+    ).clip(-1.0, 1.0)
+
     return f.dropna()
 
 
