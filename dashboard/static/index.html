@@ -309,6 +309,75 @@ nav.tabs {
 }
 .cb-banner.show { display: block; animation: notif-in 0.3s ease; }
 
+/* ─── HOLD STATUS BANNER ─── */
+.hold-banner {
+  display: none;
+  padding: 0;
+  border-bottom: 1px solid transparent;
+}
+.hold-banner.show { display: block; animation: notif-in 0.3s ease; }
+.hold-banner.warn {
+  background: rgba(245,158,11,0.07);
+  border-bottom-color: rgba(245,158,11,0.35);
+}
+.hold-banner.info {
+  background: rgba(99,102,241,0.07);
+  border-bottom-color: rgba(99,102,241,0.25);
+}
+.hold-banner-inner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 9px 20px;
+  flex-wrap: wrap;
+}
+.hold-banner-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding-top: 1px;
+  flex-shrink: 0;
+}
+.hold-banner.warn .hold-banner-label { color: var(--gold); }
+.hold-banner.info .hold-banner-label { color: var(--accent); }
+.hold-banner-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1;
+}
+.hold-reason-pill {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.hold-banner.warn .hold-reason-pill {
+  color: rgba(245,158,11,0.9);
+  border-color: rgba(245,158,11,0.3);
+  background: rgba(245,158,11,0.06);
+}
+.hold-banner.info .hold-reason-pill {
+  color: rgba(99,102,241,0.9);
+  border-color: rgba(99,102,241,0.3);
+  background: rgba(99,102,241,0.06);
+}
+.hold-banner-meta {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text2);
+  white-space: nowrap;
+  padding-top: 3px;
+  flex-shrink: 0;
+}
+
 /* ─── TAB PANELS ─── */
 .tab-panel { display: none; padding: 22px 24px; }
 .tab-panel.active { display: block; }
@@ -1016,6 +1085,13 @@ td {
 
 <div class="notif" id="notif"></div>
 <div class="cb-banner" id="cb-banner"></div>
+<div class="hold-banner" id="hold-banner">
+  <div class="hold-banner-inner">
+    <span class="hold-banner-label">⏸ WHY HOLD?</span>
+    <div class="hold-banner-reasons" id="hold-reasons"></div>
+    <span class="hold-banner-meta" id="hold-meta"></span>
+  </div>
+</div>
 
 <!-- ═══════════ HEADER ═══════════ -->
 <header>
@@ -2156,6 +2232,26 @@ function updateCircuitBreaker() {
   });
 }
 
+/* ─── HOLD STATUS BANNER ─── */
+function updateHoldStatus() {
+  var mode = document.getElementById('selFutures') && document.getElementById('selFutures').classList.contains('active') ? 'futures' : 'spot';
+  get('/api/hold_status?mode=' + mode, function(d) {
+    var banner  = document.getElementById('hold-banner');
+    var reasons = document.getElementById('hold-reasons');
+    var meta    = document.getElementById('hold-meta');
+    if (!d.holding || !d.reasons || d.reasons.length === 0) {
+      banner.classList.remove('show', 'warn', 'info');
+      return;
+    }
+    banner.classList.remove('warn', 'info');
+    banner.classList.add('show', d.severity === 'warn' ? 'warn' : 'info');
+    reasons.innerHTML = d.reasons.map(function(r) {
+      return '<span class="hold-reason-pill">' + r + '</span>';
+    }).join('');
+    meta.textContent = d.n_open + '/' + d.max_open + ' positions · ' + (d.hmm_regime || '?') + ' · ' + (d.market_regime || '?');
+  });
+}
+
 /* ─── CONFIDENCE HEATMAP ─── */
 function updateConfHeatmap() {
   get('/api/confidence_heatmap', function(d) {
@@ -2261,6 +2357,7 @@ function refresh() {
   if (_refreshInProgress) return;
   _refreshInProgress = true;
   updateCircuitBreaker();
+  updateHoldStatus();
   updateStats();
   updateChart();
   updateSignals();

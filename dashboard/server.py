@@ -725,6 +725,82 @@ def api_execution_queue():
         return jsonify({})
 
 
+@app.route("/api/hold_status")
+def api_hold_status():
+    """Explain why all signals are HOLD / new entries are paused."""
+    mode = request.args.get("mode", "futures")
+    fname = "futures_state.json" if mode == "futures" else "state.json"
+    cfg_path = CFG_FUT if mode == "futures" else CFG_SPOT
+
+    state = load_state(fname)
+    ls = state.get("live_strategy", {})
+    trades = state.get("trades", [])
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    n_open = len(open_trades)
+
+    try:
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
+        max_open = cfg.get("risk", {}).get("max_open_trades", 10)
+    except Exception:
+        max_open = 10
+
+    reasons = []
+    severity = "info"
+
+    # Max positions gate
+    if n_open >= max_open:
+        reasons.append(f"Max positions reached: {n_open}/{max_open} — waiting for exits")
+        severity = "warn"
+
+    # HMM regime
+    hmm = ls.get("hmm_regime", "UNKNOWN")
+    eff_conf = ls.get("eff_min_conf")
+    base_conf = ls.get("base_min_conf")
+    if hmm == "CRASH":
+        delta = round(eff_conf - base_conf, 2) if eff_conf and base_conf else 0.07
+        reasons.append(f"HMM: CRASH regime — min_conf raised +{delta:.2f} (effective: {eff_conf or '?'})")
+        severity = "warn"
+    elif hmm in ("HIGH_VOLATILITY", "CHOPPY"):
+        reasons.append(f"HMM: {hmm} — reduced sizing, elevated confidence threshold")
+
+    # Market regime
+    regime = ls.get("market_regime", "UNKNOWN")
+    if regime == "WEAK_TREND":
+        reasons.append("Market: WEAK_TREND — shorts blocked, longs need higher confluence")
+    elif regime in ("CHOPPY", "CRASH"):
+        reasons.append(f"Market: {regime} — all new entries blocked by regime gate")
+        severity = "warn"
+
+    # Signal quality — check if ML models are flat
+    signals = state.get("signals", [])
+    recent = signals[-30:] if len(signals) >= 30 else signals
+    if recent:
+        ml_only = sum(1 for s in recent if s.get("source") == "ml_only")
+        hold_ct = sum(1 for s in recent if s.get("action") == "HOLD")
+        avg_conf = sum(s.get("confidence", 0) for s in recent) / len(recent)
+        if ml_only >= len(recent) * 0.75:
+            reasons.append(f"ML models outputting flat signal (avg conf {avg_conf:.2f}) — full ensemble skipped")
+        elif hold_ct >= len(recent) * 0.85:
+            reasons.append(f"{hold_ct}/{len(recent)} recent signals are HOLD (avg conf {avg_conf:.2f})")
+
+    # Coordinator cache stale note
+    if recent and all(s.get("source") == "ml_only" for s in recent[-5:]):
+        reasons.append("Signal cache active — coordinator refreshes every 30 min")
+
+    holding = len(reasons) > 0
+    return jsonify({
+        "holding":      holding,
+        "severity":     severity if holding else "ok",
+        "reasons":      reasons,
+        "n_open":       n_open,
+        "max_open":     max_open,
+        "hmm_regime":   hmm,
+        "market_regime": regime,
+        "eff_min_conf": eff_conf,
+    })
+
+
 @app.route("/api/regime_detail")
 def api_regime_detail():
     """Full regime context dict from live_strategy in state files."""
