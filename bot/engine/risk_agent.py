@@ -281,6 +281,7 @@ class RiskDecisionAgent:
             confidence=conf, balance=balance, price=price,
             df=df_1h, recent_trades=all_trades or [], regime_ctx=regime_ctx,
             all_agree=(ensemble.agents_agreeing >= 3), open_trades=open_trades,
+            sl_atr_mult=getattr(profile, "stop_loss_atr_mult", 2.5),
         )
         if est_usdt < 10:
             reasons.append(f"size too small: ${est_usdt:.2f}")

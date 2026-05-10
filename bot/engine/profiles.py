@@ -49,8 +49,8 @@ class TradingProfile:
 
     # ── Risk Parameters ──
     position_size_pct: float = 0.025
-    stop_loss_atr_mult: float = 2.0
-    take_profit_atr_mult: float = 2.5
+    stop_loss_atr_mult: float = 2.5
+    take_profit_atr_mult: float = 4.5
     max_correlation: float = 0.55
     max_portfolio_heat: float = 0.50
     trailing_activation_atr: float = 1.0
@@ -58,8 +58,8 @@ class TradingProfile:
 
     # ── Exit Engine ──
     tp1_fraction: float = 0.40        # fraction closed at TP1
-    tp1_r_mult: float = 1.0           # TP1 fires at N × entry_atr gain
-    trail_atr_mult: float = 2.0       # trailing stop multiplier (post-TP1)
+    tp1_r_mult: float = 2.5           # TP1 fires at N × entry_atr gain
+    trail_atr_mult: float = 2.8       # trailing stop multiplier (post-TP1)
     early_exit_enabled: bool = True   # exit failing trades on invalidation signals
     dynamic_tp_enabled: bool = True   # skip fixed TP backstop when trend accelerates
 
@@ -116,11 +116,11 @@ _PRESETS = {
         flow_imbalance_ratio=2.0, macro_alignment_required=True, sentiment_standalone=False,
         # Hard HTF: counter-HTF signals need conf >= 0.65 to pass
         htf_filter_mode="hard", btc_momentum_filter=True,
-        # Wide TP for multi-day swing (1:3+ RR), tight max heat
-        position_size_pct=0.022, stop_loss_atr_mult=1.8, take_profit_atr_mult=5.0,
+        # Wide TP for multi-day swing (SL 3×, TP 7×, trail 3.5×) — survives crypto noise
+        position_size_pct=0.022, stop_loss_atr_mult=3.0, take_profit_atr_mult=7.0,
         max_correlation=0.35, max_portfolio_heat=0.20, trailing_activation_atr=2.0, size_mult=0.85,
-        # Exit: wide trail for swing holds; no early invalidation (need room to breathe)
-        tp1_fraction=0.40, tp1_r_mult=1.0, trail_atr_mult=2.5,
+        # Exit: very wide trail for swing holds; no early invalidation (need room to breathe)
+        tp1_fraction=0.40, tp1_r_mult=3.0, trail_atr_mult=3.5,
         early_exit_enabled=False, dynamic_tp_enabled=True,
     ),
 
@@ -144,11 +144,11 @@ _PRESETS = {
         flow_imbalance_ratio=1.4, macro_alignment_required=False, sentiment_standalone=False,
         # Soft HTF bias
         htf_filter_mode="soft", btc_momentum_filter=True,
-        # 1:2 RR for intraday holds
-        position_size_pct=0.022, stop_loss_atr_mult=1.6, take_profit_atr_mult=3.2,
+        # Intraday: SL 2.5×, TP 4.5×, trail 2.8× — enough room for intraday swings
+        position_size_pct=0.022, stop_loss_atr_mult=2.5, take_profit_atr_mult=4.5,
         max_correlation=0.50, max_portfolio_heat=0.40, trailing_activation_atr=1.5, size_mult=1.0,
         # Exit: moderate trail; early invalidation enabled
-        tp1_fraction=0.40, tp1_r_mult=1.0, trail_atr_mult=1.8,
+        tp1_fraction=0.40, tp1_r_mult=2.5, trail_atr_mult=2.8,
         early_exit_enabled=True, dynamic_tp_enabled=True,
     ),
 
@@ -172,11 +172,11 @@ _PRESETS = {
         flow_imbalance_ratio=0.0, macro_alignment_required=False, sentiment_standalone=True,
         # Soft HTF (not "none" — blind to daily trend causes outsized losses)
         htf_filter_mode="soft", btc_momentum_filter=True,
-        # Tight SL/TP for scalp (1:1.6 RR), conservative sizing
-        position_size_pct=0.015, stop_loss_atr_mult=0.9, take_profit_atr_mult=1.6,
+        # Momentum: SL 2×, TP 3.5×, trail 2.2× — respects crypto noise, still harvests fast moves
+        position_size_pct=0.015, stop_loss_atr_mult=2.0, take_profit_atr_mult=3.5,
         max_correlation=0.55, max_portfolio_heat=0.50, trailing_activation_atr=0.6, size_mult=1.0,
-        # Exit: fast invalidation + tight trail; no dynamic extension (scalp — take the win)
-        tp1_fraction=0.50, tp1_r_mult=0.8, trail_atr_mult=1.2,
+        # Exit: early invalidation on; trail wider than before; no dynamic extension
+        tp1_fraction=0.50, tp1_r_mult=2.0, trail_atr_mult=2.2,
         early_exit_enabled=True, dynamic_tp_enabled=False,
     ),
 
@@ -212,11 +212,11 @@ _PRESETS = {
         flow_imbalance_ratio=1.4, macro_alignment_required=False, sentiment_standalone=False,
         # HTF soft: counter-HTF signals penalized 20% (high-conf still passes)
         htf_filter_mode="soft", btc_momentum_filter=True,
-        # 1:2.5 RR, conservative heat
-        position_size_pct=0.020, stop_loss_atr_mult=1.8, take_profit_atr_mult=3.8,
+        # Quality swing: SL 2.8×, TP 6×, trail 3× — let high-conviction ideas run far
+        position_size_pct=0.020, stop_loss_atr_mult=2.8, take_profit_atr_mult=6.0,
         max_correlation=0.45, max_portfolio_heat=0.38, trailing_activation_atr=1.5, size_mult=1.0,
-        # Exit: full early + dynamic; 2×ATR trail for swing context
-        tp1_fraction=0.40, tp1_r_mult=1.0, trail_atr_mult=2.0,
+        # Exit: full early + dynamic; wide swing trail
+        tp1_fraction=0.40, tp1_r_mult=2.8, trail_atr_mult=3.0,
         early_exit_enabled=True, dynamic_tp_enabled=True,
     ),
 }

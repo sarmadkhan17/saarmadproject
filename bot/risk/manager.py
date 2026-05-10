@@ -502,12 +502,16 @@ class KellyCriterionSizer:
 
     base_risk  — mode-calibrated starting point (spot=0.8%, futures=0.4% of balance as margin)
     kelly_scale — derived from last 20 closed trades, capped at [0.10, 0.25] fractional Kelly
-    vol_factor  — smooth ATR-aware reduction (2% ATR→1.0; 4% ATR→0.5; 6%+→0.4)
+    vol_factor  — stop-distance normalized: RISK_NORM/(sl_atr_mult×atr_pct) keeps $ risk constant
+                  as ATR widens (wider stop → smaller position, same account risk per trade)
     regime_factor — regime size_mult + ADX modifier; capped at [0.30, 1.20]
     conf_factor — narrow [0.85, 1.0]; confidence contributes at most ±15%
     corr_factor — 10% per open position (portfolio concentration penalty)
     streak_factor — 0.5 if ≥3 of last 5 closed trades are losses
     """
+
+    # Reference point: sl_mult=2.5, atr_pct=2% → vol_factor=1.0 (baseline sizing unchanged)
+    _RISK_NORM = 2.5 * 0.02  # = 0.05
 
     KELLY_FRAC_MIN     = 0.10
     KELLY_FRAC_MAX     = 0.25
@@ -534,7 +538,7 @@ class KellyCriterionSizer:
         self.leverage = cfg.get("risk", {}).get("leverage", 1)
 
     def calculate(self, confidence, balance, price, atr_pct, regime, recent_trades,
-                  open_trades=None, all_agree=False):
+                  open_trades=None, all_agree=False, sl_atr_mult: float = 2.5):
         mode = BOT_MODE
         base = self.BASE_PCT.get(mode, 0.008)
 
@@ -542,9 +546,11 @@ class KellyCriterionSizer:
         kelly_frac = self._kelly_fraction(recent_trades)
         kelly_scale = kelly_frac / self.KELLY_FRAC_DEFAULT   # 1.0 at cold-start
 
-        # ── 2. Volatility factor (smooth ATR-aware) ───────────────────
-        # 2% ATR → 1.0 | 4% → 0.5 | 6%+ → 0.4 floor | <2% → capped at 1.0
-        vol_factor = round(max(0.40, min(1.0, 0.02 / max(atr_pct, 0.001))), 4)
+        # ── 2. Volatility factor — stop-distance normalized ───────────
+        # pos_size ∝ 1/(sl_atr_mult × atr_pct) keeps $ at risk constant.
+        # Reference: sl_mult=2.5, atr_pct=2% → vol_factor=1.0.
+        # Wider stops or higher ATR → smaller position, same account risk.
+        vol_factor = round(max(0.25, min(1.0, self._RISK_NORM / max(sl_atr_mult * atr_pct, 0.001))), 4)
 
         # ── 3. Regime factor (size_mult + ADX modifier) ───────────────
         size_mult = regime.get("size_mult", 1.0)
@@ -789,7 +795,8 @@ class RiskManager:
         return self.market_gate.detect(feed, watchlist)
 
     def get_position_size(self, confidence, balance, price, df, recent_trades,
-                           regime_ctx=None, all_agree=False, open_trades=None):
+                           regime_ctx=None, all_agree=False, open_trades=None,
+                           sl_atr_mult: float = 2.5):
         regime  = dict(regime_ctx) if regime_ctx else self.market_gate._neutral()
         high    = df["high"]
         low     = df["low"]
@@ -797,10 +804,10 @@ class RiskManager:
         tr      = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
         atr     = tr.rolling(14).mean().iloc[-1]
         atr_pct = float(atr / (df["close"].iloc[-1] + 1e-9))
-        log.debug(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f}")
+        log.debug(f"Regime: {regime['regime']} ADX={regime.get('adx','?')} size_mult={regime.get('size_mult',1.0):.2f} sl_atr={sl_atr_mult}")
         return self.sizer.calculate(
             confidence, balance, price, atr_pct, regime, recent_trades,
-            open_trades=open_trades, all_agree=all_agree,
+            open_trades=open_trades, all_agree=all_agree, sl_atr_mult=sl_atr_mult,
         )
 
     def record_trade_result(self, pnl, balance):

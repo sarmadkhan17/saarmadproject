@@ -413,6 +413,7 @@ class BaseBot:
             self.exchange, self.state, self.notifier, self.MODE,
             get_leverage_fn=self._get_leverage,
         )
+        self.execution.sl_atr_mult = self.profile.stop_loss_atr_mult
 
         self._with_training_heartbeat(lambda: self._train(quick=True), source="startup")
 
@@ -456,6 +457,7 @@ class BaseBot:
                 if new_profile_name != self.profile.name:
                     from engine.profiles import TradingProfile
                     self.profile = dataclasses.replace(TradingProfile.load(new_profile_name))
+                    self.execution.sl_atr_mult = self.profile.stop_loss_atr_mult
                     self.log.info(f"Profile switched → {self.profile.name}")
                 self.log.info(f"Config reloaded: min_conf={self.min_conf}, htf={self.htf_filter_mode}, max_open={self.max_open}, profile={self.profile.name}")
         except Exception as e:
@@ -473,6 +475,7 @@ class BaseBot:
             if new_name != self.profile.name:
                 from engine.profiles import TradingProfile
                 self.profile = dataclasses.replace(TradingProfile.load(new_name))
+                self.execution.sl_atr_mult = self.profile.stop_loss_atr_mult
                 self.log.info(f"Profile hot-swapped → {self.profile.name}")
         except Exception as e:
             self.log.warning(f"Profile hot-swap check failed: {e}")
