@@ -512,16 +512,16 @@ class KellyCriterionSizer:
     Ceiling product: 1.40 × 1.20 × 1.10 × 1.00 ≈ 1.85 × base
     """
 
-    # Reference: sl_mult=2.5, atr_pct=2% → volatility_scalar=1.0
-    _RISK_NORM = 2.5 * 0.02  # = 0.05
+    # Reference: sl_mult=2.5, atr_pct=3% → volatility_scalar=1.0 (crypto-calibrated)
+    _RISK_NORM = 2.5 * 0.03  # = 0.075
 
     KELLY_FRAC_MIN     = 0.10
     KELLY_FRAC_MAX     = 0.25
     KELLY_FRAC_DEFAULT = 0.15
 
-    MIN_PCT  = 0.003   # 0.3% floor — prevents sub-$3 positions on $1k account
-    BASE_PCT = {"spot": 0.008, "futures": 0.004}
-    MAX_PCT  = {"spot": 0.020, "futures": 0.015}
+    MIN_PCT  = 0.008   # 0.8% floor — ~$30 minimum on $3800 account
+    BASE_PCT = {"spot": 0.018, "futures": 0.012}
+    MAX_PCT  = {"spot": 0.050, "futures": 0.035}
 
     def __init__(self, config=None):
         cfg = config or {}
