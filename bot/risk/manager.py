@@ -427,11 +427,12 @@ class ExitEngine:
         if gain > -0.3 * entry_atr:
             return ""
 
-        # Volume collapse: current bar volume < 35% of 20-bar avg
+        # Volume collapse: last completed bar volume < 35% of 20-bar avg
+        # Use iloc[-2] — iloc[-1] is the forming (incomplete) candle with near-zero volume
         try:
             vol = candle_df["volume"]
-            avg = float(vol.iloc[-21:-1].mean()) if len(vol) >= 21 else float(vol.mean())
-            cur = float(vol.iloc[-1])
+            avg = float(vol.iloc[-22:-2].mean()) if len(vol) >= 22 else float(vol.iloc[:-1].mean())
+            cur = float(vol.iloc[-2])
             if avg > 0 and cur < 0.35 * avg:
                 return f"volume_collapse ({cur:.0f} < 35% avg {avg:.0f})"
         except Exception:
@@ -458,10 +459,10 @@ class ExitEngine:
                 return False
             vol = candle_df["volume"]
             c   = candle_df["close"]
-            vol_avg = float(vol.iloc[-9:-1].mean())
-            cur_vol = float(vol.iloc[-1])
-            # 3-bar price momentum
-            m3 = (float(c.iloc[-1]) - float(c.iloc[-4])) / (float(c.iloc[-4]) + 1e-9)
+            vol_avg = float(vol.iloc[-10:-2].mean())
+            cur_vol = float(vol.iloc[-2])   # last completed bar
+            # 3-bar price momentum using completed candles
+            m3 = (float(c.iloc[-2]) - float(c.iloc[-5])) / (float(c.iloc[-5]) + 1e-9)
             on_side = (m3 < -0.005) if is_short else (m3 > 0.005)
             return cur_vol > 1.2 * vol_avg and on_side
         except Exception:
@@ -496,114 +497,130 @@ class ExitEngine:
 
 class KellyCriterionSizer:
     """
-    Volatility-adjusted fractional Kelly position sizer.
+    Conviction-weighted, equity-adaptive position sizer.
 
-    pos_pct = base_risk × kelly_scale × vol_factor × regime_factor × conf_factor × corr_factor × streak_factor
+    pos_pct = dynamic_risk_pct × quality_scalar × regime_scalar × volatility_scalar × correlation_scalar
 
-    base_risk  — mode-calibrated starting point (spot=0.8%, futures=0.4% of balance as margin)
-    kelly_scale — derived from last 20 closed trades, capped at [0.10, 0.25] fractional Kelly
-    vol_factor  — stop-distance normalized: RISK_NORM/(sl_atr_mult×atr_pct) keeps $ risk constant
-                  as ATR widens (wider stop → smaller position, same account risk per trade)
-    regime_factor — regime size_mult + ADX modifier; capped at [0.30, 1.20]
-    conf_factor — narrow [0.85, 1.0]; confidence contributes at most ±15%
-    corr_factor — 10% per open position (portfolio concentration penalty)
-    streak_factor — 0.5 if ≥3 of last 5 closed trades are losses
+    dynamic_risk_pct  — BASE_PCT scaled by drawdown/streak state; adapts gradually
+    quality_scalar    — confidence tier + Kelly history + all-agree boost  [0.70, 1.40]
+    regime_scalar     — regime size_mult + ADX modifier, floored to prevent collapse  [0.75, 1.20]
+    volatility_scalar — ATR-normalised stop distance; slight upside in calm markets  [0.60, 1.10]
+    correlation_scalar — portfolio concentration penalty  [0.50, 1.00]
+
+    Scalars are bounded independently — they cannot cascade to near-zero simultaneously.
+    Floor product: 0.70 × 0.75 × 0.60 × 0.50 ≈ 0.16 × base
+    Ceiling product: 1.40 × 1.20 × 1.10 × 1.00 ≈ 1.85 × base
     """
 
-    # Reference point: sl_mult=2.5, atr_pct=2% → vol_factor=1.0 (baseline sizing unchanged)
+    # Reference: sl_mult=2.5, atr_pct=2% → volatility_scalar=1.0
     _RISK_NORM = 2.5 * 0.02  # = 0.05
 
     KELLY_FRAC_MIN     = 0.10
     KELLY_FRAC_MAX     = 0.25
-    KELLY_FRAC_DEFAULT = 0.15   # cold-start (< 10 closed trades)
+    KELLY_FRAC_DEFAULT = 0.15
 
-    MIN_PCT = 0.003   # 0.3% margin floor — prevents sub-$10 trades
-
-    BASE_PCT = {"spot": 0.008, "futures": 0.004}  # baseline margin % of balance
-    MAX_PCT  = {"spot": 0.020, "futures": 0.015}  # hard cap per mode
-
-    # Reduce effective notional in risky regimes without touching exchange leverage
-    _REGIME_LEV_SCALE = {
-        "STRONG_TREND":    1.00,
-        "TRENDING":        1.00,
-        "WEAK_TREND":      0.85,
-        "RANGING":         0.80,
-        "HIGH_VOLATILITY": 0.65,
-        "CRASH":           0.55,
-        "CHOPPY":          0.50,
-    }
+    MIN_PCT  = 0.003   # 0.3% floor — prevents sub-$3 positions on $1k account
+    BASE_PCT = {"spot": 0.008, "futures": 0.004}
+    MAX_PCT  = {"spot": 0.020, "futures": 0.015}
 
     def __init__(self, config=None):
         cfg = config or {}
         self.leverage = cfg.get("risk", {}).get("leverage", 1)
+        self._streak_active = False
 
     def calculate(self, confidence, balance, price, atr_pct, regime, recent_trades,
                   open_trades=None, all_agree=False, sl_atr_mult: float = 2.5):
         mode = BOT_MODE
-        base = self.BASE_PCT.get(mode, 0.008)
 
-        # ── 1. Fractional Kelly (0.10–0.25 from trade history) ────────
-        kelly_frac = self._kelly_fraction(recent_trades)
-        kelly_scale = kelly_frac / self.KELLY_FRAC_DEFAULT   # 1.0 at cold-start
+        # ── 1. Equity-adaptive risk budget ───────────────────────────────────
+        dynamic_rp = self._dynamic_risk_pct(balance, recent_trades)
 
-        # ── 2. Volatility factor — stop-distance normalized ───────────
-        # pos_size ∝ 1/(sl_atr_mult × atr_pct) keeps $ at risk constant.
-        # Reference: sl_mult=2.5, atr_pct=2% → vol_factor=1.0.
-        # Wider stops or higher ATR → smaller position, same account risk.
-        vol_factor = round(max(0.25, min(1.0, self._RISK_NORM / max(sl_atr_mult * atr_pct, 0.001))), 4)
+        # ── 2. Bounded conviction scalars ────────────────────────────────────
+        q_scalar = self._quality_scalar(confidence, all_agree, recent_trades)
+        r_scalar = self._regime_scalar(regime)
+        v_scalar = self._volatility_scalar(atr_pct, sl_atr_mult)
+        c_scalar = self._correlation_scalar(open_trades)
 
-        # ── 3. Regime factor (size_mult + ADX modifier) ───────────────
-        size_mult = regime.get("size_mult", 1.0)
-        adx = regime.get("adx", 25.0)
-        if   adx >= 35: adx_mod =  0.15
-        elif adx >= 28: adx_mod =  0.05
-        elif adx <  20: adx_mod = -0.20
-        elif adx <  25: adx_mod = -0.10
-        else:           adx_mod =  0.00
-        regime_factor = round(max(0.30, min(1.20, size_mult + adx_mod)), 4)
+        # ── 3. Combine ────────────────────────────────────────────────────────
+        pos_pct = dynamic_rp * q_scalar * r_scalar * v_scalar * c_scalar
 
-        # ── 4. Confidence factor (narrow band — never dominant) ────────
-        # conf=0.50 → 0.85 | conf=0.80 → 1.0 | max swing ±15%
-        conf_factor = round(0.85 + min(0.15, max(0.0, (confidence - 0.50) * 0.5)), 4)
-
-        # ── 5. Correlation / concentration factor ─────────────────────
-        n_open = len(open_trades) if open_trades else 0
-        corr_factor = round(max(0.60, 1.0 - n_open * 0.10), 4)
-
-        # ── 6. Losing streak guard ─────────────────────────────────────
-        recent_5 = [t for t in recent_trades if t.get("status") == "closed"][-5:]
-        if len(recent_5) >= 3 and sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 3:
-            streak_factor = 0.5
-            log.warning("Losing streak — sizing halved")
-        else:
-            streak_factor = 1.0
-
-        # ── Combine ────────────────────────────────────────────────────
-        pos_pct = (base * kelly_scale * vol_factor * regime_factor
-                   * conf_factor * corr_factor * streak_factor)
-
-        # ── Hard cap (mode-aware, slight bonus on all-agree STRONG_TREND) ──
+        # ── 4. Hard cap ───────────────────────────────────────────────────────
         cap = self.MAX_PCT.get(mode, 0.015)
-        if all_agree and confidence >= 0.68 and regime.get("regime") == "STRONG_TREND":
-            cap = min(cap * 1.15, cap + 0.004)
         pos_pct = max(self.MIN_PCT, min(cap, pos_pct))
 
-        # ── Leverage scaling by regime ─────────────────────────────────
-        regime_name = regime.get("regime", "RANGING")
-        lev_scale   = self._REGIME_LEV_SCALE.get(regime_name, 0.85)
-        effective_lev = self.leverage * lev_scale
-
-        usdt   = balance * pos_pct * effective_lev
+        usdt   = balance * pos_pct * self.leverage
         amount = usdt / price
 
         log.debug(
-            f"Sizer [{mode}]: base={base*100:.2f}% kelly={kelly_frac:.2f}(×{kelly_scale:.2f}) "
-            f"vol={vol_factor:.2f} regime={regime_factor:.2f} conf={conf_factor:.2f} "
-            f"corr={corr_factor:.2f} streak={streak_factor:.1f} "
-            f"→ {pos_pct*100:.3f}% × {effective_lev:.1f}x = ${usdt:.2f} "
-            f"(cap={cap*100:.1f}% adx={adx:.0f} {regime_name})"
+            f"Sizer [{mode}]: base={dynamic_rp*100:.3f}% "
+            f"Q={q_scalar:.2f} R={r_scalar:.2f} V={v_scalar:.2f} C={c_scalar:.2f} "
+            f"→ {pos_pct*100:.3f}% × {self.leverage}x = ${usdt:.2f} "
+            f"(cap={cap*100:.1f}% conf={confidence:.2f} {regime.get('regime','')})"
         )
         return amount, usdt
+
+    def _dynamic_risk_pct(self, balance: float, recent_trades: list) -> float:
+        """Base risk pct scaled by drawdown state. Streak guard folds here."""
+        base = self.BASE_PCT.get(BOT_MODE, 0.008)
+        closed = [t for t in recent_trades if t.get("status") == "closed"]
+
+        # Losing streak: ≥3 of last 5 closed trades losing → 65% of base
+        recent_5 = closed[-5:]
+        streak_on = len(recent_5) >= 3 and sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 3
+        if streak_on:
+            if not self._streak_active:
+                log.warning("Losing streak — dynamic risk reduced to 65% of base")
+                self._streak_active = True
+            return round(base * 0.65, 6)
+        if self._streak_active:
+            log.info("Losing streak cleared — risk normalizing")
+            self._streak_active = False
+
+        # Rolling PnL ratio over last 10 closed trades
+        if len(closed) >= 5 and balance > 0:
+            rolling_pnl = sum(t.get("pnl", 0) for t in closed[-10:])
+            ratio = rolling_pnl / (balance + 1e-9)
+            if ratio < -0.04:   return round(base * 0.60, 6)   # heavy drawdown
+            if ratio < -0.02:   return round(base * 0.75, 6)   # moderate drawdown
+            if ratio >  0.03:   return round(base * 1.05, 6)   # stable profitability
+
+        return base
+
+    def _quality_scalar(self, confidence: float, all_agree: bool, recent_trades: list) -> float:
+        """Conviction from confidence tier + Kelly history + all-agree. Range: [0.70, 1.40]."""
+        if   confidence >= 0.75: base = 1.20
+        elif confidence >= 0.65: base = 1.00
+        elif confidence >= 0.55: base = 0.85
+        else:                    base = 0.70
+
+        if all_agree:
+            base += 0.15
+
+        kelly_frac  = self._kelly_fraction(recent_trades)
+        kelly_bonus = (kelly_frac - self.KELLY_FRAC_DEFAULT) / self.KELLY_FRAC_DEFAULT * 0.30
+
+        return round(max(0.70, min(1.40, base + kelly_bonus)), 4)
+
+    def _regime_scalar(self, regime: dict) -> float:
+        """Regime size_mult + ADX modifier. Floor at 0.75 prevents regime from collapsing size. Range: [0.75, 1.20]."""
+        size_mult = regime.get("size_mult", 0.85)
+        adx = regime.get("adx", 25.0)
+        if   adx >= 35: adx_mod =  0.10
+        elif adx >= 28: adx_mod =  0.05
+        elif adx <  20: adx_mod = -0.10
+        elif adx <  25: adx_mod = -0.05
+        else:           adx_mod =  0.00
+        return round(max(0.75, min(1.20, size_mult + adx_mod)), 4)
+
+    def _volatility_scalar(self, atr_pct: float, sl_atr_mult: float) -> float:
+        """ATR-normalised stop distance. Wider stop/higher vol → smaller size. Range: [0.60, 1.10]."""
+        raw = self._RISK_NORM / max(sl_atr_mult * atr_pct, 0.001)
+        return round(max(0.60, min(1.10, raw)), 4)
+
+    def _correlation_scalar(self, open_trades) -> float:
+        """Portfolio concentration: 8% reduction per open trade. Range: [0.50, 1.00]."""
+        n_open = len(open_trades) if open_trades else 0
+        return round(max(0.50, 1.0 - n_open * 0.08), 4)
 
     def _kelly_fraction(self, recent_trades: list) -> float:
         """Fractional Kelly from last 20 closed trades, capped at [0.10, 0.25]."""
