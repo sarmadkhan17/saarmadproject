@@ -165,7 +165,7 @@ class MarketRegimeGate:
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
 
-        if adx_val < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.60:
+        if adx_val < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.65:
             return dict(regime="RANGING", gate=True,
                         allow_longs=True, allow_shorts=True,
                         trend_direction=trend_direction, trend_strength=trend_strength,
@@ -173,11 +173,12 @@ class MarketRegimeGate:
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
 
-        # WEAK_TREND: block the contra-trend direction when breadth is clearly one-sided
+        # WEAK_TREND: both directions open — Gate 4b applies breadth-proportional biasing
+        wt_dir = "BULLISH" if breadth > 0.55 else ("BEARISH" if bear_breadth > 0.55 else "NEUTRAL")
         return dict(regime="WEAK_TREND", gate=True,
-                    allow_longs=bear_breadth < 0.60,
-                    allow_shorts=breadth < 0.60,
-                    trend_direction=trend_direction, trend_strength=trend_strength,
+                    allow_longs=True,
+                    allow_shorts=True,
+                    trend_direction=wt_dir, trend_strength=trend_strength,
                     min_conf=0.50, size_mult=0.85,
                     breadth=breadth, bear_breadth=bear_breadth,
                     vol_ratio=vol_ratio, adx=adx_val)
@@ -210,14 +211,15 @@ class MarketRegimeGate:
                         trend_direction=trend_direction, trend_strength="WEAK",
                         min_conf=0.75, size_mult=0.0,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
-        if adx < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.60:
+        if adx < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.65:
             return dict(regime="RANGING", gate=True, allow_longs=True, allow_shorts=True,
                         trend_direction=trend_direction, trend_strength=trend_strength,
                         min_conf=0.62, size_mult=0.55,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
+        wt_dir = "BULLISH" if breadth > 0.55 else ("BEARISH" if bear_breadth > 0.55 else "NEUTRAL")
         return dict(regime="WEAK_TREND", gate=True,
-                    allow_longs=bear_breadth < 0.60, allow_shorts=breadth < 0.60,
-                    trend_direction=trend_direction, trend_strength=trend_strength,
+                    allow_longs=True, allow_shorts=True,
+                    trend_direction=wt_dir, trend_strength=trend_strength,
                     min_conf=0.50, size_mult=0.85,
                     breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
 

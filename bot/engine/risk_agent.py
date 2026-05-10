@@ -214,8 +214,7 @@ class RiskDecisionAgent:
             if action == "SELL" and breadth > 0.50:
                 penalty = min(0.15, (breadth - 0.50) * 1.5)
                 penalised_floor = round(min(
-                    max(getattr(profile, 'min_confidence', 0.45),
-                        regime_ctx.get("min_conf", 0.45)) + penalty,
+                    getattr(profile, 'min_confidence', 0.45) + penalty,
                     0.80,
                 ), 4)
                 if conf < penalised_floor:
@@ -226,8 +225,7 @@ class RiskDecisionAgent:
             elif action == "BUY" and bear_breadth > 0.50:
                 penalty = min(0.15, (bear_breadth - 0.50) * 1.5)
                 penalised_floor = round(min(
-                    max(getattr(profile, 'min_confidence', 0.45),
-                        regime_ctx.get("min_conf", 0.45)) + penalty,
+                    getattr(profile, 'min_confidence', 0.45) + penalty,
                     0.80,
                 ), 4)
                 if conf < penalised_floor:
@@ -250,7 +248,7 @@ class RiskDecisionAgent:
         htf_conflict = (action == "BUY" and htf_bias == "SELL") or (action == "SELL" and htf_bias == "BUY")
         if htf_conflict:
             if htf_mode == "soft":
-                conf = round(conf * 0.50, 4)
+                conf = round(conf * 0.80, 4)
                 reasons.append(f"HTF {htf_bias} softened → conf={conf:.2f}")
             elif htf_mode == "hard":
                 if conf < 0.65:
@@ -269,6 +267,9 @@ class RiskDecisionAgent:
                 conf = round(conf * 0.85, 4)
             elif action == "SELL" and btc_return > 0.015:
                 conf = round(conf * 0.85, 4)
+            if conf < profile.min_confidence:
+                reasons.append(f"BTC momentum: conf={conf:.2f} < {profile.min_confidence}")
+                return RiskDecision(False, reasons, conf, profile=profile.name, htf_bias=htf_bias, hmm_regime=hmm_regime)
 
         # ── Gate 8: Position sizing ──────────────────────────────────
         price = get_price_fn(symbol)

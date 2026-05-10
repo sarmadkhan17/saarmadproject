@@ -105,10 +105,10 @@ _PRESETS = {
         # FVG entries only — no chasing
         allow_market_entry=False, entry_at_fvg=True, entry_at_retracement=False,
         # All filters on for swing context
-        funding_filter_enabled=True, funding_extreme_required=True,
+        funding_filter_enabled=True, funding_extreme_required=False,
         flow_imbalance_ratio=2.0, macro_alignment_required=True, sentiment_standalone=False,
-        # Strict HTF alignment
-        htf_filter_mode="strict", btc_momentum_filter=True,
+        # Hard HTF: counter-HTF signals need conf >= 0.65 to pass
+        htf_filter_mode="hard", btc_momentum_filter=True,
         # Wide TP for multi-day swing (1:3+ RR), tight max heat
         position_size_pct=0.022, stop_loss_atr_mult=1.8, take_profit_atr_mult=5.0,
         max_correlation=0.35, max_portfolio_heat=0.20, trailing_activation_atr=2.0, size_mult=0.85,
@@ -194,8 +194,8 @@ _PRESETS = {
         # Full macro stack
         funding_filter_enabled=True, funding_extreme_required=False,
         flow_imbalance_ratio=1.4, macro_alignment_required=False, sentiment_standalone=False,
-        # HTF required for confluence validity
-        htf_filter_mode="hard", btc_momentum_filter=True,
+        # HTF soft: counter-HTF signals penalized 20% (high-conf still passes)
+        htf_filter_mode="soft", btc_momentum_filter=True,
         # 1:2.5 RR, conservative heat
         position_size_pct=0.020, stop_loss_atr_mult=1.8, take_profit_atr_mult=3.8,
         max_correlation=0.45, max_portfolio_heat=0.38, trailing_activation_atr=1.5, size_mult=1.0,
