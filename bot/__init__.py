@@ -14,7 +14,7 @@ from engine.futures import FuturesBot  # noqa: F401
 from models.ai_strategy import AIStrategyEngine, make_features, make_labels  # noqa: F401
 
 # risk
-from risk.manager import RiskManager, MarketRegimeGate, ATRTrailingStop  # noqa: F401
+from risk.manager import RiskManager, MarketRegimeGate, ExitEngine  # noqa: F401
 
 # agents
 from agents.coordinator import AgentCoordinator  # noqa: F401

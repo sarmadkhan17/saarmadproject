@@ -250,99 +250,248 @@ class MarketRegimeGate:
             return pd.Series([25.0] * len(close), index=close.index)
 
 
-class ATRTrailingStop:
-    def __init__(self, atr_multiplier=2.0):
-        self.multiplier  = atr_multiplier
-        self.peak_prices = {}
-        self.atr_values  = {}
-        self.entry_atrs  = {}
-        self.partial     = {}
-        self._file = DATA / f"trailing_stops_{BOT_MODE}.json"
+class ExitEngine:
+    """
+    Expectancy-optimised exit engine.
+
+    Per-trade state machine:
+      · Early invalidation  — exits fast when breakout fails (volume/momentum)
+      · TP1 partial         — closes tp1_fraction at tp1_r_mult×ATR; arms breakeven
+      · Breakeven clamp     — trailing stop never goes below entry after TP1
+      · ATR trail           — profile trail_atr_mult, widens when dynamic_tp active
+      · Swing structure     — exits on swing-low/high break for more natural stops
+      · Fixed TP backstop   — wide hard cap; skipped when trend is accelerating
+    """
+
+    def __init__(self, default_trail_mult: float = 2.0):
+        self._default_trail = default_trail_mult
+        self._peaks:      dict = {}   # best price seen (low for shorts, high for longs)
+        self._entry_atrs: dict = {}   # ATR at initialisation
+        self._tp1_done:   dict = {}
+        self._be_active:  dict = {}   # breakeven clamp armed
+        self._dirty = False
+        self._file  = DATA / f"exit_engine_{BOT_MODE}.json"
         self._load()
 
     def _load(self):
-        if self._file.exists():
+        if not self._file.exists():
+            return
+        try:
             with open(self._file) as f:
                 d = json.load(f)
-                self.peak_prices = d.get("peaks", {})
-                self.atr_values  = d.get("atrs", {})
-                self.entry_atrs  = d.get("entry_atrs", {})
-                self.partial     = d.get("partial", {})
+            self._peaks      = d.get("peaks", {})
+            self._entry_atrs = d.get("entry_atrs", {})
+            self._tp1_done   = d.get("tp1_done", {})
+            self._be_active  = d.get("be_active", {})
+        except Exception:
+            pass
 
     def _save(self):
-        with open(self._file, "w") as f:
+        tmp = self._file.with_suffix(".tmp.json")
+        with open(tmp, "w") as f:
             json.dump({
-                "peaks":      self.peak_prices,
-                "atrs":       self.atr_values,
-                "entry_atrs": self.entry_atrs,
-                "partial":    self.partial,
+                "peaks":      self._peaks,
+                "entry_atrs": self._entry_atrs,
+                "tp1_done":   self._tp1_done,
+                "be_active":  self._be_active,
             }, f)
-
-    def update(self, trade_id, price, atr, side="long"):
-        if trade_id not in self.peak_prices:
-            self.peak_prices[trade_id] = price
-            self.atr_values[trade_id]  = atr
-            self.entry_atrs[trade_id]  = atr
-            self.partial[trade_id]     = {"tier1": False, "tier2": False}
-        elif side in ("short", "sell"):
-            if price < self.peak_prices[trade_id]:
-                self.peak_prices[trade_id] = price
-                self.atr_values[trade_id]  = atr
-        else:
-            if price > self.peak_prices[trade_id]:
-                self.peak_prices[trade_id] = price
-                self.atr_values[trade_id]  = atr
-        self._dirty = True
+        tmp.replace(self._file)
+        self._dirty = False
 
     def flush(self):
-        if getattr(self, "_dirty", False):
+        if self._dirty:
             self._save()
-            self._dirty = False
 
-    def cleanup(self, trade_id):
-        self.peak_prices.pop(trade_id, None)
-        self.atr_values.pop(trade_id, None)
-        self.entry_atrs.pop(trade_id, None)
-        self.partial.pop(trade_id, None)
+    def cleanup(self, trade_id: str):
+        for store in (self._peaks, self._entry_atrs, self._tp1_done, self._be_active):
+            store.pop(trade_id, None)
         self._save()
 
-    def should_exit(self, trade_id, entry, price, atr, side="long"):
-        """Returns (fraction_to_close, reason). fraction=0.0 means hold."""
-        self.update(trade_id, price, atr, side)
-        is_short  = side in ("short", "sell")
-        entry_atr = self.entry_atrs.get(trade_id, atr)
-        partial   = self.partial.get(trade_id, {"tier1": False, "tier2": False})
-        gain      = (entry - price) if is_short else (price - entry)
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-        # PARTIAL_TP1 removed: closing 40% at +1×ATR produced near-zero wins (~$0.01 avg)
-        # because the remaining 60% frequently got stopped at break-even, netting a loss.
-        # Mark tier1 silently so the tier2 check can still fire.
-        if not partial["tier1"] and gain >= entry_atr:
-            self.partial[trade_id]["tier1"] = True
-            self._dirty = True
+    def _init(self, trade_id: str, price: float, atr: float):
+        self._peaks[trade_id]      = price
+        self._entry_atrs[trade_id] = max(atr, 1e-9)
+        self._tp1_done[trade_id]   = False
+        self._be_active[trade_id]  = False
+        self._dirty = True
 
-        # Partial exit at +2×ATR: take 50% off, let remainder trail to full TP
-        if partial["tier1"] and not partial["tier2"] and gain >= 2 * entry_atr:
-            self.partial[trade_id]["tier2"] = True
-            self._dirty = True
-            return 0.5, "PARTIAL_TP2 +2×ATR"
-
-        # ATR trailing stop on remaining position
-        extreme  = self.peak_prices.get(trade_id, entry)
-        cur_atr  = self.atr_values.get(trade_id, atr)
+    def _update_peak(self, trade_id: str, price: float, atr: float, is_short: bool):
         if is_short:
-            trail_stop = extreme + self.multiplier * cur_atr
-            init_stop  = entry  + self.multiplier * atr
-            stop       = min(trail_stop, init_stop)
-            if price >= stop:
-                return 1.0, f"ATR SL ${stop:.4f} (trough ${extreme:.4f})"
+            if price < self._peaks.get(trade_id, price):
+                self._peaks[trade_id] = price
         else:
-            trail_stop = extreme - self.multiplier * cur_atr
-            init_stop  = entry  - self.multiplier * atr
-            stop       = max(trail_stop, init_stop)
-            if price <= stop:
-                return 1.0, f"ATR SL ${stop:.4f} (peak ${extreme:.4f})"
+            if price > self._peaks.get(trade_id, price):
+                self._peaks[trade_id] = price
+        self._dirty = True
+
+    # ── Main exit decision ────────────────────────────────────────────────────
+
+    def should_exit(
+        self,
+        trade_id: str,
+        entry: float,
+        price: float,
+        atr: float,
+        side: str = "long",
+        profile=None,
+        candle_df=None,
+    ) -> tuple:
+        """Returns (fraction_to_close, reason).  fraction=0.0 → hold."""
+        is_short = side in ("short", "sell")
+
+        # Initialise new trade state
+        if trade_id not in self._peaks:
+            self._init(trade_id, price, max(atr, 1e-9))
+
+        entry_atr = self._entry_atrs.get(trade_id, max(atr, 1e-9))
+        self._update_peak(trade_id, price, atr, is_short)
+
+        # No-ATR fallback — hard 2.5% stop to keep trades safe without data
+        if atr <= 0:
+            gain_pct = ((entry - price) if is_short else (price - entry)) / (entry + 1e-9)
+            if gain_pct < -0.025:
+                return 1.0, "Fixed SL 2.5% (no ATR)"
+            return 0.0, ""
+
+        gain = (entry - price) if is_short else (price - entry)
+
+        # Pull profile params
+        tp1_fraction       = getattr(profile, "tp1_fraction",       0.40)
+        tp1_r_mult         = getattr(profile, "tp1_r_mult",         1.0)
+        trail_mult         = getattr(profile, "trail_atr_mult",      self._default_trail)
+        early_exit_enabled = getattr(profile, "early_exit_enabled",  True)
+        dynamic_tp_enabled = getattr(profile, "dynamic_tp_enabled",  True)
+        tp_backstop_mult   = getattr(profile, "take_profit_atr_mult", 2.5)
+
+        tp1_done  = self._tp1_done.get(trade_id, False)
+        be_active = self._be_active.get(trade_id, False)
+
+        # ── 1. Early invalidation (pre-TP1, only when trade is losing) ────────
+        if early_exit_enabled and not tp1_done:
+            reason = self._check_invalidation(entry, price, entry_atr, gain, is_short, candle_df)
+            if reason:
+                return 1.0, f"INVALIDATION: {reason}"
+
+        # ── 2. TP1 partial — lock in fraction, arm breakeven ─────────────────
+        if not tp1_done and gain >= tp1_r_mult * entry_atr:
+            self._tp1_done[trade_id]  = True
+            self._be_active[trade_id] = True
+            self._dirty = True
+            return tp1_fraction, f"PARTIAL_TP1 +{tp1_r_mult:.1f}R ({tp1_fraction:.0%})"
+
+        # ── 3. Dynamic TP extension — skip backstop when trend accelerates ────
+        skip_backstop = (
+            dynamic_tp_enabled and tp1_done
+            and candle_df is not None
+            and self._trend_accelerating(candle_df, is_short)
+        )
+
+        # ── 4. Fixed TP backstop (wide — only fires on truly large moves) ─────
+        if not skip_backstop and gain >= tp_backstop_mult * entry_atr:
+            return 1.0, f"TP_BACKSTOP +{tp_backstop_mult:.1f}R"
+
+        # ── 5. ATR trailing stop (clamped to breakeven after TP1) ────────────
+        peak = self._peaks.get(trade_id, entry)
+        if is_short:
+            trail_stop = peak + trail_mult * atr
+            if be_active:
+                trail_stop = min(trail_stop, entry)  # never above entry for shorts
+            if price >= trail_stop:
+                return 1.0, f"ATR_TRAIL SL ${trail_stop:.4f} (trough=${peak:.4f})"
+        else:
+            trail_stop = peak - trail_mult * atr
+            if be_active:
+                trail_stop = max(trail_stop, entry)  # never below entry for longs
+            if price <= trail_stop:
+                return 1.0, f"ATR_TRAIL SL ${trail_stop:.4f} (peak=${peak:.4f})"
+
+        # ── 6. Swing structure trailing (post-TP1, uses confirmed candle lows/highs) ─
+        if tp1_done and candle_df is not None:
+            reason = self._swing_trail(entry, price, atr, is_short, be_active, candle_df)
+            if reason:
+                return 1.0, reason
+
         return 0.0, ""
+
+    # ── Signal helpers ────────────────────────────────────────────────────────
+
+    def _check_invalidation(
+        self, entry: float, price: float, entry_atr: float,
+        gain: float, is_short: bool, candle_df,
+    ) -> str:
+        """Return non-empty reason when pre-TP1 trade should be cut fast."""
+        if candle_df is None or len(candle_df) < 5:
+            return ""
+        # Only invalidate when clearly losing (more than 0.3R underwater)
+        if gain > -0.3 * entry_atr:
+            return ""
+
+        # Volume collapse: current bar volume < 35% of 20-bar avg
+        try:
+            vol = candle_df["volume"]
+            avg = float(vol.iloc[-21:-1].mean()) if len(vol) >= 21 else float(vol.mean())
+            cur = float(vol.iloc[-1])
+            if avg > 0 and cur < 0.35 * avg:
+                return f"volume_collapse ({cur:.0f} < 35% avg {avg:.0f})"
+        except Exception:
+            pass
+
+        # Momentum reversal: 3 consecutive closed candles moving against trade
+        try:
+            c = candle_df["close"]
+            if len(c) >= 4:
+                c1, c2, c3 = float(c.iloc[-4]), float(c.iloc[-3]), float(c.iloc[-2])
+                if is_short and c1 < c2 < c3:
+                    return "momentum_reversal (3 rising closes vs short)"
+                if not is_short and c1 > c2 > c3:
+                    return "momentum_reversal (3 falling closes vs long)"
+        except Exception:
+            pass
+
+        return ""
+
+    def _trend_accelerating(self, candle_df, is_short: bool) -> bool:
+        """Return True when volume is expanding AND price momentum is on-side."""
+        try:
+            if len(candle_df) < 8:
+                return False
+            vol = candle_df["volume"]
+            c   = candle_df["close"]
+            vol_avg = float(vol.iloc[-9:-1].mean())
+            cur_vol = float(vol.iloc[-1])
+            # 3-bar price momentum
+            m3 = (float(c.iloc[-1]) - float(c.iloc[-4])) / (float(c.iloc[-4]) + 1e-9)
+            on_side = (m3 < -0.005) if is_short else (m3 > 0.005)
+            return cur_vol > 1.2 * vol_avg and on_side
+        except Exception:
+            return False
+
+    def _swing_trail(
+        self, entry: float, price: float, atr: float,
+        is_short: bool, be_active: bool, candle_df,
+    ) -> str:
+        """Swing-low/high trail using last 10 confirmed candle bars."""
+        try:
+            recent = candle_df.iloc[-10:]
+            if is_short:
+                # Trail at confirmed swing high (3-bar rolling max, shift 1 bar back)
+                swing_h = float(recent["high"].rolling(3).max().iloc[-2])
+                stop = swing_h + 0.2 * atr
+                if be_active:
+                    stop = min(stop, entry)
+                if price >= stop:
+                    return f"SWING_TRAIL SL ${stop:.4f} (swing_high=${swing_h:.4f})"
+            else:
+                swing_l = float(recent["low"].rolling(3).min().iloc[-2])
+                stop = swing_l - 0.2 * atr
+                if be_active:
+                    stop = max(stop, entry)
+                if price <= stop:
+                    return f"SWING_TRAIL SL ${stop:.4f} (swing_low=${swing_l:.4f})"
+        except Exception:
+            pass
+        return ""
 
 
 class KellyCriterionSizer:
@@ -573,20 +722,24 @@ class CircuitBreaker:
 
 class RiskManager:
     def __init__(self, config):
-        risk             = config.get("risk", {})
-        self.market_gate = MarketRegimeGate()
-        self.correlation = CorrelationFilter()
-        self.trailing    = ATRTrailingStop(risk.get("stop_loss_atr_multiplier", 3.0))
-        self.sizer       = KellyCriterionSizer(config)
-        self.breaker     = CircuitBreaker(risk)
-        self.heat        = PortfolioHeatTracker(risk.get("max_portfolio_heat", 0.40))
-        self.sl_min_pct  = risk.get("stop_loss_min_pct", 0.015)
-        self.tp_atr_mult = risk.get("take_profit_atr_multiplier", 2.5)
-        self.fallback_tp = risk.get("take_profit_pct", 0.05)
+        risk              = config.get("risk", {})
+        self.market_gate  = MarketRegimeGate()
+        self.correlation  = CorrelationFilter()
+        self.exit_engine  = ExitEngine(risk.get("stop_loss_atr_multiplier", 2.0))
+        self.sizer        = KellyCriterionSizer(config)
+        self.breaker      = CircuitBreaker(risk)
+        self.heat         = PortfolioHeatTracker(risk.get("max_portfolio_heat", 0.40))
+        self.sl_min_pct   = risk.get("stop_loss_min_pct", 0.015)
 
-    def check_exits(self, open_trades, get_price_fn, get_atr_fn):
+    def check_exits(self, open_trades, get_price_fn, get_atr_fn,
+                    get_ohlcv_fn=None, profile=None):
+        """
+        Evaluate all open trades for exit conditions via ExitEngine.
+        get_ohlcv_fn(symbol) → pd.DataFrame | None  (trading-timeframe candles, limit≈30)
+        profile → TradingProfile (controls TP1, trail multiplier, early-exit flags)
+        """
         exits = []
-        now = datetime.now(timezone.utc) if hasattr(self, 'tp_atr_mult') else None
+        now   = datetime.now(timezone.utc)
         for trade in open_trades:
             price = get_price_fn(trade["symbol"])
             if price is None or price <= 0:
@@ -596,61 +749,29 @@ class RiskManager:
             side     = trade.get("side", "long")
             is_short = side in ("short", "sell")
 
-            stale_exit = False
-            if now:
-                try:
-                    opened = datetime.fromisoformat(trade.get("timestamp", ""))
-                    if opened.tzinfo is None:
-                        opened = opened.replace(tzinfo=timezone.utc)
-                    age_hours = (now - opened).total_seconds() / 3600
-                    if age_hours > 72:
-                        pnl_est = (price - entry) / entry * 100
-                        if is_short:
-                            pnl_est = -pnl_est
-                        if pnl_est < 0:
-                            stale_exit = True
-                except (ValueError, TypeError):
-                    pass
+            # Stale exit: trade > 72h old and still losing
+            try:
+                opened = datetime.fromisoformat(trade.get("timestamp", ""))
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                if (now - opened).total_seconds() > 72 * 3600:
+                    pnl_est = ((entry - price) if is_short else (price - entry)) / entry
+                    if pnl_est < 0:
+                        exits.append((trade, price, "Stale exit (72h, loss)", 1.0))
+                        continue
+            except (ValueError, TypeError):
+                pass
 
-            if stale_exit:
-                exits.append((trade, price, f"Stale exit (72h, loss)", 1.0))
-                continue
+            atr       = get_atr_fn(trade["symbol"])
+            candle_df = get_ohlcv_fn(trade["symbol"]) if get_ohlcv_fn else None
 
-            atr = get_atr_fn(trade["symbol"])
-            if atr > 0:
-                tp_distance = atr * self.tp_atr_mult
-                if is_short:
-                    tp_price = entry - tp_distance
-                    if price <= tp_price:
-                        exits.append((trade, price, f"ATR TP ${tp_price:.4f} ({self.tp_atr_mult}xATR)", 1.0))
-                        continue
-                else:
-                    tp_price = entry + tp_distance
-                    if price >= tp_price:
-                        exits.append((trade, price, f"ATR TP ${tp_price:.4f} ({self.tp_atr_mult}xATR)", 1.0))
-                        continue
-            else:
-                if is_short:
-                    if price <= entry * (1 - self.fallback_tp):
-                        exits.append((trade, price, f"Fixed TP {self.fallback_tp:.0%}", 1.0))
-                        continue
-                else:
-                    if price >= entry * (1 + self.fallback_tp):
-                        exits.append((trade, price, f"Fixed TP {self.fallback_tp:.0%}", 1.0))
-                        continue
+            fraction, reason = self.exit_engine.should_exit(
+                trade_id, entry, price, atr, side, profile, candle_df
+            )
+            if fraction > 0:
+                exits.append((trade, price, reason, fraction))
 
-            if atr > 0:
-                fraction, reason = self.trailing.should_exit(trade_id, entry, price, atr, side)
-                if fraction > 0:
-                    exits.append((trade, price, reason, fraction))
-                    continue
-                self.trailing.update(trade_id, price, atr, side)
-            else:
-                if is_short and price >= entry * 1.025:
-                    exits.append((trade, price, "Fixed SL 2.5%", 1.0))
-                elif not is_short and price <= entry * 0.975:
-                    exits.append((trade, price, "Fixed SL 2.5%", 1.0))
-        self.trailing.flush()
+        self.exit_engine.flush()
         return exits
 
     def can_open_trade(self, symbol, open_trades, balance, new_usdt, get_price_fn):
@@ -708,7 +829,7 @@ class RiskManager:
         return round(max(0.35, min(0.65, base_min_conf + adj)), 4)
 
     def cleanup_trade(self, trade_id):
-        self.trailing.cleanup(trade_id)
+        self.exit_engine.cleanup(trade_id)
 
     def flush(self):
-        self.trailing.flush()
+        self.exit_engine.flush()

@@ -906,21 +906,35 @@ class BaseBot:
     def check_exits(self):
         """
         Check open trades for exit conditions.
-        Pre-fetches ATR values in parallel to avoid sequential API calls.
+        Pre-fetches ATR + OHLCV in parallel; passes profile for exit engine params.
         """
         trades = self.state.get_open_trades()
         if not trades:
             return
         symbols = list(set(t["symbol"] for t in trades))
-        atr_cache = {}
-        def _fetch_atr(s):
-            return s, self.get_atr(s)
+        atr_cache   = {}
+        ohlcv_cache = {}
+        tf = self.config.get("scanner", {}).get("timeframe", "15m")
+
+        def _fetch_data(s):
+            atr = self.get_atr(s)
+            df  = self.feed.fetch_ohlcv(s, tf, limit=30)
+            return s, atr, df
+
         with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as ex:
-            for s, atr in ex.map(_fetch_atr, symbols):
-                atr_cache[s] = atr
+            for s, atr, df in ex.map(_fetch_data, symbols):
+                atr_cache[s]   = atr
+                ohlcv_cache[s] = df
+
         def _get_atr_cached(symbol):
             return atr_cache.get(symbol, 0.0)
-        exits = self.risk.check_exits(trades, self.get_price, _get_atr_cached)
+
+        def _get_ohlcv_cached(symbol):
+            return ohlcv_cache.get(symbol)
+
+        exits = self.risk.check_exits(
+            trades, self.get_price, _get_atr_cached, _get_ohlcv_cached, self.profile
+        )
         for trade, price, reason, fraction in exits:
             close_amount = trade["amount"] * fraction
             _sym_lk = self._get_symbol_lock(trade["symbol"])
@@ -947,14 +961,18 @@ class BaseBot:
                                 trade["symbol"], trade.get("sl_order_id", "")
                             )
                             atr = _get_atr_cached(trade["symbol"])
-                            if atr and atr > 0:
+                            # TP1: move exchange SL to breakeven (atr=0 → entry ± min_pct buffer)
+                            is_tp1 = "PARTIAL_TP1" in reason
+                            sl_atr = 0.0 if is_tp1 else (atr if atr and atr > 0 else 0.0)
+                            if sl_atr > 0 or is_tp1:
                                 new_sl_id = self.execution._place_sl(
                                     trade["symbol"], trade["side"], remaining,
-                                    float(trade["price"]), atr,
+                                    float(trade["price"]), sl_atr,
                                 )
                                 if new_sl_id:
                                     self.state.update_trade_sl(trade["id"], new_sl_id)
-                                    self.log.info(f"SL re-placed for {trade['symbol']}: {remaining:.4f} remaining")
+                                    label = "breakeven" if is_tp1 else f"ATR×{atr:.4f}"
+                                    self.log.info(f"SL re-placed [{label}] {trade['symbol']}: {remaining:.4f} remaining")
                 self.ai.record_trade_result(trade["symbol"], pnl)
                 self.agents.record_trade_result(trade["symbol"], pnl)
                 self.risk.record_trade_result(pnl, self.get_usdt_balance())

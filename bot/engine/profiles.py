@@ -56,6 +56,13 @@ class TradingProfile:
     trailing_activation_atr: float = 1.0
     size_mult: float = 1.0
 
+    # ── Exit Engine ──
+    tp1_fraction: float = 0.40        # fraction closed at TP1
+    tp1_r_mult: float = 1.0           # TP1 fires at N × entry_atr gain
+    trail_atr_mult: float = 2.0       # trailing stop multiplier (post-TP1)
+    early_exit_enabled: bool = True   # exit failing trades on invalidation signals
+    dynamic_tp_enabled: bool = True   # skip fixed TP backstop when trend accelerates
+
     # ── Confluence Scoring (CONFLUENCE profile only) ──
     use_confluence_scoring: bool = False
     confluence_threshold_trending: float = 0.55
@@ -112,6 +119,9 @@ _PRESETS = {
         # Wide TP for multi-day swing (1:3+ RR), tight max heat
         position_size_pct=0.022, stop_loss_atr_mult=1.8, take_profit_atr_mult=5.0,
         max_correlation=0.35, max_portfolio_heat=0.20, trailing_activation_atr=2.0, size_mult=0.85,
+        # Exit: wide trail for swing holds; no early invalidation (need room to breathe)
+        tp1_fraction=0.40, tp1_r_mult=1.0, trail_atr_mult=2.5,
+        early_exit_enabled=False, dynamic_tp_enabled=True,
     ),
 
     # ── BALANCED: 10–12h intraday, steady compounding ─────────────────────────
@@ -137,6 +147,9 @@ _PRESETS = {
         # 1:2 RR for intraday holds
         position_size_pct=0.022, stop_loss_atr_mult=1.6, take_profit_atr_mult=3.2,
         max_correlation=0.50, max_portfolio_heat=0.40, trailing_activation_atr=1.5, size_mult=1.0,
+        # Exit: moderate trail; early invalidation enabled
+        tp1_fraction=0.40, tp1_r_mult=1.0, trail_atr_mult=1.8,
+        early_exit_enabled=True, dynamic_tp_enabled=True,
     ),
 
     # ── AGGRESSIVE: momentum scalp, breakout/volume-driven ────────────────────
@@ -162,6 +175,9 @@ _PRESETS = {
         # Tight SL/TP for scalp (1:1.6 RR), conservative sizing
         position_size_pct=0.015, stop_loss_atr_mult=0.9, take_profit_atr_mult=1.6,
         max_correlation=0.55, max_portfolio_heat=0.50, trailing_activation_atr=0.6, size_mult=1.0,
+        # Exit: fast invalidation + tight trail; no dynamic extension (scalp — take the win)
+        tp1_fraction=0.50, tp1_r_mult=0.8, trail_atr_mult=1.2,
+        early_exit_enabled=True, dynamic_tp_enabled=False,
     ),
 
     # ── CONFLUENCE: quality overlay — highest bar, all dimensions required ─────
@@ -199,5 +215,8 @@ _PRESETS = {
         # 1:2.5 RR, conservative heat
         position_size_pct=0.020, stop_loss_atr_mult=1.8, take_profit_atr_mult=3.8,
         max_correlation=0.45, max_portfolio_heat=0.38, trailing_activation_atr=1.5, size_mult=1.0,
+        # Exit: full early + dynamic; 2×ATR trail for swing context
+        tp1_fraction=0.40, tp1_r_mult=1.0, trail_atr_mult=2.0,
+        early_exit_enabled=True, dynamic_tp_enabled=True,
     ),
 }
