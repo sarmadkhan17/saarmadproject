@@ -145,13 +145,12 @@ class MarketRegimeGate:
                         vol_ratio=vol_ratio, adx=adx_val)
 
         if adx_val > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
-            # Direction from breadth consensus — BTC EMA lags during altcoin-led moves
-            st_allow_longs  = breadth > 0.60
-            st_allow_shorts = bear_breadth > 0.60
-            st_dir = "BULLISH" if st_allow_longs else "BEARISH"
+            # Both directions open — Gate 4b applies breadth-proportional confidence biasing
+            # (restricts counter-trend shorts/longs without hard-blocking high-conviction signals)
+            st_dir = "BULLISH" if breadth > 0.60 else "BEARISH"
             return dict(regime="STRONG_TREND", gate=True,
-                        allow_longs=st_allow_longs,
-                        allow_shorts=st_allow_shorts,
+                        allow_longs=True,
+                        allow_shorts=True,
                         trend_direction=st_dir, trend_strength="STRONG",
                         min_conf=0.45, size_mult=1.2,
                         breadth=breadth, bear_breadth=bear_breadth,
@@ -200,11 +199,9 @@ class MarketRegimeGate:
                         min_conf=0.70, size_mult=0.3,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if adx > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
-            st_allow_longs  = breadth > 0.60
-            st_allow_shorts = bear_breadth > 0.60
-            st_dir = "BULLISH" if st_allow_longs else "BEARISH"
+            st_dir = "BULLISH" if breadth > 0.60 else "BEARISH"
             return dict(regime="STRONG_TREND", gate=True,
-                        allow_longs=st_allow_longs, allow_shorts=st_allow_shorts,
+                        allow_longs=True, allow_shorts=True,
                         trend_direction=st_dir, trend_strength="STRONG",
                         min_conf=0.45, size_mult=1.2,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
