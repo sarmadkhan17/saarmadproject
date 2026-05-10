@@ -51,10 +51,12 @@ class EnsembleEngine:
 
         signals = []
         with ThreadPoolExecutor(max_workers=min(4, len(agents))) as pool:
-            futures = {
-                pool.submit(agent.analyze, df, profile): name
-                for name, agent in agents.items()
-            }
+            futures = {}
+            for name, agent in agents.items():
+                if name == "smc":
+                    futures[pool.submit(agent.analyze, df, profile, market_ctx)] = name
+                else:
+                    futures[pool.submit(agent.analyze, df, profile)] = name
             for future in as_completed(futures):
                 name = futures[future]
                 try:
@@ -68,7 +70,8 @@ class EnsembleEngine:
             return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, 0, signals, "no_agents")
 
         ctx     = market_ctx or {}
-        regime  = ctx.get("hmm_regime") or ctx.get("regime", "RANGING")
+        # Prefer MarketRegimeGate regime (uses ADX + breadth) over HMM (log-return only, lags 3 bars)
+        regime  = ctx.get("regime") or ctx.get("hmm_regime") or "RANGING"
         return self._aggregate(signals, profile, market_ctx=ctx, regime=regime)
 
     def _aggregate(self, signals: list, profile,

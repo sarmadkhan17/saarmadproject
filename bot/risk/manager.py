@@ -431,7 +431,11 @@ class ExitEngine:
         # Use iloc[-2] — iloc[-1] is the forming (incomplete) candle with near-zero volume
         try:
             vol = candle_df["volume"]
-            avg = float(vol.iloc[-22:-2].mean()) if len(vol) >= 22 else float(vol.iloc[:-1].mean())
+            if len(vol) >= 22:
+                avg = float(vol.iloc[-22:-2].mean())
+            else:
+                n = min(len(vol) - 2, 20)
+                avg = float(vol.iloc[-n-1:-1].mean()) if n > 0 else 0.0
             cur = float(vol.iloc[-2])
             if avg > 0 and cur < 0.35 * avg:
                 return f"volume_collapse ({cur:.0f} < 35% avg {avg:.0f})"

@@ -27,7 +27,7 @@ class SMCAgent:
     def __init__(self, lookback: int = 5):
         self.lookback = lookback
 
-    def analyze(self, df: pd.DataFrame, profile) -> AgentSignal:
+    def analyze(self, df: pd.DataFrame, profile, market_ctx=None) -> AgentSignal:
         if df is None or len(df) < 50:
             return AgentSignal("smc", 0, 0, 0, 0, reasoning="insufficient data")
 
@@ -38,6 +38,11 @@ class SMCAgent:
 
         pivots_high, pivots_low = self._detect_pivots(high, low)
         structure = self._track_structure(pivots_high, pivots_low)
+
+        # In STRONG_TREND/TRENDING regimes, suppress SMC bearish reversal patterns (sweep above
+        # pivot highs, BOS below recent lows) — they fire on normal pullbacks within the trend.
+        _regime_str = ((market_ctx or {}).get("regime") or "").upper()
+        _trending = "TREND" in _regime_str
 
         # Sub-checks
         checks = {}
@@ -59,7 +64,8 @@ class SMCAgent:
             buy_score += 0.35
             reasons_parts.append(f"sweep+{sweep.get('pct',0):.2%}")
             active_checks += 1
-        elif sweep.get("direction") == "bearish":
+        elif sweep.get("direction") == "bearish" and not _trending:
+            # In a strong trend, a wick above prior highs is a breakout, not a sweep — skip
             sell_score += 0.35
             reasons_parts.append(f"sweep-{sweep.get('pct',0):.2%}")
             active_checks += 1
@@ -70,7 +76,8 @@ class SMCAgent:
             buy_score += 0.30
             reasons_parts.append(f"BOS+{bos.get('body_pct',0):.0%}")
             active_checks += 1
-        elif bos.get("direction") == "bearish":
+        elif bos.get("direction") == "bearish" and not _trending:
+            # In a strong trend, shallow pullbacks below recent lows are normal — skip bearish BOS
             sell_score += 0.30
             reasons_parts.append(f"BOS-{bos.get('body_pct',0):.0%}")
             active_checks += 1
