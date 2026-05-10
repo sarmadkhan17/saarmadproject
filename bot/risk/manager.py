@@ -124,9 +124,14 @@ class MarketRegimeGate:
         breadth      = bull / checked if checked else 0.5
         bear_breadth = bear / checked if checked else 0.5
 
+        trend_direction = "BULLISH" if btc_bullish else ("BEARISH" if btc_bearish else "NEUTRAL")
+        trend_strength  = "STRONG" if adx_val > 30 else ("MODERATE" if adx_val > 22 else "WEAK")
+
         if chg_4h < -0.05 or chg_24h < -0.10:
-            return dict(regime="CRASH", gate=False,
+            # gate=True: allow short entries; allow_longs=False blocks the other side
+            return dict(regime="CRASH", gate=True,
                         allow_longs=False, allow_shorts=True,
+                        trend_direction="BEARISH", trend_strength="STRONG",
                         min_conf=0.65, size_mult=0.4,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
@@ -134,15 +139,17 @@ class MarketRegimeGate:
         if vol_ratio > 2.0:
             return dict(regime="HIGH_VOLATILITY", gate=False,
                         allow_longs=False, allow_shorts=False,
+                        trend_direction=trend_direction, trend_strength=trend_strength,
                         min_conf=0.70, size_mult=0.3,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
 
         if adx_val > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
-            # Only allow trades in the direction the trend is running
+            # Direction-symmetric: longs only in bullish trend, shorts only in bearish trend
             return dict(regime="STRONG_TREND", gate=True,
                         allow_longs=btc_bullish,
                         allow_shorts=btc_bearish,
+                        trend_direction=trend_direction, trend_strength="STRONG",
                         min_conf=0.45, size_mult=1.2,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
@@ -151,6 +158,7 @@ class MarketRegimeGate:
         if adx_val < 18 or (adx_val < 22 and vol_ratio < 0.85 and abs(breadth - 0.5) < 0.12):
             return dict(regime="CHOPPY", gate=False,
                         allow_longs=False, allow_shorts=False,
+                        trend_direction=trend_direction, trend_strength="WEAK",
                         min_conf=0.75, size_mult=0.0,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
@@ -158,6 +166,7 @@ class MarketRegimeGate:
         if adx_val < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.60:
             return dict(regime="RANGING", gate=True,
                         allow_longs=True, allow_shorts=True,
+                        trend_direction=trend_direction, trend_strength=trend_strength,
                         min_conf=0.62, size_mult=0.55,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
@@ -166,6 +175,7 @@ class MarketRegimeGate:
         return dict(regime="WEAK_TREND", gate=True,
                     allow_longs=bear_breadth < 0.60,
                     allow_shorts=breadth < 0.60,
+                    trend_direction=trend_direction, trend_strength=trend_strength,
                     min_conf=0.50, size_mult=0.85,
                     breadth=breadth, bear_breadth=bear_breadth,
                     vol_ratio=vol_ratio, adx=adx_val)
@@ -174,35 +184,44 @@ class MarketRegimeGate:
                              bear_breadth: float, chg_4h: float, chg_24h: float,
                              btc_bullish: bool = False, btc_bearish: bool = False) -> dict:
         """Test helper: run classification logic without fetching live data."""
+        trend_direction = "BULLISH" if btc_bullish else ("BEARISH" if btc_bearish else "NEUTRAL")
+        trend_strength  = "STRONG" if adx > 30 else ("MODERATE" if adx > 22 else "WEAK")
         if chg_4h < -0.05 or chg_24h < -0.10:
-            return dict(regime="CRASH", gate=False, allow_longs=False, allow_shorts=True,
+            return dict(regime="CRASH", gate=True, allow_longs=False, allow_shorts=True,
+                        trend_direction="BEARISH", trend_strength="STRONG",
                         min_conf=0.65, size_mult=0.4,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if vol_ratio > 2.0:
             return dict(regime="HIGH_VOLATILITY", gate=False, allow_longs=False, allow_shorts=False,
+                        trend_direction=trend_direction, trend_strength=trend_strength,
                         min_conf=0.70, size_mult=0.3,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if adx > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
             return dict(regime="STRONG_TREND", gate=True,
                         allow_longs=btc_bullish, allow_shorts=btc_bearish,
+                        trend_direction=trend_direction, trend_strength="STRONG",
                         min_conf=0.45, size_mult=1.2,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if adx < 18 or (adx < 22 and vol_ratio < 0.85 and abs(breadth - 0.5) < 0.12):
             return dict(regime="CHOPPY", gate=False, allow_longs=False, allow_shorts=False,
+                        trend_direction=trend_direction, trend_strength="WEAK",
                         min_conf=0.75, size_mult=0.0,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if adx < 22 and vol_ratio < 0.9 and 0.30 < breadth < 0.60:
             return dict(regime="RANGING", gate=True, allow_longs=True, allow_shorts=True,
+                        trend_direction=trend_direction, trend_strength=trend_strength,
                         min_conf=0.62, size_mult=0.55,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         return dict(regime="WEAK_TREND", gate=True,
                     allow_longs=bear_breadth < 0.60, allow_shorts=breadth < 0.60,
+                    trend_direction=trend_direction, trend_strength=trend_strength,
                     min_conf=0.50, size_mult=0.85,
                     breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
 
     def _neutral(self) -> dict:
         return dict(regime="UNKNOWN", gate=True,
                     allow_longs=True, allow_shorts=True,
+                    trend_direction="NEUTRAL", trend_strength="MODERATE",
                     min_conf=0.52, size_mult=0.8,
                     breadth=0.5, bear_breadth=0.5, vol_ratio=1.0, adx=25.0)
 

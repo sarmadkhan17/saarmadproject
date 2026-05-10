@@ -34,34 +34,52 @@ class RiskDecisionAgent:
     # ── Quality Score ─────────────────────────────────────────────────────────
     def _compute_quality_score(self, ensemble, df_1h, regime_ctx: dict) -> float:
         """
-        Composite quality score: confidence × trend_strength × volume_factor × regime_factor.
-        Replaces confidence-only gating. All profiles use this; CONFLUENCE also applies
-        its weighted scoring on top.
+        Composite quality score — weighted additive formula, all inputs normalized 0–1.
+          quality = confidence*0.4 + trend_strength*0.3 + volume_factor*0.2 + regime_factor*0.1
+        Expected ranges: weak 0.20–0.35 | medium 0.40–0.60 | strong 0.65+
         """
         ctx = regime_ctx or {}
         adx = ctx.get("adx", 25.0)
         vol_ratio = ctx.get("vol_ratio", 1.0)
 
-        # Trend strength (ADX 15→40 maps to 0.2→1.0)
-        trend_factor = min(1.0, max(0.2, (adx - 15.0) / 25.0))
+        # Confidence: already 0–1
+        confidence = float(ensemble.confidence)
 
-        # Volume factor (vol_ratio 0.5→2.0 maps to 0.3→1.0)
-        volume_factor = min(1.0, max(0.3, (vol_ratio - 0.5) / 1.5))
+        # Trend strength: ADX 15→40 maps linearly to 0.0→1.0
+        trend_strength = min(1.0, max(0.0, (adx - 15.0) / 25.0))
 
-        # Regime factor — rewards trending, penalises choppy
+        # Volume factor: vol_ratio 0.5→2.0 maps linearly to 0.0→1.0
+        volume_factor = min(1.0, max(0.0, (vol_ratio - 0.5) / 1.5))
+
+        # Regime factor — direction-aware: CRASH/STRONG_TREND scored by alignment with trade
         regime_scores = {
-            "STRONG_TREND":   1.00,
-            "TRENDING":       0.90,
-            "WEAK_TREND":     0.72,
-            "RANGING":        0.52,
-            "HIGH_VOLATILITY":0.32,
-            "CHOPPY":         0.10,
-            "CRASH":          0.08,
+            "STRONG_TREND":    1.00,
+            "TRENDING":        0.90,
+            "WEAK_TREND":      0.72,
+            "RANGING":         0.52,
+            "HIGH_VOLATILITY": 0.32,
+            "CHOPPY":          0.10,
+            "CRASH":           0.08,
         }
+        action = getattr(ensemble, "action", "BUY")
         regime = ctx.get("hmm_regime", ctx.get("regime", "RANGING"))
-        regime_factor = regime_scores.get(regime, 0.52)
+        if regime == "CRASH":
+            # Shorts align with crash direction; longs are contra-crash
+            regime_factor = 0.70 if action == "SELL" else 0.05
+        elif regime == "STRONG_TREND":
+            trend_dir = ctx.get("trend_direction", "NEUTRAL")
+            if (action == "BUY" and trend_dir == "BEARISH") or (action == "SELL" and trend_dir == "BULLISH"):
+                regime_factor = 0.30  # contra-trend quality penalty
+            else:
+                regime_factor = 1.00
+        else:
+            regime_factor = regime_scores.get(regime, 0.52)
 
-        return round(ensemble.confidence * trend_factor * volume_factor * regime_factor, 4)
+        quality = (confidence    * 0.4
+                   + trend_strength * 0.3
+                   + volume_factor  * 0.2
+                   + regime_factor  * 0.1)
+        return round(quality, 4)
 
     # ── Confluence Score (CONFLUENCE profile) ─────────────────────────────────
     def _confluence_score(self, ensemble, df_1h, regime_ctx: dict, profile) -> tuple:
@@ -284,7 +302,7 @@ class RiskDecisionAgent:
             return RiskDecision(False, reasons, conf, profile=profile.name, htf_bias=htf_bias, hmm_regime=hmm_regime)
 
         # ── Gate 11: Composite quality score (all profiles) ──────────
-        # quality = confidence × trend_strength × volume_factor × regime_factor
+        # quality = conf*0.4 + trend*0.3 + volume*0.2 + regime*0.1  (additive, each 0–1)
         quality = self._compute_quality_score(ensemble, df_1h, regime_ctx)
         min_quality = getattr(profile, 'min_quality_score', 0.40)
         if quality < min_quality:

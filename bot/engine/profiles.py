@@ -22,7 +22,7 @@ class TradingProfile:
 
     # ── Trend Quality Gate ──
     adx_min: float = 20.0            # minimum ADX at entry
-    min_quality_score: float = 0.40  # minimum composite quality score
+    min_quality_score: float = 0.47  # minimum composite quality score (additive formula)
 
     # ── SMC Rules ──
     smc_liquidity_sweep_pct: float = 0.005
@@ -98,7 +98,7 @@ _PRESETS = {
         min_confidence=0.70, min_agent_agreement=3, net_score_threshold=0.48,
         ml_prob_threshold=0.78, smc_sub_checks_min=4,
         # Hard trend requirement — no chop trades
-        adx_min=28.0, min_quality_score=0.58,
+        adx_min=28.0, min_quality_score=0.60,
         # Near-complete SMC structure
         smc_liquidity_sweep_pct=0.008, smc_bos_body_pct=0.65,
         smc_fvg_required=True, smc_volume_spike_ratio=2.0, smc_pattern_completion=0.85,
@@ -123,7 +123,7 @@ _PRESETS = {
         min_confidence=0.58, min_agent_agreement=2, net_score_threshold=0.32,
         ml_prob_threshold=0.68, smc_sub_checks_min=2,
         # Moderate trend quality gate
-        adx_min=22.0, min_quality_score=0.45,
+        adx_min=22.0, min_quality_score=0.47,
         # SMC with volume confirmation
         smc_liquidity_sweep_pct=0.003, smc_bos_body_pct=0.45,
         smc_fvg_required=False, smc_volume_spike_ratio=1.6, smc_pattern_completion=0.68,
@@ -148,7 +148,7 @@ _PRESETS = {
         min_confidence=0.54, min_agent_agreement=2, net_score_threshold=0.28,
         ml_prob_threshold=0.62, smc_sub_checks_min=1,
         # Breakout focus: ADX floor + volume spike primary signal
-        adx_min=20.0, min_quality_score=0.38,
+        adx_min=20.0, min_quality_score=0.30,
         # Volume spike is the primary confirmation
         smc_liquidity_sweep_pct=0.003, smc_bos_body_pct=0.20,
         smc_fvg_required=False, smc_volume_spike_ratio=2.0, smc_pattern_completion=0.45,
@@ -185,7 +185,7 @@ _PRESETS = {
         min_confidence=0.52, min_agent_agreement=2, net_score_threshold=0.28,
         ml_prob_threshold=0.65, smc_sub_checks_min=2,
         # Trend quality overlay
-        adx_min=22.0, min_quality_score=0.52,
+        adx_min=22.0, min_quality_score=0.55,
         # SMC structure required
         smc_liquidity_sweep_pct=0.004, smc_bos_body_pct=0.35,
         smc_fvg_required=False, smc_volume_spike_ratio=1.5, smc_pattern_completion=0.60,

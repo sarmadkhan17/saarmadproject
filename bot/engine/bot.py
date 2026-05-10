@@ -638,6 +638,7 @@ class BaseBot:
         self.log.info(f"Training complete: {results}")
         self._check_model_health(results)
         self.agents.invalidate_cache()
+        self.ml_agent._scaler = None  # force reload of fresh feature metadata next cycle
 
     def _train(self, quick: bool = False, force: bool = False):
         self._reload_config()
@@ -745,6 +746,7 @@ class BaseBot:
             self.log.info(f"Training complete: {results}")
             self._check_model_health(results)
             self.agents.invalidate_cache()
+            self.ml_agent._scaler = None  # force reload of fresh feature metadata next cycle
 
             try:
                 btc_df = fetched.get("BTC/USDT") or self.training_feed.fetch_training_data(
@@ -852,6 +854,7 @@ class BaseBot:
         try:
             bal = self.exchange.fetch_balance()
             value = float(bal["total"].get("USDT", 0.0))
+            self._balance_cache = value
             return value
         except Exception as e:
             self.log.error(f"Balance error: {e}")

@@ -1695,13 +1695,17 @@ function loadProfile() {
       var el = document.getElementById('prof'+p.charAt(0)+p.slice(1).toLowerCase());
       if (el) el.classList.toggle('active', d.name === p);
     });
+    // Update profile name immediately from YAML (bot state may still be stale)
+    var pnEl = document.getElementById('plProfileName');
+    if (pnEl && d.name) pnEl.textContent = d.name;
     var live = d.live;
     if (live && live.updated_at) {
       document.getElementById('profileLiveInfo').style.display = 'flex';
-      document.getElementById('plEffConf').textContent = live.eff_min_conf || '-';
-      document.getElementById('plRegime').textContent = (live.market_regime||'?') + ' / ' + (live.hmm_regime||'?');
-      document.getElementById('plSize').textContent = live.eff_size_mult || '-';
-      document.getElementById('plUpdated').textContent = (live.updated_at || '').substring(11,19);
+      document.getElementById('plEffConf').textContent = live.eff_min_conf ? (live.eff_min_conf * 100).toFixed(1) + '%' : '-';
+      document.getElementById('plRegime').textContent = live.market_regime || '-';
+      document.getElementById('plHmmRegime').textContent = live.hmm_regime || '-';
+      document.getElementById('plSize').textContent = live.eff_size_mult ? live.eff_size_mult.toFixed(2) + 'x' : '-';
+      document.getElementById('plUpdated').textContent = live.updated_at ? live.updated_at.replace('T',' ').slice(0,19) + ' UTC' : '-';
     }
   });
 }
