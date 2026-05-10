@@ -211,6 +211,13 @@ class RiskDecisionAgent:
         if regime_ctx:
             breadth      = regime_ctx.get("breadth",      0.5)
             bear_breadth = regime_ctx.get("bear_breadth", 0.5)
+            _gate_regime = regime_ctx.get("regime", "")
+            # Hard-block shorts in confirmed bull STRONG_TREND (breadth > 70%)
+            if action == "SELL" and _gate_regime == "STRONG_TREND" and breadth > 0.70:
+                reasons.append(
+                    f"shorts blocked: STRONG_TREND breadth={breadth:.0%}"
+                )
+                return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
             if action == "SELL" and breadth > 0.50:
                 penalty = min(0.15, (breadth - 0.50) * 1.5)
                 penalised_floor = round(min(

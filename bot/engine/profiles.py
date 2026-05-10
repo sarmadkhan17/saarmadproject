@@ -157,8 +157,8 @@ _PRESETS = {
     # Still quality-filtered — NOT a "take everything" mode.
     "AGGRESSIVE": TradingProfile(
         name="AGGRESSIVE",
-        # Requires 2-agent consensus even for scalps (1 was too permissive)
-        min_confidence=0.54, min_agent_agreement=2, net_score_threshold=0.28,
+        # 1-agent minimum: SMC neutral in STRONG_TREND leaves only Tech; direction filtered at Gate 4b
+        min_confidence=0.54, min_agent_agreement=1, net_score_threshold=0.28,
         ml_prob_threshold=0.62, smc_sub_checks_min=1,
         # Breakout focus: ADX floor + volume spike primary signal
         adx_min=20.0, min_quality_score=0.30,
