@@ -273,29 +273,27 @@ class BinanceDemoClient:
         }
 
     def create_stop_market_order(self, symbol: str, side: str, amount: float, stop_price: float, params: dict = None) -> dict:
-        """Place STOP_MARKET order (exchange-side stop loss)."""
+        """Place stop-loss order.  Demo-fapi rejects STOP_MARKET on /fapi/v1/order
+        (-4120), so we use STOP (stop-limit) with a 0.5% slippage buffer on the
+        limit price to guarantee a fill at or near the stop level."""
         sym = self._normalize_symbol(symbol)
         amount = self._round_amount(symbol, amount)
+        rounded_stop = self._round_price(symbol, stop_price)
+
+        # Limit price: give 0.5% slippage room so the order fills on a fast move
+        is_buy = side.upper() == "BUY"   # buy-stop = covering a short
+        limit_price = self._round_price(symbol, stop_price * (1.005 if is_buy else 0.995))
 
         order_params = {
             "symbol":      sym,
             "side":        side.upper(),
-            "type":        "STOP_MARKET",
-            "stopPrice":   self._round_price(symbol, stop_price),
+            "type":        "STOP",
+            "stopPrice":   rounded_stop,
+            "price":       limit_price,
+            "quantity":    amount,
             "workingType": "CONTRACT_PRICE",
+            "reduceOnly":  "true",
         }
-
-        close_pos = False
-        if params:
-            if params.get("closePosition"):
-                close_pos = True
-                order_params["closePosition"] = "true"
-            elif params.get("reduceOnly"):
-                order_params["reduceOnly"] = "true"
-
-        # closePosition doesn't need quantity — Binance closes entire position
-        if not close_pos:
-            order_params["quantity"] = amount
 
         path = "/order"
         data = self._signed_post(path, order_params)

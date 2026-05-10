@@ -29,3 +29,4 @@ Dashboard: `http://localhost:5002` — `BOT_MODE` env var (`spot`|`futures`) con
 2. `decide()` always returns `(action, confidence)` — always unpack both.
 3. Stale `.pkl`/`.pt` model files → delete; bot retrains next cycle.
 4. State written atomically via `.tmp.json` → `replace()`.
+5. **Never make code changes without explicit user approval.** Present a plan and wait for "go ahead" / "do it" / "yes" before editing any file.

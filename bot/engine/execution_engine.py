@@ -148,7 +148,7 @@ class ExecutionEngine:
                 sl_price = min(sl_price, entry_price * 1.25)
             order = self.exchange.create_stop_market_order(
                 symbol, "sell" if side == "long" else "buy", amount,
-                stop_price=sl_price, params={"closePosition": True}
+                stop_price=sl_price, params={"reduceOnly": True}
             )
             return order.get("id", "") if order else ""
         except Exception as e:
