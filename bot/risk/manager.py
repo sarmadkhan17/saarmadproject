@@ -145,11 +145,14 @@ class MarketRegimeGate:
                         vol_ratio=vol_ratio, adx=adx_val)
 
         if adx_val > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
-            # Direction-symmetric: longs only in bullish trend, shorts only in bearish trend
+            # Direction from breadth consensus — BTC EMA lags during altcoin-led moves
+            st_allow_longs  = breadth > 0.60
+            st_allow_shorts = bear_breadth > 0.60
+            st_dir = "BULLISH" if st_allow_longs else "BEARISH"
             return dict(regime="STRONG_TREND", gate=True,
-                        allow_longs=btc_bullish,
-                        allow_shorts=btc_bearish,
-                        trend_direction=trend_direction, trend_strength="STRONG",
+                        allow_longs=st_allow_longs,
+                        allow_shorts=st_allow_shorts,
+                        trend_direction=st_dir, trend_strength="STRONG",
                         min_conf=0.45, size_mult=1.2,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
@@ -197,9 +200,12 @@ class MarketRegimeGate:
                         min_conf=0.70, size_mult=0.3,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if adx > 25 and (btc_bullish or btc_bearish) and (breadth > 0.60 or bear_breadth > 0.60):
+            st_allow_longs  = breadth > 0.60
+            st_allow_shorts = bear_breadth > 0.60
+            st_dir = "BULLISH" if st_allow_longs else "BEARISH"
             return dict(regime="STRONG_TREND", gate=True,
-                        allow_longs=btc_bullish, allow_shorts=btc_bearish,
-                        trend_direction=trend_direction, trend_strength="STRONG",
+                        allow_longs=st_allow_longs, allow_shorts=st_allow_shorts,
+                        trend_direction=st_dir, trend_strength="STRONG",
                         min_conf=0.45, size_mult=1.2,
                         breadth=breadth, bear_breadth=bear_breadth, vol_ratio=vol_ratio, adx=adx)
         if adx < 18 or (adx < 22 and vol_ratio < 0.85 and abs(breadth - 0.5) < 0.12):
