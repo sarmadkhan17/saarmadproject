@@ -547,12 +547,14 @@ class BaseBot:
             try:
                 sym_api = sym.replace("_", "/", 1) if "_" in sym else sym
                 history_years = training_cfg.get("history_years", 3)
-                cutoff = pd.Timestamp.now() - pd.Timedelta(days=int(history_years * 365))
+                cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=int(history_years * 365))
                 dfs = {}
                 for t in train_tfs:
                     df = self.training_feed.fetch_ohlcv(sym_api, t, limit=0)
                     if df is not None and len(df) >= 100:
-                        df = df[df.index >= cutoff]
+                        if df.index.tz is not None:
+                            df.index = df.index.tz_convert(None)
+                        df = df[df.index >= cutoff.replace(tzinfo=None)]
                     if df is not None and len(df) >= 100:
                         dfs[t] = df
                 if len(dfs) < 2:
@@ -561,8 +563,10 @@ class BaseBot:
 
                 f = build_features(dfs, prediction_mode=False)
                 primary_df = self.training_feed.fetch_ohlcv(sym_api, primary_tf, limit=0)
-                if primary_df is not None and len(primary_df) > 0:
-                    primary_df = primary_df[primary_df.index >= cutoff]
+                if primary_df is not None and len(primary_df) >= 50:
+                    if primary_df.index.tz is not None:
+                        primary_df.index = primary_df.index.tz_convert(None)
+                    primary_df = primary_df[primary_df.index >= cutoff.replace(tzinfo=None)]
                 if primary_df is None or len(primary_df) < 50:
                     return None
                 labels = make_labels(primary_df, forward_bars=fb, atr_k=atr_k)
