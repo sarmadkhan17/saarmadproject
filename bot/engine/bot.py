@@ -120,6 +120,10 @@ class Trade:
     close_price: float = 0.0
     close_timestamp: str = ""
     sl_order_id: str = ""
+    entry_price: float = 0.0
+    live_pnl: float = 0.0
+    mark_price: float = 0.0
+    duration_hours: float = 0.0
 
 
 class StateManager:
@@ -174,6 +178,7 @@ class StateManager:
                     "total_pnl": 0.0,
                     "start_time": datetime.now(timezone.utc).isoformat(),
                 },
+                "last_update": datetime.now(timezone.utc).isoformat(),
             }
 
     def save(self, immediate: bool = False):
@@ -215,6 +220,7 @@ class StateManager:
                 json.dump(existing + to_archive, f, indent=2, default=str)
             arc_tmp.replace(archive_path)
             self.state["trades"] = to_keep
+        self.state["last_update"] = datetime.now(timezone.utc).isoformat()
         tmp_path = self.path.with_suffix(".tmp.json")
         with open(tmp_path, "w") as f:
             json.dump(self.state, f, indent=2, default=str)
@@ -269,6 +275,17 @@ class StateManager:
             if t["id"] == trade_id:
                 t["sl_order_id"] = sl_order_id
                 break
+        self.save()
+
+    def update_trade_live_pnl(self, trade_id: str, live_pnl: float,
+                               mark_price: float, duration_hours: float) -> None:
+        with self._lock:
+            for t in self.state["trades"]:
+                if t.get("id") == trade_id and t.get("status") == "open":
+                    t["live_pnl"]       = round(live_pnl, 6)
+                    t["mark_price"]     = mark_price
+                    t["duration_hours"] = round(duration_hours, 2)
+                    break
         self.save()
 
     def add_signal(self, signal):
@@ -1461,11 +1478,21 @@ class BaseBot:
             usdt = float(bal["total"].get("USDT", 0))
 
             d = self.state.state
+            now_utc = datetime.now(timezone.utc)
             with self.state._lock:
-                # Update live PnL for tracked positions
+                # Update live PnL and duration for tracked positions
                 for t in d.get("trades", []):
                     if t["status"] != "open":
                         continue
+                    try:
+                        ts_str = t.get("timestamp", "")
+                        if ts_str:
+                            opened = datetime.fromisoformat(ts_str)
+                            if opened.tzinfo is None:
+                                opened = opened.replace(tzinfo=timezone.utc)
+                            t["duration_hours"] = round((now_utc - opened).total_seconds() / 3600, 2)
+                    except (ValueError, TypeError):
+                        pass
                     sym = t["symbol"]
                     if sym in exchange_syms:
                         for pos in positions:
@@ -1484,8 +1511,11 @@ class BaseBot:
                 if position_fetch_ok:
                     self._cleanup_ghost_trades(exchange_syms, d)
 
-            self.state.state["stats"]["balance"]   = round(usdt, 2)
-            self.state.state["stats"]["last_sync"] = datetime.now(timezone.utc).isoformat()
+            self.state.state["stats"]["balance"]      = round(usdt, 2)
+            self.state.state["stats"]["last_sync"]     = datetime.now(timezone.utc).isoformat()
+            self.state.state["stats"]["total_live_pnl"] = round(
+                sum(t.get("live_pnl", 0.0) for t in d.get("trades", []) if t.get("status") == "open"), 4
+            )
             self.log.info(f"Sync saving balance=${usdt:.2f}")
         except Exception as e:
             self.log.warning(f"Sync error: {e}")
@@ -1613,10 +1643,24 @@ class BaseBot:
                     d["stats"]["total_trades"] += 1
                     self.log.info(f"Sync: imported {sym} buy {free:.6f} (${free*price:.2f})")
 
+            now_utc = datetime.now(timezone.utc)
+            for t in d["trades"]:
+                if t.get("status") != "open":
+                    continue
+                try:
+                    ts_str = t.get("timestamp", "")
+                    if ts_str:
+                        opened = datetime.fromisoformat(ts_str)
+                        if opened.tzinfo is None:
+                            opened = opened.replace(tzinfo=timezone.utc)
+                        t["duration_hours"] = round((now_utc - opened).total_seconds() / 3600, 2)
+                except (ValueError, TypeError):
+                    pass
+
             usdt = float(totals.get("USDT", 0))
             self.log.info(f"Sync saving balance=${usdt:.2f}")
-            self.state.state["stats"]["balance"]   = round(usdt, 2)
-            self.state.state["stats"]["last_sync"] = datetime.now(timezone.utc).isoformat()
+            self.state.state["stats"]["balance"]        = round(usdt, 2)
+            self.state.state["stats"]["last_sync"]      = datetime.now(timezone.utc).isoformat()
             self.state.state["stats"]["total_live_pnl"] = 0.0
         except Exception as e:
             import traceback

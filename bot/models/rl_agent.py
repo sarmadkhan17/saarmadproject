@@ -148,8 +148,8 @@ class RLTradeManager:
         self.n_steps   = 0
         self.metadata: Dict = {}
 
-        # trade_id → (state_vec, action_idx, entry_price_at_decision)
-        self._pending: Dict[str, Tuple[np.ndarray, int, float, dict, str]] = {}
+        # trade_id → (state_vec, action_idx, entry_price_at_decision, trade_ctx, regime, steps_held)
+        self._pending: Dict[str, Tuple[np.ndarray, int, float, dict, str, int]] = {}
 
         self._load()
 
@@ -219,7 +219,7 @@ class RLTradeManager:
             state = build_state(trade, current_price, atr, regime, price_1h_ago)
 
             if len(self.buffer) < self.MIN_EXPERIENCES:
-                self._pending[trade["id"]] = (state, 0, current_price, dict(trade), regime)
+                self._pending[trade["id"]] = (state, 0, current_price, dict(trade), regime, 0)
                 log.debug(f"RL {trade.get('symbol','?')}: HOLD (buffer {len(self.buffer)}/{self.MIN_EXPERIENCES})")
                 return "HOLD", 1.0
 
@@ -278,7 +278,7 @@ class RLTradeManager:
                 action     = "HOLD"
                 action_idx = 0
 
-            self._pending[trade["id"]] = (state, action_idx, current_price, dict(trade), regime)
+            self._pending[trade["id"]] = (state, action_idx, current_price, dict(trade), regime, 0)
             log.info(
                 f"RL {trade.get('symbol','?')}: {action} conf={confidence:.2f} "
                 f"eps={self.epsilon:.3f} buf={len(self.buffer)}"
@@ -305,17 +305,23 @@ class RLTradeManager:
         """
         if trade_id not in self._pending:
             return
-        prev_state, action_idx, prev_price, trade_ctx, regime = self._pending[trade_id]
+        prev_state, action_idx, prev_price, trade_ctx, regime, steps_held = self._pending[trade_id]
 
         if done:
-            reward     = float(np.clip(final_pnl / 5.0, -2.0, 2.0))
+            base_reward = float(np.clip(final_pnl / 5.0, -2.0, 2.0))
+            # Quick winners get a small efficiency bonus; losers get nothing extra
+            efficiency_bonus = max(0.0, 0.05 - steps_held * 0.001) if final_pnl > 0 else 0.0
+            reward     = base_reward + efficiency_bonus
             next_state = np.zeros(STATE_DIM, dtype=np.float32)
             del self._pending[trade_id]
         else:
-            price_chg  = (next_price - prev_price) / (prev_price + 1e-9)
-            reward     = float(np.clip(price_chg * 3, -0.1, 0.1))
+            price_chg = (next_price - prev_price) / (prev_price + 1e-9)
+            if price_chg > 0:
+                reward = float(np.clip(price_chg * 3, 0, 0.1))
+            else:
+                reward = float(np.clip(price_chg * 6, -0.3, 0))
             next_state = build_state(trade_ctx, next_price, next_atr, regime=regime)
-            self._pending[trade_id] = (next_state, action_idx, next_price, trade_ctx, regime)
+            self._pending[trade_id] = (next_state, action_idx, next_price, trade_ctx, regime, steps_held + 1)
 
         self.buffer.push(prev_state, action_idx, reward, next_state, float(done))
         self.n_steps += 1
@@ -372,3 +378,5 @@ class RLTradeManager:
         if self.n_steps % self.TARGET_SYNC == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
             self.target_net.eval()
+
+RLPositionManager = RLTradeManager

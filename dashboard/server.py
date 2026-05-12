@@ -184,6 +184,23 @@ def futures_trades():
     return jsonify(all_t[-limit:][::-1])
 
 
+@app.route("/api/futures")
+def futures_combined():
+    d             = load_combined()
+    futures_data  = d["futures"]
+    trades        = futures_data.get("trades", [])
+    signals       = futures_data.get("signals", [])
+    stats         = calculate_stats(trades)
+    live_strategy = futures_data.get("live_strategy", {})
+    limit         = min(request.args.get("limit", 500, type=int), 1000)
+    return jsonify({
+        "trades":        trades[-limit:][::-1],
+        "signals":       signals[-50:][::-1],
+        "stats":         stats,
+        "live_strategy": live_strategy,
+    })
+
+
 @app.route("/api/trades")
 def trades():
     d     = load_combined()

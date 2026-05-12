@@ -36,11 +36,20 @@ class SMCAgent:
         low   = df["low"].values
         vol   = df["volume"].values
 
+        if len(close) > 1:
+            tr = np.maximum(
+                high[1:] - low[1:],
+                np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1]))
+            )
+            _atr = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(tr))
+        else:
+            _atr = 0.0
+
         pivots_high, pivots_low = self._detect_pivots(high, low)
         structure = self._track_structure(pivots_high, pivots_low)
 
-        # In STRONG_TREND/TRENDING regimes, suppress SMC bearish reversal patterns (sweep above
-        # pivot highs, BOS below recent lows) — they fire on normal pullbacks within the trend.
+        # In STRONG_TREND/TRENDING regimes, bearish reversal patterns get partial credit
+        # (0.15) instead of full credit (0.30-0.35) — they fire on pullbacks within trends.
         _regime_str = ((market_ctx or {}).get("regime") or "").upper()
         _trending = "TREND" in _regime_str
 
@@ -48,8 +57,8 @@ class SMCAgent:
         checks = {}
         checks["sweep"] = self._detect_liquidity_sweep(high, low, close, pivots_high, pivots_low, profile.smc_liquidity_sweep_pct)
         checks["bos"]   = self._detect_bos(close, pivots_high, pivots_low, structure, profile.smc_bos_body_pct)
-        checks["fvg"]   = self._detect_fvg(high, low, close)
-        checks["volume"]= self._detect_volume_spike(vol, profile.smc_volume_spike_ratio)
+        checks["fvg"]   = self._detect_fvg(high, low, close, _atr)
+        checks["volume"]= self._detect_volume_spike(vol, close, profile.smc_volume_spike_ratio)
         checks["pattern"] = self._detect_pattern_completion(high, low, close, profile.smc_pattern_completion)
 
         # Map to scores
@@ -58,27 +67,25 @@ class SMCAgent:
         reasons_parts = []
         active_checks = 0
 
-        # Sweep: ±0.35
+        # Sweep: ±0.35 (±0.15 during trend — partial credit, not full suppression)
         sweep = checks["sweep"]
         if sweep.get("direction") == "bullish":
             buy_score += 0.35
             reasons_parts.append(f"sweep+{sweep.get('pct',0):.2%}")
             active_checks += 1
-        elif sweep.get("direction") == "bearish" and not _trending:
-            # In a strong trend, a wick above prior highs is a breakout, not a sweep — skip
-            sell_score += 0.35
+        elif sweep.get("direction") == "bearish":
+            sell_score += 0.15 if _trending else 0.35
             reasons_parts.append(f"sweep-{sweep.get('pct',0):.2%}")
             active_checks += 1
 
-        # BOS: ±0.30
+        # BOS: ±0.30 (±0.15 during trend — partial credit, not full suppression)
         bos = checks["bos"]
         if bos.get("direction") == "bullish":
             buy_score += 0.30
             reasons_parts.append(f"BOS+{bos.get('body_pct',0):.0%}")
             active_checks += 1
-        elif bos.get("direction") == "bearish" and not _trending:
-            # In a strong trend, shallow pullbacks below recent lows are normal — skip bearish BOS
-            sell_score += 0.30
+        elif bos.get("direction") == "bearish":
+            sell_score += 0.15 if _trending else 0.30
             reasons_parts.append(f"BOS-{bos.get('body_pct',0):.0%}")
             active_checks += 1
 
@@ -93,16 +100,20 @@ class SMCAgent:
             reasons_parts.append("FVG-")
             active_checks += 1
 
-        # Volume: ±0.15
+        # Volume: ±0.15 — direction biased by price location within recent range
         vol_chk = checks["volume"]
         if vol_chk:
-            if structure in ("uptrend", "ranging_bull"):
+            price_loc = vol_chk.get("price_location", 0.5)
+            if price_loc > 0.8:
+                sell_score += 0.15
+            elif price_loc < 0.2:
                 buy_score += 0.15
-                active_checks += 1
+            elif structure in ("uptrend", "ranging_bull"):
+                buy_score += 0.15
             else:
                 sell_score += 0.15
-                active_checks += 1
-            reasons_parts.append(f"vol={vol_chk.get('ratio',0):.1f}x")
+            active_checks += 1
+            reasons_parts.append(f"vol={vol_chk.get('ratio',0):.1f}x loc={price_loc:.2f}")
 
         # Pattern: ±0.10
         pat = checks["pattern"]
@@ -203,8 +214,8 @@ class SMCAgent:
             return {"direction": None, "body_pct": round(body_pct, 4)}
 
         last_p = float(close[-1])
-        recent_high = max(p[1] for p in pivots_high[-3:]) if pivots_high else float('inf')
-        recent_low  = min(p[1] for p in pivots_low[-3:]) if pivots_low else 0
+        recent_high = pivots_high[-1][1] if pivots_high else float('inf')
+        recent_low  = pivots_low[-1][1]  if pivots_low  else 0
 
         if structure in ("downtrend", "ranging_bear", "ranging"):
             if last_p > recent_high:
@@ -214,11 +225,12 @@ class SMCAgent:
                 return {"direction": "bearish", "body_pct": round(body_pct, 4)}
         return {"direction": None}
 
-    def _detect_fvg(self, high, low, close) -> dict:
+    def _detect_fvg(self, high, low, close, atr: float = 0.0) -> dict:
         """3-candle Fair Value Gap: gap between candle 1's price and candle 3's price."""
         n = len(close)
         if n < 5:
             return {"direction": None}
+        gap_threshold = (atr / (float(close[-1]) + 1e-9)) * 0.3 if atr > 0 else 0.0005
         # Check last 2 possible FVG windows
         for offset in [0, 1]:
             i = n - 1 - offset
@@ -229,24 +241,26 @@ class SMCAgent:
             # Bullish FVG: candle-3 low > candle-1 high
             if l2 > h0:
                 gap = abs(l2 - h0) / (h0 + 1e-9)
-                if gap > 0.0005:
+                if gap > gap_threshold:
                     return {"direction": "bullish", "gap_pct": round(gap, 4)}
             # Bearish FVG: candle-3 high < candle-1 low
             if h2 < l0:
                 gap = abs(l0 - h2) / (l0 + 1e-9)
-                if gap > 0.0005:
+                if gap > gap_threshold:
                     return {"direction": "bearish", "gap_pct": round(gap, 4)}
         return {"direction": None}
 
-    def _detect_volume_spike(self, vol, min_ratio: float) -> dict:
-        """Current volume vs 20-bar average."""
-        if len(vol) < 21:
+    def _detect_volume_spike(self, vol, close, min_ratio: float) -> dict:
+        """Current volume vs 20-bar average, with price location within recent range."""
+        if len(vol) < 21 or len(close) < 20:
             return {}
         vol_ma = np.mean(vol[-21:-1])
-        curr_vol = float(vol[-1])
-        ratio = curr_vol / (vol_ma + 1e-9)
+        ratio = float(vol[-1]) / (vol_ma + 1e-9)
         if ratio >= min_ratio:
-            return {"ratio": round(ratio, 2)}
+            high_20 = np.max(close[-20:])
+            low_20  = np.min(close[-20:])
+            price_location = (float(close[-1]) - float(low_20)) / (float(high_20) - float(low_20) + 1e-9)
+            return {"ratio": round(ratio, 2), "price_location": round(price_location, 3)}
         return {}
 
     def _detect_pattern_completion(self, high, low, close, min_pct: float) -> dict:
