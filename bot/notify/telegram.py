@@ -517,14 +517,16 @@ class TelegramNotifier:
     def _cmd_profile(self):
         """Show current trading profile with key settings."""
         try:
-            profile_name = "BALANCED"
-            for cfg_path in (CFG_FUT, CFG_SPOT):
-                if cfg_path.exists():
-                    with open(cfg_path) as f:
-                        cfg = yaml.safe_load(f) or {}
-                    profile_name = cfg.get("strategy", {}).get("trading_profile", "BALANCED")
+            mode = self._get_mode_from_env()
+            cfg_path = CFG_FUT if mode != "spot" else CFG_SPOT
+            profile_name = "AGGRESSIVE"
+            if cfg_path.exists():
+                with open(cfg_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                profile_name = cfg.get("strategy", {}).get("trading_profile", "AGGRESSIVE")
 
-            p = DATA / "futures_state.json"
+            state_file = "futures_state.json" if mode != "spot" else "state.json"
+            p = DATA / state_file
             eff_min = "?"
             regime  = "UNKNOWN"
             if p.exists():
