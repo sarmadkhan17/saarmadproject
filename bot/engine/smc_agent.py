@@ -48,10 +48,10 @@ class SMCAgent:
         pivots_high, pivots_low = self._detect_pivots(high, low)
         structure = self._track_structure(pivots_high, pivots_low)
 
-        # In STRONG_TREND/TRENDING regimes, bearish reversal patterns get partial credit
-        # (0.15) instead of full credit (0.30-0.35) — they fire on pullbacks within trends.
-        _regime_str = ((market_ctx or {}).get("regime") or "").upper()
-        _trending = "TREND" in _regime_str
+        _regime_str    = ((market_ctx or {}).get("regime") or "").upper()
+        _trend_dir     = ((market_ctx or {}).get("trend_direction") or "").upper()
+        _is_bull_trend = "TREND" in _regime_str and _trend_dir == "BULLISH"
+        _is_bear_trend = "TREND" in _regime_str and _trend_dir == "BEARISH"
 
         # Sub-checks
         checks = {}
@@ -67,25 +67,25 @@ class SMCAgent:
         reasons_parts = []
         active_checks = 0
 
-        # Sweep: ±0.35 (±0.15 during trend — partial credit, not full suppression)
+        # Sweep: ±0.35 — suppressed only when counter-trend
         sweep = checks["sweep"]
-        if sweep.get("direction") == "bullish":
+        if sweep.get("direction") == "bullish" and not _is_bear_trend:
             buy_score += 0.35
             reasons_parts.append(f"sweep+{sweep.get('pct',0):.2%}")
             active_checks += 1
-        elif sweep.get("direction") == "bearish":
-            sell_score += 0.15 if _trending else 0.35
+        elif sweep.get("direction") == "bearish" and not _is_bull_trend:
+            sell_score += 0.35
             reasons_parts.append(f"sweep-{sweep.get('pct',0):.2%}")
             active_checks += 1
 
-        # BOS: ±0.30 (±0.15 during trend — partial credit, not full suppression)
+        # BOS: ±0.30 — suppressed only when counter-trend
         bos = checks["bos"]
-        if bos.get("direction") == "bullish":
+        if bos.get("direction") == "bullish" and not _is_bear_trend:
             buy_score += 0.30
             reasons_parts.append(f"BOS+{bos.get('body_pct',0):.0%}")
             active_checks += 1
-        elif bos.get("direction") == "bearish":
-            sell_score += 0.15 if _trending else 0.30
+        elif bos.get("direction") == "bearish" and not _is_bull_trend:
+            sell_score += 0.30
             reasons_parts.append(f"BOS-{bos.get('body_pct',0):.0%}")
             active_checks += 1
 
