@@ -701,10 +701,6 @@ class BaseBot:
 
             train_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
                              "XRP/USDT", "DOGE/USDT", "ADA/USDT", "LINK/USDT"]
-            if self.scanner.top_coins:
-                for c in self.scanner.top_coins[:4]:
-                    if c not in train_symbols:
-                        train_symbols.append(c)
 
             tf = self.config.get("ml", {}).get("timeframe") or self.config.get("scanner", {}).get("timeframe", "15m")
             training_cfg = self.config.get("training", {})
