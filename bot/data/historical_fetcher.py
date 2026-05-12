@@ -94,7 +94,8 @@ def backfill(coins=None, timeframes=None, targets=None, rate_limit=None):
 
                 end_time = int(df.index[0].timestamp() * 1000) - 1
                 store.ingest(sym, df, tf)
-                total = len(store.get(sym, tf))
+                fresh = store.get(sym, tf)
+                total = len(fresh) if fresh is not None else total + len(df)
 
                 print(f"    +{len(df):,} → {total:,}")
 
