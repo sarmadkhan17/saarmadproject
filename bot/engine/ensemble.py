@@ -104,6 +104,16 @@ class EnsembleEngine:
             buy_score  = buy_score / total_w
             sell_score = sell_score / total_w
 
+        # Directional bias: reduce net_score when fighting the trend
+        _bias_ctx = market_ctx or {}
+        trend_dir = _bias_ctx.get("trend_direction", "NEUTRAL")
+        if trend_dir == "BEARISH" and net > 0:
+            net = net * 0.7
+            log.debug(f"Ensemble: bearish trend → BUY net reduced to {net:.3f}")
+        elif trend_dir == "BULLISH" and net < 0:
+            net = net * 0.7
+            log.debug(f"Ensemble: bullish trend → SELL net reduced to {net:.3f}")
+
         # ── Hard block: volume so thin price discovery is unreliable ────────────
         ctx = market_ctx or {}
         if ctx.get("vol_ratio", 1.0) < 0.5:
