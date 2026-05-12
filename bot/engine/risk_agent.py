@@ -241,6 +241,21 @@ class RiskDecisionAgent:
                     )
                     return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
 
+        # ── Gate 4c: Momentum filter (price vs 20EMA) ───────────────────
+        if symbol != "BTC/USDT":
+            try:
+                ema20 = df_1h["close"].ewm(span=20).mean().iloc[-1]
+                price = get_price_fn(symbol)
+                if price is not None and price > 0:
+                    if action == "BUY" and price < ema20 * 0.99:
+                        reasons.append(f"price {price:.4f} below 20EMA {ema20:.4f} (bearish)")
+                        return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+                    elif action == "SELL" and price > ema20 * 1.01:
+                        reasons.append(f"price {price:.4f} above 20EMA {ema20:.4f} (bullish)")
+                        return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+            except Exception:
+                pass
+
         # ── Gate 5: Confidence (post-regime effective) ───────────────
         eff_conf = max(
             getattr(profile, 'min_confidence', 0.50),
