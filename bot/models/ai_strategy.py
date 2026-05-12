@@ -645,6 +645,7 @@ class AIStrategyEngine:
         w_rf, w_lgbm = self._get_dynamic_weights()
         buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
         sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
+        hold_prob = rf_probs[1] * w_rf + lgbm_probs[1] * w_lgbm
 
         if rf_p.get("action") == "HOLD" or lgbm_p.get("action") == "HOLD":
             if buy_prob < 0.60 and sell_prob < 0.60:
@@ -658,6 +659,8 @@ class AIStrategyEngine:
         else:
             action, conf = "SELL", min(sell_prob, 0.95)
 
+        conf = conf * (1.0 - hold_prob * 0.5)
+        conf = max(0.35, min(0.95, conf))
         conf = round(float(conf), 4)
         strat = f"bin:RF={rf_probs[2]:.2f}|{rf_probs[0]:.2f} LGBM={lgbm_probs[2]:.2f}|{lgbm_probs[0]:.2f}"
         ts = datetime.now(timezone.utc).isoformat()
