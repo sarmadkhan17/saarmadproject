@@ -66,12 +66,12 @@ def backfill(coins=None, timeframes=None, targets=None, rate_limit=None):
             empty_streak = 0
 
             while total < target and empty_streak < 3:
-                params = {"limit": FETCH_LIMIT}
+                extra_params = {}
                 if end_time is not None:
-                    params["endTime"] = end_time
+                    extra_params["endTime"] = end_time
 
                 try:
-                    raw = exchange.fetch_ohlcv(sym, tf, **params)
+                    raw = exchange.fetch_ohlcv(sym, tf, None, FETCH_LIMIT, extra_params)
                 except Exception as e:
                     print(f"    API error: {e}")
                     empty_streak += 1
