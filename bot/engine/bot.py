@@ -905,7 +905,9 @@ class BaseBot:
     def _resolve_close_pnl(self, trade: dict, symbol: str, detection_price: float, fraction: float) -> tuple:
         """
         After a close order is placed, look up the actual fill to get the real exit
-        price and PnL. For futures fills that carry realizedPnl, use it directly.
+        price and PnL. Always uses _calc_pnl (not exchange realizedPnl) because:
+        - exchange realizedPnl on fills omits the leverage multiplier on the demo exchange
+        - partial-close fraction would be applied twice (fill is already for the partial qty)
         Falls back to detection_price if no matching fill is found.
         Returns (pnl, actual_price).
         """
@@ -915,12 +917,7 @@ class BaseBot:
             closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
             if closing_fills:
                 best = max(closing_fills, key=lambda x: x["time"])
-                # Bot enforces one open trade per symbol (risk manager correlation filter),
-                # so the most-recent closing fill unambiguously belongs to this trade.
                 actual_price = float(best.get("price", detection_price))
-                raw_rpnl = best.get("realizedPnl")
-                if raw_rpnl is not None:
-                    return float(raw_rpnl) * fraction, actual_price
                 return self._calc_pnl(trade, actual_price) * fraction, actual_price
         except Exception as e:
             self.log.debug(f"_resolve_close_pnl fallback to detection_price for {symbol}: {e}")
@@ -1440,7 +1437,7 @@ class BaseBot:
                     close_price = self.exchange.fetch_ticker(sym)["last"]
                 except Exception:
                     pass
-            pnl = float(raw_rpnl) if raw_rpnl is not None else self._calc_pnl(t, close_price)
+            pnl = self._calc_pnl(t, close_price)
             t["status"]          = "closed"
             t["close_price"]     = close_price
             t["pnl"]             = round(pnl, 8)
