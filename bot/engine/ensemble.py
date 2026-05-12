@@ -23,6 +23,7 @@ class EnsembleResult:
     agents_total: int
     signals: list = field(default_factory=list)
     source: str = "ensemble"
+    agents_ok: bool = True   # False when ≥1 configured agent errored during this run
 
 
 class EnsembleEngine:
@@ -74,14 +75,18 @@ class EnsembleEngine:
         n_failed = n_submitted - len(signals)
         if n_failed > 1:
             log.warning(f"Ensemble {symbol}: {n_failed}/{n_submitted} agents failed — returning HOLD")
-            return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, n_submitted, [], "multiple_agent_failures")
+            return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, n_submitted, [], "multiple_agent_failures",
+                                  agents_ok=False)
         threshold_mult = 1.5 if n_failed == 1 else 1.0
 
         ctx     = market_ctx or {}
         # Prefer MarketRegimeGate regime (uses ADX + breadth) over HMM (log-return only, lags 3 bars)
         regime  = ctx.get("regime") or ctx.get("hmm_regime") or "RANGING"
-        return self._aggregate(signals, profile, market_ctx=ctx, regime=regime,
-                               threshold_mult=threshold_mult)
+        result = self._aggregate(signals, profile, market_ctx=ctx, regime=regime,
+                                 threshold_mult=threshold_mult)
+        if n_failed >= 1:
+            result.agents_ok = False
+        return result
 
     def _aggregate(self, signals: list, profile,
                    market_ctx: dict = None, regime: str = "RANGING",

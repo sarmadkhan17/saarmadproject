@@ -31,6 +31,13 @@ class RiskDecisionAgent:
         self.gnn        = gnn
         self.hmm_model  = hmm_regime_model
 
+    # ── Gate -1: Ensemble completeness ────────────────────────────────────────
+    def _check_agents_ok(self, ensemble) -> Optional[RiskDecision]:
+        if not getattr(ensemble, 'agents_ok', True):
+            log.warning(f"Rejected: partial ensemble — one or more agents errored")
+            return RiskDecision(False, ["partial ensemble — incomplete signal"])
+        return None
+
     # ── Quality Score ─────────────────────────────────────────────────────────
     def _compute_quality_score(self, ensemble, df_1h, regime_ctx: dict) -> float:
         """
@@ -140,6 +147,11 @@ class RiskDecisionAgent:
         reasons = []
         action = ensemble.action
         conf   = ensemble.confidence
+
+        # ── Gate -1: Ensemble completeness ───────────────────────────
+        guard = self._check_agents_ok(ensemble)
+        if guard is not None:
+            return guard
 
         # ── Gate 0: Stale data check ─────────────────────────────────
         try:
