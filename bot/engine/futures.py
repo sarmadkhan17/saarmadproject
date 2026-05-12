@@ -152,19 +152,18 @@ class FuturesBot(BaseBot):
 
     def _calc_pnl(self, trade, close_price) -> float:
         """
-        Futures PnL - leveraged, includes fee deduction.
-        PnL = (close - entry) * amount * leverage  (long)
-        PnL = (entry - close) * amount * leverage  (short)
-        Fee = 0.04% taker × 2 sides (on notional, not margin)
+        Futures PnL — amount is notional quantity (already accounts for leverage).
+        PnL = (close - entry) * amount  (long)
+        PnL = (entry - close) * amount  (short)
+        Fee = 0.04% taker × 2 sides (on notional)
         """
         entry  = float(trade["price"])
         amount = float(trade["amount"])
-        lev    = float(trade.get("leverage", self._get_leverage()))
         fee    = entry * amount * 0.0004 * 2
         if trade["side"] == "long":
-            return (close_price - entry) * amount * lev - fee
+            return (close_price - entry) * amount - fee
         else:
-            return (entry - close_price) * amount * lev - fee
+            return (entry - close_price) * amount - fee
 
     def _get_leverage(self) -> int:
         return self.leverage

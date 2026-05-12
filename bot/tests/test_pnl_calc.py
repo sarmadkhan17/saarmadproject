@@ -105,8 +105,8 @@ def test_resolve_close_pnl_falls_back_to_detection_price_on_error():
     assert price == detection
 
 
-def test_futures_calc_pnl_includes_leverage():
-    """_calc_pnl (FuturesBot) correctly multiplies by leverage."""
+def test_futures_calc_pnl_uses_notional_amount():
+    """_calc_pnl uses notional amount directly — leverage is already embedded in amount."""
     from engine.futures import FuturesBot
     bot = FuturesBot.__new__(FuturesBot)
     bot.leverage = 5
@@ -116,9 +116,6 @@ def test_futures_calc_pnl_includes_leverage():
     close_price = 0.8669
     pnl = bot._calc_pnl(trade, close_price)
 
-    expected_unleveraged = (close_price - 0.8430) * 121.1
-    # pnl must be significantly larger than unleveraged (leverage multiplier applied)
-    assert pnl > expected_unleveraged * 1.5, f"pnl={pnl} should be leveraged vs raw={expected_unleveraged}"
-    # fee deducted: pnl = raw * lev - fee
     fee = 0.8430 * 121.1 * 0.0004 * 2
-    assert abs(pnl - (expected_unleveraged * 5 - fee)) < 0.001
+    expected = (close_price - 0.8430) * 121.1 - fee
+    assert abs(pnl - expected) < 0.001
