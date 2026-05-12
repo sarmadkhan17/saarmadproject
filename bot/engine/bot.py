@@ -523,10 +523,7 @@ class BaseBot:
         train_tfs    = training_cfg.get("timeframes", ["1h", "4h", "1d"])
 
         # Build pipeline dataset (for stats + caching only — not used for training features)
-        symbols = training_cfg.get("symbols", [])
-        if self.scanner.top_coins:
-            extra = [c for c in self.scanner.top_coins[:training_cfg.get("top_n", 10)] if c not in symbols]
-            symbols = symbols + extra
+        symbols = training_cfg.get("symbols", [])  # anchor coins only — no scanner injection
 
         dataset_stats = build_training_dataset(
             self.training_feed, self.config, symbols=symbols,
@@ -549,9 +546,13 @@ class BaseBot:
             sym = dataset_stats["symbols"][sym_idx]
             try:
                 sym_api = sym.replace("_", "/", 1) if "_" in sym else sym
+                history_years = training_cfg.get("history_years", 3)
+                cutoff = pd.Timestamp.now() - pd.Timedelta(days=int(history_years * 365))
                 dfs = {}
                 for t in train_tfs:
                     df = self.training_feed.fetch_ohlcv(sym_api, t, limit=0)
+                    if df is not None and len(df) >= 100:
+                        df = df[df.index >= cutoff]
                     if df is not None and len(df) >= 100:
                         dfs[t] = df
                 if len(dfs) < 2:
@@ -560,6 +561,8 @@ class BaseBot:
 
                 f = build_features(dfs, prediction_mode=False)
                 primary_df = self.training_feed.fetch_ohlcv(sym_api, primary_tf, limit=0)
+                if primary_df is not None and len(primary_df) > 0:
+                    primary_df = primary_df[primary_df.index >= cutoff]
                 if primary_df is None or len(primary_df) < 50:
                     return None
                 labels = make_labels(primary_df, forward_bars=fb, atr_k=atr_k)
