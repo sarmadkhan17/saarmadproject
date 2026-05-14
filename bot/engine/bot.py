@@ -1899,9 +1899,10 @@ class BaseBot:
                 regime_ctx = dict(regime_ctx)  # shallow copy — prevent cache pollution
                 old_min_conf  = regime_ctx.get("min_conf", self.min_conf)
                 old_size_mult = regime_ctx.get("size_mult", 1.0)
-                regime_ctx["min_conf"]   = round(old_min_conf  + hmm_adj["min_conf_delta"], 4)
-                regime_ctx["size_mult"]  = round(old_size_mult * hmm_adj["size_mult"], 4)
-                regime_ctx["hmm_regime"] = hmm_regime
+                regime_ctx["min_conf"]       = round(old_min_conf  + hmm_adj["min_conf_delta"], 4)
+                regime_ctx["size_mult"]      = round(old_size_mult * hmm_adj["size_mult"], 4)
+                regime_ctx["hmm_regime"]     = hmm_regime
+                regime_ctx["min_conf_delta"] = hmm_adj["min_conf_delta"]
             self.log.info(
                 f"HMM regime: {hmm_regime} | "
                 f"min_conf_delta={hmm_adj['min_conf_delta']:+.2f} "
