@@ -16,9 +16,9 @@ class MacroFlowAgent:
     def __init__(self, macro_agent):
         self.macro_agent = macro_agent
         self._cache = None
-        self._cache_time = None
+        self._cache_time = datetime.min.replace(tzinfo=timezone.utc)
 
-    def analyze(self, df, profile) -> AgentSignal:
+    def analyze(self, df, profile, market_ctx=None) -> AgentSignal:
         now = datetime.now(timezone.utc)
         if (self._cache is None or
                 (now - self._cache_time).total_seconds() > self.TTL):
