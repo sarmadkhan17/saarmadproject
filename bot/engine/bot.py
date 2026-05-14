@@ -364,6 +364,7 @@ class BaseBot:
 
         self._balance_cache: Optional[float] = None
         self._symbol_loss_cooldown: dict = {}  # symbol → datetime of last loss
+        self._sl_failure_cooldown: dict = {}   # symbol → datetime of last SL placement failure
         self._symbol_locks: dict = {}           # per-symbol order placement locks
         self._symbol_locks_guard = threading.Lock()
 
@@ -1130,6 +1131,16 @@ class BaseBot:
                 else:
                     del self._symbol_loss_cooldown[symbol]
 
+            # Per-symbol cooldown: skip 2h after SL placement failure to stop open/abort loops
+            sl_fail_until = self._sl_failure_cooldown.get(symbol)
+            if sl_fail_until:
+                elapsed = (datetime.now(timezone.utc) - sl_fail_until).total_seconds()
+                if elapsed < 7200:
+                    self.log.debug(f"[{symbol}] SL-failure cooldown {(7200-elapsed)/60:.0f}m remaining")
+                    return
+                else:
+                    del self._sl_failure_cooldown[symbol]
+
             # Use pre-fetched data if available, otherwise fetch
             if pre_multi:
                 dfs = pre_multi
@@ -1287,6 +1298,9 @@ class BaseBot:
                 place_buy_fn=self._place_buy, place_sell_fn=self._place_sell,
                 strat=f"ensemble:{ensemble.net_score:+.3f}",
             )
+            if trade == "SL_FAILED":
+                self._sl_failure_cooldown[symbol] = datetime.now(timezone.utc)
+                self.log.warning(f"[{symbol}] SL failure cooldown set — skipping for 2h")
 
         except Exception as e:
             self.log.error(f"Error analyzing {symbol}: {e}", exc_info=True)

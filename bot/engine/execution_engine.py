@@ -113,7 +113,7 @@ class ExecutionEngine:
                     log.warning(f"[{symbol}] Emergency close placed after SL failure")
                 except Exception as ce:
                     log.error(f"[{symbol}] Emergency close also failed: {ce}")
-                return None
+                return "SL_FAILED"
 
         trade = Trade(
             id=order.get("id", f"t_{int(time.time())}"),

@@ -56,7 +56,7 @@ def test_futures_entry_aborted_when_sl_fails():
             strat='ensemble:+0.450',
         )
 
-    assert result is None, "_execute_entry_locked must return None when SL fails"
+    assert result == "SL_FAILED", "_execute_entry_locked must return 'SL_FAILED' sentinel when SL fails"
     engine.state.add_trade.assert_not_called()
     # An emergency closing sell must have been issued
     engine.exchange.create_market_order.assert_called_once()
