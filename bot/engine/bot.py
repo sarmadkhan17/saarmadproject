@@ -422,8 +422,9 @@ class BaseBot:
                 )
 
         self.ml_agent = MLTechnicalAgent(self.ai, DATA_DIR / self.MODE)
+        from engine.macro_agent import MacroFlowAgent
         self.ensemble = EnsembleEngine(
-            self.smc_agent, self.ml_agent, None  # Macro/Flow deferred
+            self.smc_agent, self.ml_agent, MacroFlowAgent(self.agents.macro)
         )
         self.risk_agent  = RiskDecisionAgent(self.risk, self.gnn_filter, self.hmm_regime)
         self.execution   = ExecutionEngine(
