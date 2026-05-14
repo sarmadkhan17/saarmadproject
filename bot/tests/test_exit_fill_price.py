@@ -6,25 +6,23 @@ def _calc_pnl_stub(trade, price):
 
 
 def _get_close_pnl(trade, fills, fraction):
-    """Simulate _resolve_close_pnl logic."""
+    """Simulate _resolve_close_pnl logic — always uses _calc_pnl with fill price."""
     closing_side = "sell" if trade["side"] == "long" else "buy"
     closing_fills = [f for f in fills if f.get("side", "").lower() == closing_side]
     if closing_fills:
         best = max(closing_fills, key=lambda x: x["time"])
         actual_price = float(best.get("price", trade["price"]))
-        rpnl = float(best.get("realizedPnl", 0))
-        if rpnl != 0:
-            return rpnl * fraction, actual_price
         return _calc_pnl_stub(trade, actual_price) * fraction, actual_price
     detection_price = trade.get("_detection_price", float(trade["price"]))
     return _calc_pnl_stub(trade, detection_price) * fraction, detection_price
 
 
-def test_uses_realized_pnl_from_fill():
+def test_uses_calc_pnl_with_fill_price_not_exchange_rpnl():
+    """Exchange realizedPnl is ignored; _calc_pnl with fill price is used instead."""
     trade = {"side": "long", "price": 100.0, "amount": 1.0, "leverage": 5}
     fills = [{"side": "sell", "price": "105.0", "realizedPnl": "24.5", "time": 999}]
     pnl, price = _get_close_pnl(trade, fills, fraction=1.0)
-    assert pnl == 24.5
+    assert pnl == 25.0   # _calc_pnl: (105-100)*1*5
     assert price == 105.0
 
 
@@ -56,29 +54,35 @@ def test_short_trade_uses_buy_fill():
 
 
 def test_partial_close_scales_pnl_by_fraction():
+    """fraction applied to _calc_pnl(full_position), not to exchange realizedPnl."""
     trade = {"side": "long", "price": 100.0, "amount": 2.0, "leverage": 5}
     fills = [{"side": "sell", "price": "110.0", "realizedPnl": "50.0", "time": 999}]
     pnl, price = _get_close_pnl(trade, fills, fraction=0.5)
-    assert pnl == 25.0  # 50.0 * 0.5
+    # _calc_pnl(full 2.0 amount) = (110-100)*2*5 = 100 ; * fraction 0.5 = 50
+    assert pnl == 50.0
 
 
-def test_resolve_close_pnl_uses_realized_pnl_directly():
-    """The actual BaseBot._resolve_close_pnl must use exchange realizedPnl when available."""
+def test_resolve_close_pnl_ignores_rpnl_uses_calc_pnl_with_fill_price():
+    """BaseBot._resolve_close_pnl must use _calc_pnl with fill price, not exchange realizedPnl."""
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from engine.bot import BaseBot
+    from engine.futures import FuturesBot
 
     class FakeExchange:
         def fetch_my_trades(self, symbol, limit=10):
             return [{"side": "sell", "price": "105.0", "realizedPnl": "24.5", "time": 999}]
 
-    bot = object.__new__(BaseBot)
+    bot = object.__new__(FuturesBot)
     bot.exchange = FakeExchange()
+    bot.leverage = 5
+    bot.config = {}
     bot.log = type("L", (), {"debug": lambda self, *a, **k: None})()
 
-    trade = {"side": "long", "price": 100.0, "amount": 1.0, "leverage": 5,
-             "pnl": 0.0}
+    trade = {"side": "long", "price": 100.0, "amount": 1.0, "leverage": 5, "pnl": 0.0}
     pnl, price = bot._resolve_close_pnl(trade, "BTC/USDT", detection_price=103.0, fraction=1.0)
-    assert pnl == 24.5
+    # _calc_pnl: (105-100)*1*5 - fee ≈ 24.96
+    expected = bot._calc_pnl(trade, 105.0)
+    assert abs(pnl - expected) < 0.001
     assert price == 105.0

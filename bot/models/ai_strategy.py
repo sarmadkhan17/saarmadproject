@@ -158,8 +158,8 @@ def make_features(df):
 
     # funding_rate_momentum: proxy via hourly return velocity relative to volume activity.
     # Positive → price rising with thin volume (longs squeezing), Negative → falling with thin volume.
-    _hour_ret = close.pct_change(1)
-    _vol_norm = vol / (vol.rolling(24).mean() + 1e-9)
+    _hour_ret = close.pct_change(1).shift(1)
+    _vol_norm = (vol / (vol.rolling(24).mean() + 1e-9)).shift(1)
     f["funding_rate_momentum"] = (
         _hour_ret.rolling(8).mean() / (_vol_norm.rolling(8).mean() + 1e-9)
     ).clip(-1.0, 1.0)
@@ -645,6 +645,7 @@ class AIStrategyEngine:
         w_rf, w_lgbm = self._get_dynamic_weights()
         buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
         sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
+        hold_prob = rf_probs[1] * w_rf + lgbm_probs[1] * w_lgbm
 
         if rf_p.get("action") == "HOLD" or lgbm_p.get("action") == "HOLD":
             if buy_prob < 0.60 and sell_prob < 0.60:
@@ -658,6 +659,8 @@ class AIStrategyEngine:
         else:
             action, conf = "SELL", min(sell_prob, 0.95)
 
+        conf = conf * (1.0 - hold_prob * 0.5)
+        conf = max(0.35, min(0.95, conf))
         conf = round(float(conf), 4)
         strat = f"bin:RF={rf_probs[2]:.2f}|{rf_probs[0]:.2f} LGBM={lgbm_probs[2]:.2f}|{lgbm_probs[0]:.2f}"
         ts = datetime.now(timezone.utc).isoformat()
@@ -692,7 +695,7 @@ class AIStrategyEngine:
         rf_probs   = np.array(rf_p["probs"])   # [SELL_prob, HOLD_prob, BUY_prob]
         lgbm_probs = np.array(lgbm_p["probs"])
 
-        w_rf, w_lgbm = 0.40, 0.60
+        w_rf, w_lgbm = self._get_dynamic_weights()
         buy_prob  = rf_probs[2] * w_rf + lgbm_probs[2] * w_lgbm
         sell_prob = rf_probs[0] * w_rf + lgbm_probs[0] * w_lgbm
 

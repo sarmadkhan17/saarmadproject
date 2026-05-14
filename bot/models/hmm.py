@@ -31,9 +31,9 @@ DATA = DATA_DIR
 # Only adjusts min_conf + size_mult. Never blocks or overrides signal direction.
 # Profile-aware: AGGRESSIVE ignores RANGING; STRICT tightens all regimes.
 REGIME_ADJUSTMENTS: Dict[str, Dict] = {
-    "TRENDING":  {"min_conf_delta": -0.03, "size_mult": 1.20},
-    "RANGING":   {"min_conf_delta":  0.01, "size_mult": 0.90},
-    "HIGH_VOL":  {"min_conf_delta":  0.05, "size_mult": 0.60},
+    "RANGING":   {"min_conf_delta": -0.10, "size_mult": 0.70},
+    "TRENDING":  {"min_conf_delta": -0.05, "size_mult": 1.15},
+    "HIGH_VOL":  {"min_conf_delta":  0.03, "size_mult": 0.60},
     "CRASH":     {"min_conf_delta":  0.08, "size_mult": 0.40},
 }
 

@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
+import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ class EnsembleResult:
     agents_total: int
     signals: list = field(default_factory=list)
     source: str = "ensemble"
+    agents_ok: bool = True   # False when ≥1 configured agent errored during this run
 
 
 class EnsembleEngine:
@@ -57,6 +59,7 @@ class EnsembleEngine:
                     futures[pool.submit(agent.analyze, df, profile, market_ctx)] = name
                 else:
                     futures[pool.submit(agent.analyze, df, profile)] = name
+            n_submitted = len(futures)
             for future in as_completed(futures):
                 name = futures[future]
                 try:
@@ -69,13 +72,25 @@ class EnsembleEngine:
         if not signals:
             return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, 0, signals, "no_agents")
 
+        n_failed = n_submitted - len(signals)
+        if n_failed > 1:
+            log.warning(f"Ensemble {symbol}: {n_failed}/{n_submitted} agents failed — returning HOLD")
+            return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, n_submitted, [], "multiple_agent_failures",
+                                  agents_ok=False)
+        threshold_mult = 1.5 if n_failed == 1 else 1.0
+
         ctx     = market_ctx or {}
         # Prefer MarketRegimeGate regime (uses ADX + breadth) over HMM (log-return only, lags 3 bars)
         regime  = ctx.get("regime") or ctx.get("hmm_regime") or "RANGING"
-        return self._aggregate(signals, profile, market_ctx=ctx, regime=regime)
+        result = self._aggregate(signals, profile, market_ctx=ctx, regime=regime,
+                                 threshold_mult=threshold_mult)
+        if n_failed >= 1:
+            result.agents_ok = False
+        return result
 
     def _aggregate(self, signals: list, profile,
-                   market_ctx: dict = None, regime: str = "RANGING") -> EnsembleResult:
+                   market_ctx: dict = None, regime: str = "RANGING",
+                   threshold_mult: float = 1.0) -> EnsembleResult:
         weights = self._regime_weights(regime)
         net = 0.0
         buy_score  = 0.0
@@ -94,10 +109,24 @@ class EnsembleEngine:
             buy_score  = buy_score / total_w
             sell_score = sell_score / total_w
 
+        # Directional bias: reduce net_score when fighting the trend
+        _bias_ctx = market_ctx or {}
+        trend_dir = _bias_ctx.get("trend_direction", "NEUTRAL")
+        if trend_dir == "BEARISH" and net > 0:
+            net = net * 0.7
+            log.debug(f"Ensemble: bearish trend → BUY net reduced to {net:.3f}")
+        elif trend_dir == "BULLISH" and net < 0:
+            net = net * 0.7
+            log.debug(f"Ensemble: bullish trend → SELL net reduced to {net:.3f}")
+
+        # ── Hard block: volume so thin price discovery is unreliable ────────────
+        ctx = market_ctx or {}
+        if ctx.get("vol_ratio", 1.0) < 0.5:
+            return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, len(signals), signals, "low_volume_block")
+
         # ── Confidence decay for low-quality market conditions ───────────────
-        ctx   = market_ctx or {}
         decay = 1.0
-        if ctx.get("vol_ratio", 1.0) < 0.7:           # low volume
+        if ctx.get("vol_ratio", 1.0) < 0.7:           # low-but-not-empty volume band
             decay *= 0.75
         if abs(buy_score - sell_score) < 0.05:         # conflicting agents
             decay *= 0.80
@@ -108,9 +137,7 @@ class EnsembleEngine:
         sell_score *= decay
 
         # ── Dynamic threshold ────────────────────────────────────────────────────
-        # Slight reduction when one direction clearly dominates, but floor raised to
-        # avoid weak-signal bleed-through. Diverging agents keep threshold at full base.
-        base_threshold = getattr(profile, 'net_score_threshold', 0.25)
+        base_threshold = getattr(profile, 'net_score_threshold', 0.25) * threshold_mult
         direction_conviction = abs(buy_score - sell_score)
         threshold = max(0.20, base_threshold * (1.0 - direction_conviction * 0.25))
         if net > threshold:
@@ -118,22 +145,23 @@ class EnsembleEngine:
         elif net < -threshold:
             action = "SELL"
         else:
-            # Sub-threshold fallback: require meaningful score to avoid chop entries
-            if buy_score > sell_score and buy_score > 0.22:
-                action = "BUY"
-            elif sell_score > buy_score and sell_score > 0.22:
-                action = "SELL"
-            else:
-                action = "HOLD"
+            action = "HOLD"
 
         # Agent agreement
         agreement = sum(1 for s in signals if s.net_score * net > 0)
 
-        # Confidence: use the strongest agent's net_score + agreement bonus
-        max_agent_net = max((abs(s.net_score) for s in signals), default=0)
-        max_agent_conf = max((s.confidence for s in signals if abs(s.net_score) > 0.01), default=0.35)
-        agreement_bonus = 0.15 if agreement >= 2 else 0.08 if agreement >= 1 else 0.0
-        confidence = min(0.95, max(0.35, max_agent_net * 1.0 + max_agent_conf * 0.3 + agreement_bonus))
+        # ── Variance-weighted confidence: penalise agent disagreement ──────────
+        agent_weights_list = [weights.get(s.agent, 0.30) for s in signals]
+        total_w_conf = sum(agent_weights_list) + 1e-9
+        weighted_conf = sum(s.confidence * w for s, w in zip(signals, agent_weights_list)) / total_w_conf
+
+        net_scores = [s.net_score for s in signals]
+        net_var = float(np.var(net_scores)) if len(net_scores) > 1 else 0.0
+        consensus_factor = 1.0 / (1.0 + net_var * 3.0)
+
+        alignment = max(0.3, agreement / max(len(signals), 1))
+
+        confidence = min(0.95, max(0.35, weighted_conf * consensus_factor * alignment))
 
         return EnsembleResult(
             action=action,

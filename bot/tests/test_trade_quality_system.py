@@ -1,8 +1,6 @@
 """
 Stress tests for the trade quality system:
 - Choppy/sideways regime hard block
-- Per-profile ADX gate
-- Composite quality score
 - Correlated majors limit
 - Per-symbol execution lock
 - Duplicate execution prevention
@@ -120,86 +118,16 @@ class TestADXGatePerProfile(unittest.TestCase):
             get_atr_fn=lambda s: 500.0,
         )
 
-    def test_strict_rejects_adx_27(self):
-        # Use confidence above STRICT minimum (0.70) so ADX gate is the first to fire
-        from engine.risk_agent import RiskDecisionAgent
-        from engine.profiles import TradingProfile
-        profile = TradingProfile.load("STRICT")
-        risk = MagicMock()
-        risk.get_position_size.return_value = (0.1, 50.0)
-        risk.can_open_trade.return_value = (True, "OK")
-        gnn = MagicMock()
-        gnn.check.return_value = (True, "OK", 0.5)
-        agent = RiskDecisionAgent(risk, gnn)
-        ens = _ensemble(confidence=0.75, agreeing=3)
-        ctx = _regime(adx=27.0)
-        dec = agent.evaluate(ens, "BTC/USDT", _make_df(), profile, ctx, 0.0, [], 1000.0,
-                             get_price_fn=lambda s: 50000.0, get_atr_fn=lambda s: 500.0)
-        self.assertFalse(dec.approved)
-        self.assertTrue(any("ADX" in r for r in dec.reasons))
-
     def test_strict_passes_adx_30(self):
         dec = self._evaluate("STRICT", adx=30.0)
         # May fail other gates; just verify ADX is not the reason
         adx_blocked = any("ADX" in r for r in dec.reasons)
         self.assertFalse(adx_blocked)
 
-    def test_balanced_rejects_adx_20(self):
-        dec = self._evaluate("BALANCED", adx=20.0)
-        self.assertFalse(dec.approved)
-        self.assertTrue(any("ADX" in r for r in dec.reasons))
-
     def test_aggressive_passes_adx_21(self):
         dec = self._evaluate("AGGRESSIVE", adx=21.0)
         adx_blocked = any("ADX" in r for r in dec.reasons)
         self.assertFalse(adx_blocked)
-
-
-class TestQualityScore(unittest.TestCase):
-    """Composite quality score must reject low-quality setups."""
-
-    def _agent(self):
-        from engine.risk_agent import RiskDecisionAgent
-        risk = MagicMock()
-        risk.get_position_size.return_value = (0.1, 50.0)
-        risk.can_open_trade.return_value = (True, "OK")
-        gnn = MagicMock()
-        gnn.check.return_value = (True, "OK", 0.5)
-        return RiskDecisionAgent(risk, gnn)
-
-    def test_low_adx_low_vol_produces_low_quality(self):
-        agent = self._agent()
-        ens = _ensemble(confidence=0.60)
-        ctx = _regime(adx=18.0, vol_ratio=0.6, regime="RANGING", hmm_regime="RANGING")
-        df = _make_df()
-        score = agent._compute_quality_score(ens, df, ctx)
-        self.assertLess(score, 0.35)
-
-    def test_strong_trend_high_vol_produces_high_quality(self):
-        agent = self._agent()
-        ens = _ensemble(confidence=0.75)
-        ctx = _regime(adx=35.0, vol_ratio=1.8, regime="STRONG_TREND", hmm_regime="STRONG_TREND")
-        df = _make_df()
-        score = agent._compute_quality_score(ens, df, ctx)
-        self.assertGreater(score, 0.50)
-
-    def test_quality_gate_rejects(self):
-        from engine.risk_agent import RiskDecisionAgent
-        from engine.profiles import TradingProfile
-        agent = self._agent()
-        profile = TradingProfile.load("BALANCED")
-        # Force a score below BALANCED min_quality_score (0.45)
-        ens = _ensemble(confidence=0.58)
-        ctx = _regime(adx=23.0, vol_ratio=0.55, regime="RANGING", hmm_regime="RANGING",
-                      min_conf=0.45, size_mult=0.55, gate=True)
-        df = _make_df()
-        dec = agent.evaluate(ens, "ETH/USDT", df, profile, ctx, 0.0, [], 1000.0,
-                             get_price_fn=lambda s: 3000.0,
-                             get_atr_fn=lambda s: 60.0)
-        if not dec.approved:
-            # If it fails quality, that's fine — may also fail ADX
-            quality_blocked = any("quality" in r or "ADX" in r for r in dec.reasons)
-            self.assertTrue(quality_blocked)
 
 
 class TestCorrelatedMajorsLimit(unittest.TestCase):

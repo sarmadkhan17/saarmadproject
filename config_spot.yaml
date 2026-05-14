@@ -40,11 +40,12 @@ scanner:
   top_n: 40
 strategy:
   htf_filter_mode: soft
-  min_confidence: 0.43
+  min_confidence: 0.42
   min_votes: 2
   trading_profile: AGGRESSIVE
 training:
   atr_k: 0.45
+  history_years: 3
   max_rows: 200000
   min_bars_per_coin: 500
   min_coins: 4
@@ -59,18 +60,10 @@ training:
   - DOGE/USDT
   - ADA/USDT
   - LINK/USDT
-  - AVAX/USDT
-  - DOT/USDT
-  - ARB/USDT
-  - SUI/USDT
-  - NEAR/USDT
-  - INJ/USDT
-  - LDO/USDT
   timeframes:
   - 15m
   - 1h
   - 4h
   - 1d
-  top_n: 10
   use_dataset_pipeline: true
   use_real_api: true

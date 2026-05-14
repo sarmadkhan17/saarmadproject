@@ -105,6 +105,15 @@ class ExecutionEngine:
             atr = get_atr_fn(symbol)
             sl_id = self._place_sl(symbol, "long" if action == "BUY" else "short",
                                     amount, fill_price, atr)
+            if not sl_id:
+                log.error(f"[{symbol}] SL placement failed after fill — aborting position")
+                close_side = "sell" if action == "BUY" else "buy"
+                try:
+                    self.exchange.create_market_order(symbol, close_side, amount)
+                    log.warning(f"[{symbol}] Emergency close placed after SL failure")
+                except Exception as ce:
+                    log.error(f"[{symbol}] Emergency close also failed: {ce}")
+                return None
 
         trade = Trade(
             id=order.get("id", f"t_{int(time.time())}"),
