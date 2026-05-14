@@ -229,8 +229,8 @@ class RiskDecisionAgent:
             else:  # strict
                 reasons.append(f"HTF {htf_bias} strict-block")
                 return RiskDecision(False, reasons, conf, profile=profile.name, htf_bias=htf_bias, hmm_regime=hmm_regime)
-            if conf < profile.min_confidence:
-                reasons.append(f"post-HTF conf={conf:.2f} < {profile.min_confidence}")
+            if conf < effective_threshold:
+                reasons.append(f"post-HTF conf={conf:.2f} < eff={effective_threshold:.2f}")
                 return RiskDecision(False, reasons, conf, profile=profile.name, htf_bias=htf_bias, hmm_regime=hmm_regime)
 
         # ── Gate 7: BTC momentum ────────────────────────────────────
@@ -239,8 +239,8 @@ class RiskDecisionAgent:
                 conf = round(conf * 0.85, 4)
             elif action == "SELL" and btc_return > 0.015:
                 conf = round(conf * 0.85, 4)
-            if conf < profile.min_confidence:
-                reasons.append(f"BTC momentum: conf={conf:.2f} < {profile.min_confidence}")
+            if conf < effective_threshold:
+                reasons.append(f"BTC momentum: conf={conf:.2f} < eff={effective_threshold:.2f}")
                 return RiskDecision(False, reasons, conf, profile=profile.name, htf_bias=htf_bias, hmm_regime=hmm_regime)
 
         # ── Gate 8: Position sizing ──────────────────────────────────
