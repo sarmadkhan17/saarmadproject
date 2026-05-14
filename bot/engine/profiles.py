@@ -158,7 +158,7 @@ _PRESETS = {
     "AGGRESSIVE": TradingProfile(
         name="AGGRESSIVE",
         # 1-agent minimum: SMC neutral in STRONG_TREND leaves only Tech; direction filtered at Gate 4b
-        min_confidence=0.54, min_agent_agreement=1, net_score_threshold=0.28,
+        min_confidence=0.42, min_agent_agreement=1, net_score_threshold=0.28,
         ml_prob_threshold=0.62, smc_sub_checks_min=1,
         # Breakout focus: ADX floor + volume spike primary signal
         adx_min=20.0, min_quality_score=0.30,
