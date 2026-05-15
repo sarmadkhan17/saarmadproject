@@ -108,11 +108,25 @@ class ExecutionEngine:
             if not sl_id:
                 log.error(f"[{symbol}] SL placement failed after fill — aborting position")
                 close_side = "sell" if action == "BUY" else "buy"
+                close_price = fill_price
                 try:
-                    self.exchange.create_market_order(symbol, close_side, amount)
+                    close_order = self.exchange.create_market_order(symbol, close_side, amount)
                     log.warning(f"[{symbol}] Emergency close placed after SL failure")
+                    if close_order:
+                        close_price = float(close_order.get("average") or close_order.get("price") or fill_price)
                 except Exception as ce:
                     log.error(f"[{symbol}] Emergency close also failed: {ce}")
+                leverage = self._get_leverage()
+                pnl = ((close_price - fill_price) if side in ("buy", "long") else (fill_price - close_price)) * amount * leverage
+                aborted = Trade(
+                    id=order.get("id", f"t_{int(time.time())}"),
+                    symbol=symbol, side=side, amount=amount, price=fill_price,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    strategy=f"{strat}_sl_abort", timeframe=f"AUTO-{self.mode}",
+                    status="open", mode=self.mode, leverage=leverage, sl_order_id="",
+                )
+                self.state.add_trade(aborted)
+                self.state.close_trade(aborted.id, close_price, round(pnl, 8))
                 return "SL_FAILED"
 
         trade = Trade(
@@ -155,9 +169,10 @@ class ExecutionEngine:
             else:
                 sl_price = max(sl_price, entry_price + min_distance)
                 sl_price = min(sl_price, entry_price * 1.25)
-            order = self.exchange.create_stop_market_order(
-                symbol, "sell" if side == "long" else "buy", amount,
-                stop_price=sl_price, params={"reduceOnly": True}
+            order = self.exchange.create_order(
+                symbol, "STOP_MARKET",
+                "sell" if side == "long" else "buy", amount,
+                params={"stopPrice": round(sl_price, 4), "reduceOnly": True, "workingType": "MARK_PRICE"}
             )
             return order.get("id", "") if order else ""
         except Exception as e:
