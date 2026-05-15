@@ -255,6 +255,18 @@ def circuit_breaker_status():
     initial_bal   = cb.get("initial_balance") or 0
     peak_bal      = cb.get("peak_balance") or initial_bal
 
+    # Honour disabled_until grace period
+    disabled_until = cb.get("disabled_until")
+    if disabled_until:
+        from datetime import datetime, timezone
+        try:
+            until_dt = datetime.fromisoformat(disabled_until)
+            if datetime.now(timezone.utc) < until_dt:
+                remaining = (until_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                return jsonify({"tripped": False, "reason": f"breaker disabled ({remaining:.1f}h remaining)"})
+        except Exception:
+            pass
+
     # Read config thresholds
     try:
         import yaml
