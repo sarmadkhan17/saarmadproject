@@ -1383,6 +1383,10 @@ class BaseBot:
             sym = pos["symbol"]
             if sym in our_syms or float(pos.get("amount", 0)) == 0:
                 continue
+            notional = float(pos.get("amount", 0)) * float(pos.get("entry_price", 0))
+            if notional < 5.0:
+                self.log.debug(f"Sync: skipping dust {sym} notional=${notional:.4f}")
+                continue
             trade = {
                 "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
                 "symbol":          sym,
