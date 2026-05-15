@@ -106,28 +106,32 @@ class ExecutionEngine:
             sl_id = self._place_sl(symbol, "long" if action == "BUY" else "short",
                                     amount, fill_price, atr)
             if not sl_id:
-                log.error(f"[{symbol}] SL placement failed after fill — aborting position")
-                close_side = "sell" if action == "BUY" else "buy"
-                close_price = fill_price
-                try:
-                    close_order = self.exchange.create_market_order(symbol, close_side, amount)
-                    log.warning(f"[{symbol}] Emergency close placed after SL failure")
-                    if close_order:
-                        close_price = float(close_order.get("average") or close_order.get("price") or fill_price)
-                except Exception as ce:
-                    log.error(f"[{symbol}] Emergency close also failed: {ce}")
-                leverage = self._get_leverage()
-                pnl = ((close_price - fill_price) if side in ("buy", "long") else (fill_price - close_price)) * amount * leverage
-                aborted = Trade(
-                    id=order.get("id", f"t_{int(time.time())}"),
-                    symbol=symbol, side=side, amount=amount, price=fill_price,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    strategy=f"{strat}_sl_abort", timeframe=f"AUTO-{self.mode}",
-                    status="open", mode=self.mode, leverage=leverage, sl_order_id="",
-                )
-                self.state.add_trade(aborted)
-                self.state.close_trade(aborted.id, close_price, round(pnl, 8))
-                return "SL_FAILED"
+                _is_demo = 'demo' in getattr(self.exchange, 'base_url', '')
+                if _is_demo:
+                    log.warning(f"[{symbol}] SL not supported on demo exchange — keeping trade open without hard stop")
+                else:
+                    log.error(f"[{symbol}] SL placement failed after fill — aborting position")
+                    close_side = "sell" if action == "BUY" else "buy"
+                    close_price = fill_price
+                    try:
+                        close_order = self.exchange.create_market_order(symbol, close_side, amount)
+                        log.warning(f"[{symbol}] Emergency close placed after SL failure")
+                        if close_order:
+                            close_price = float(close_order.get("average") or close_order.get("price") or fill_price)
+                    except Exception as ce:
+                        log.error(f"[{symbol}] Emergency close also failed: {ce}")
+                    leverage = self._get_leverage()
+                    pnl = ((close_price - fill_price) if side in ("buy", "long") else (fill_price - close_price)) * amount * leverage
+                    aborted = Trade(
+                        id=order.get("id", f"t_{int(time.time())}"),
+                        symbol=symbol, side=side, amount=amount, price=fill_price,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        strategy=f"{strat}_sl_abort", timeframe=f"AUTO-{self.mode}",
+                        status="open", mode=self.mode, leverage=leverage, sl_order_id="",
+                    )
+                    self.state.add_trade(aborted)
+                    self.state.close_trade(aborted.id, close_price, round(pnl, 8))
+                    return "SL_FAILED"
 
         trade = Trade(
             id=order.get("id", f"t_{int(time.time())}"),
