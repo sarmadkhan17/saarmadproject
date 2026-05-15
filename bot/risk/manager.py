@@ -694,11 +694,13 @@ class CircuitBreaker:
                 self.consec_losses = d.get("consec_losses", 0)
                 self._initial_balance = d.get("initial_balance")
                 self._peak_balance   = d.get("peak_balance")
+                self._disabled_until = d.get("disabled_until")
         else:
             self.pnl_history   = {}
             self.consec_losses = 0
             self._initial_balance = None
             self._peak_balance   = None
+            self._disabled_until = None
 
     def _save(self):
         from datetime import timedelta
@@ -708,7 +710,8 @@ class CircuitBreaker:
             json.dump({"pnl_history": self.pnl_history,
                        "consec_losses": self.consec_losses,
                        "initial_balance": self._initial_balance,
-                       "peak_balance": self._peak_balance}, f)
+                       "peak_balance": self._peak_balance,
+                       "disabled_until": self._disabled_until}, f)
 
     def _get_rolling_loss(self):
         from datetime import timedelta
@@ -732,6 +735,15 @@ class CircuitBreaker:
         self._save()
 
     def can_trade(self, balance):
+        if self._disabled_until:
+            from datetime import datetime, timezone
+            until = datetime.fromisoformat(self._disabled_until)
+            if datetime.now(timezone.utc) < until:
+                remaining = (until - datetime.now(timezone.utc)).total_seconds() / 3600
+                return True, f"breaker disabled ({remaining:.1f}h remaining)"
+            else:
+                self._disabled_until = None
+                self._save()
         rolling_loss = self._get_rolling_loss()
         ref_balance = self._initial_balance or balance
         threshold = ref_balance * self.max_daily_loss * self.WINDOW_DAYS
