@@ -106,7 +106,8 @@ class ExecutionEngine:
             sl_id = self._place_sl(symbol, "long" if action == "BUY" else "short",
                                     amount, fill_price, atr)
             if not sl_id:
-                _is_demo = 'demo' in getattr(self.exchange, 'base_url', '')
+                _inner = getattr(self.exchange, 'client', self.exchange)
+                _is_demo = 'demo' in getattr(_inner, 'base_url', '')
                 if _is_demo:
                     log.warning(f"[{symbol}] SL not supported on demo exchange — keeping trade open without hard stop")
                 else:
