@@ -339,7 +339,7 @@ class RLTradeManager:
         Provides terminal reward signal even for non-RL-initiated closes.
         """
         if trade_id in self._pending:
-            prev_state, action_idx, prev_price, trade_ctx, _regime = self._pending[trade_id]
+            prev_state, action_idx, prev_price, trade_ctx, _regime, _steps = self._pending[trade_id]
             reward     = float(np.clip(final_pnl / 5.0, -2.0, 2.0))
             next_state = np.zeros(STATE_DIM, dtype=np.float32)
             self.buffer.push(prev_state, action_idx, reward, next_state, 1.0)
