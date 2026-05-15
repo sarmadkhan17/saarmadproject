@@ -273,25 +273,21 @@ class BinanceDemoClient:
         }
 
     def create_stop_market_order(self, symbol: str, side: str, amount: float, stop_price: float, params: dict = None) -> dict:
-        """Place stop-loss order.  Demo-fapi rejects STOP_MARKET on /fapi/v1/order
-        (-4120), so we use STOP (stop-limit) with a 0.5% slippage buffer on the
-        limit price to guarantee a fill at or near the stop level."""
+        """Place a STOP_MARKET stop-loss order on the demo FAPI."""
         sym = self._normalize_symbol(symbol)
         amount = self._round_amount(symbol, amount)
         rounded_stop = self._round_price(symbol, stop_price)
 
-        # Limit price: give 0.5% slippage room so the order fills on a fast move
-        is_buy = side.upper() == "BUY"   # buy-stop = covering a short
-        limit_price = self._round_price(symbol, stop_price * (1.005 if is_buy else 0.995))
+        extra = params or {}
+        working_type = extra.get("workingType", "MARK_PRICE")
 
         order_params = {
             "symbol":      sym,
             "side":        side.upper(),
-            "type":        "STOP",
+            "type":        "STOP_MARKET",
             "stopPrice":   rounded_stop,
-            "price":       limit_price,
             "quantity":    amount,
-            "workingType": "CONTRACT_PRICE",
+            "workingType": working_type,
             "reduceOnly":  "true",
         }
 

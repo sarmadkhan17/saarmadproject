@@ -169,10 +169,12 @@ class ExecutionEngine:
             else:
                 sl_price = max(sl_price, entry_price + min_distance)
                 sl_price = min(sl_price, entry_price * 1.25)
-            order = self.exchange.create_order(
-                symbol, "STOP_MARKET",
-                "sell" if side == "long" else "buy", amount,
-                params={"stopPrice": round(sl_price, 4), "reduceOnly": True, "workingType": "MARK_PRICE"}
+            order = self.exchange.create_stop_market_order(
+                symbol,
+                "sell" if side == "long" else "buy",
+                amount,
+                round(sl_price, 4),
+                params={"reduceOnly": True, "workingType": "MARK_PRICE"},
             )
             return order.get("id", "") if order else ""
         except Exception as e:
