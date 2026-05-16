@@ -3,3 +3,34 @@
 2026-05-17T00:02:08.330976 [futures] - Applied config: {'strategy': {'min_confidence': 0.55}}
 2026-05-17T00:32:11.475440 [futures] - DeepSeek says: {"min_confidence": 0.45}
 2026-05-17T00:32:11.496823 [futures] - Applied config: {'strategy': {'min_confidence': 0.45}}
+2026-05-17T00:34:00.281697 [futures] - DeepSeek Full Agent started in futures mode
+2026-05-17T00:34:00.303212 [futures] - Working on branch ai-agent-futures
+2026-05-17T00:34:03.508564 [futures] - DeepSeek raw response: ```json
+[
+  {
+    "type": "config_change",
+    "section": "strategy",
+    "key": "min_confidence",
+    "value": 0.55
+  },
+  {
+    "type": "config_change",
+    "section": "risk",
+    "key": "stop_loss_atr_multiplier",
+    "value": 5.0
+  },
+  {
+    "type": "config_change",
+    "section": "risk",
+    "key": "take_profit_atr_multiplier",
+    "value": 4.0
+  },
+  {
+    "type": "code_patch",
+    "file": "bot/models/hmm.py",
+    "diff": "--- a/bot/models/hmm.py\n+++ b/bot/models/hmm.py\n@@ -10,3 +10,3 @
+2026-05-17T00:34:03.535743 [futures] - Config changed: {'strategy': {'min_confidence': 0.55}}
+2026-05-17T00:34:03.559242 [futures] - Config changed: {'risk': {'stop_loss_atr_multiplier': 5.0}}
+2026-05-17T00:34:03.574300 [futures] - Config changed: {'risk': {'take_profit_atr_multiplier': 4.0}}
+2026-05-17T00:34:10.780768 [futures] - Bot restarted successfully
+2026-05-17T00:34:10.781388 [futures] - DeepSeek actions: config strategy.min_confidence=0.55, config risk.stop_loss_atr_multiplier=5.0, config risk.take_profit_atr_multiplier=4.0, restarted bot
