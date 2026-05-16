@@ -271,7 +271,7 @@ def circuit_breaker_status():
     try:
         import yaml
         mode = _read_env_var("BOT_MODE") or "futures"
-        cfg_path = BASE_DIR / f"config_{mode}.yaml"
+        cfg_path = BOT_ROOT / f"config_{mode}.yaml"
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f)
         risk_cfg = cfg.get("risk", {})

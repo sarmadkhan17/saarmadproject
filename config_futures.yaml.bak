@@ -38,7 +38,7 @@ scanner:
   min_price: 0.5
   min_volume_usdt: 100000000
   rescan_hours: 4
-  top_n: 25
+  top_n: 20
 strategy:
   htf_filter_mode: hard
   min_confidence: 0.43
