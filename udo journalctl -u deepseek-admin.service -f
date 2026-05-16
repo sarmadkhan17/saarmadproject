@@ -1,0 +1,11 @@
+[0;1;32m●[0m deepseek-admin.service - DeepSeek Autonomous Admin for CryptoBot
+     Loaded: loaded (]8;;file://vmi3268048/etc/systemd/system/deepseek-admin.service/etc/systemd/system/deepseek-admin.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (running)[0m since Sun 2026-05-17 00:37:09 CEST; 51ms ago
+   Main PID: 1124480 (python3)
+      Tasks: 3 (limit: 28792)
+     Memory: 597.6M (peak: 1.0G)
+        CPU: 112ms
+     CGroup: /system.slice/deepseek-admin.service
+             └─[0;38;5;245m1124480 /usr/bin/python3 /root/cryptobot_v3/deepseek_admin.py[0m
+
+May 17 00:37:09 vmi3268048 systemd[1]: Started deepseek-admin.service - DeepSeek Autonomous Admin for CryptoBot.
