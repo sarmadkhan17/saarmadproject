@@ -28,8 +28,10 @@ from core.config import DATA_DIR
 import os
 
 log  = logging.getLogger("AIStrategy")
-BOT_MODE = os.environ.get("BOT_MODE", "spot")
-DATA = DATA_DIR / BOT_MODE
+def _current_bot_mode() -> str:
+    return os.environ.get("BOT_MODE", "spot")
+
+DATA = DATA_DIR / _current_bot_mode()
 DATA.mkdir(exist_ok=True)
 
 
@@ -261,7 +263,7 @@ class OnlineBuffer:
 
 class RandomForestStrategy:
     def __init__(self, mode: str = None):
-        data_dir = DATA_DIR / (mode or BOT_MODE)
+        data_dir = DATA_DIR / (mode or _current_bot_mode())
         data_dir.mkdir(exist_ok=True)
         self.model_path   = data_dir / "rf_model.pkl"
         self.scaler_path  = data_dir / "rf_scaler.pkl"
@@ -413,7 +415,7 @@ class RandomForestStrategy:
 
 class LightGBMStrategy:
     def __init__(self, mode: str = None):
-        data_dir = DATA_DIR / (mode or BOT_MODE)
+        data_dir = DATA_DIR / (mode or _current_bot_mode())
         data_dir.mkdir(exist_ok=True)
         self.model_path   = data_dir / "lgbm_model.pkl"
         self.scaler_path  = data_dir / "lgbm_scaler.pkl"
