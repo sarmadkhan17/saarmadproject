@@ -99,10 +99,27 @@ def apply_config(changes):
             yaml.dump(config, f)
     return modified
 
+def _read_bot_mode_from_env_file():
+    env_path = BOT_DIR / ".env"
+    if not env_path.exists():
+        return ""
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("BOT_MODE="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'").lower()
+    return ""
+
+
 def restart_bot():
     subprocess.run(["pkill", "-f", "launcher.py"])
     time.sleep(2)
-    subprocess.Popen(["python3", str(BOT_DIR / "bot/launcher.py")], cwd=BOT_DIR / "bot")
+    mode = _read_bot_mode_from_env_file() or "futures"
+    env = {**os.environ, "BOT_MODE": mode}
+    subprocess.Popen(
+        ["python3", str(BOT_DIR / "bot/launcher.py")],
+        cwd=BOT_DIR / "bot",
+        env=env,
+    )
 
 def ask_deepseek(prompt):
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
