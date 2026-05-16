@@ -425,7 +425,8 @@ class BaseBot:
         self.ml_agent = MLTechnicalAgent(self.ai, DATA_DIR / self.MODE)
         from engine.macro_agent import MacroFlowAgent
         self.ensemble = EnsembleEngine(
-            self.smc_agent, self.ml_agent, MacroFlowAgent(self.agents.macro)
+            self.smc_agent, self.ml_agent, MacroFlowAgent(self.agents.macro),
+            trend_filter=self.config.get("trend_filter") or {},
         )
         self.risk_agent  = RiskDecisionAgent(self.risk, self.gnn_filter, self.hmm_regime)
         self.execution   = ExecutionEngine(
@@ -470,6 +471,7 @@ class BaseBot:
                 strat = self.config.get("strategy", {})
                 self.min_conf = strat.get("min_confidence", self.min_conf)
                 self.htf_filter_mode = strat.get("htf_filter_mode", self.htf_filter_mode)
+                self.profile.htf_filter_mode = self.htf_filter_mode
                 self.scan_interval = self.config.get("bot", {}).get("scan_interval_seconds", self.scan_interval)
                 self.max_open = risk.get("max_open_trades", self.max_open)
                 new_profile_name = strat.get("trading_profile", self.profile.name)
@@ -733,7 +735,7 @@ class BaseBot:
             for sym_df in raw_dfs:
                 try:
                     sym_reset = sym_df.reset_index(drop=True)
-                    f = make_features(sym_reset)
+                    f = make_features(sym_reset).reset_index(drop=True)
                     l = make_labels(sym_reset, forward_bars=fb).reindex(f.index).dropna()
                     f = f.loc[l.index]
                     if len(f) < 50:
@@ -2057,7 +2059,7 @@ class BaseBot:
 
                 if self.learner.should_run():
                     try:
-                        self._with_training_heartbeat(lambda: self.learner.run_learning_cycle(), source="ai_agent")
+                        self._with_training_heartbeat(lambda: self.learner.run_learning_cycle(notifier=self.notifier), source="ai_agent")
                     except Exception as e:
                         self.log.error(f"AI agent learning error: {e}", exc_info=True)
 

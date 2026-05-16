@@ -1,0 +1,29 @@
+--- a/bot/engine/ensemble.py
++++ b/bot/engine/ensemble.py
+@@ -66,6 +66,7 @@
+             net += s.net_score * w
+             buy_score += s.buy_score * w
+             sell_score += s.sell_score * w
+             total_w += w
+ 
+         if total_w > 0:
+             net = net / total_w
+             buy_score = buy_score / total_w
+             sell_score = sell_score / total_w
+ 
++        # ─── HARD TREND OVERRIDE (prevents counter-trend signals) ───
++        trend_dir = (market_ctx or {}).get("trend_direction", "NEUTRAL") if market_ctx else "NEUTRAL"
++        if trend_dir == "BULLISH":
++            if net < 0:
++                net = net * 0.05
++                buy_score = buy_score * 0.05
++                sell_score = sell_score * 0.05
++        elif trend_dir == "BEARISH":
++            if net > 0:
++                net = net * 0.05
++                buy_score = buy_score * 0.05
++                sell_score = sell_score * 0.05
++
+         # Directional bias: reduce net_score when fighting the trend
+         _bias_ctx = market_ctx or {}
+         trend_dir = _bias_ctx.get("trend_direction", "NEUTRAL")

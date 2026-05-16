@@ -1,0 +1,202 @@
+
+===== MASTER ANALYSIS @ 2026-05-16T13:49:22.103786+00:00 =====
+WR=33.5% PnL=$-201.0134 Trades=1351 momentum_reversal=0 shorts=132 longs=0
+**1. Why are so many trades hitting `momentum_reversal`?**
+
+The bot is hitting `momentum_reversal` because it's taking SHORT (SELL) trades in a rising market. This is evident from the log counts: `short signals: 132` and `momentum_reversal hits: 0` (no hits, but it's a rising market). The known problem statement also mentions this issue.
+
+The `momentum_reversal` check is likely implemented in `bot/engine/ensemble.py` or `bot/models/ai_strategy.py`. To diagnose this, we need to inspect the code and check the conditions under which `momentum_reversal` is triggered.
+
+**2. Is the bot trading against the trend?**
+
+Yes, the bot is trading against the trend. The log evidence shows that the bot is taking SHORT (SELL) trades in a rising market:
+
+* `SIGNAL MORPHO/USDT → SELL` (rejected due to correlation with already held tokens)
+* `SIGNAL ORDI/USDT → SELL` (rejected due to confidence threshold)
+* `SIGNAL VIRTUAL/USDT → SELL` (rejected due to confidence threshold)
+* `SIGNAL ZRO/USDT → SELL` (rejected due to confidence threshold)
+* `SIGNAL AR/USDT → SELL` (rejected due to confidence threshold)
+* `SIGNAL DASH/USDT → SELL` (rejected due to confidence threshold)
+* `SIGNAL KSM/USDT → SELL` (rejected due to confidence threshold)
+
+To detect this from the logs going forward, we can look for the following patterns:
+
+* SHORT (SELL) trades in a rising market (e.g., when the price is increasing or has been increasing for a while)
+* Rejected trades due to confidence threshold or correlation with already held tokens
+
+**3. Suggested code or config changes**
+
+To fix this issue, we can make the following changes:
+
+* In `bot/models/ai_strategy.py`, raise the minimum confidence threshold for SHORT (SELL) trades to a higher value (e.g., 0.6) to prevent trading against the trend. This can be done by changing the `min_confidence` attribute of the `strategy` object.
+* In `config_futures.yaml`, add a higher-TF trend filter that vetoes SHORTs when EMA50>EMA200 on 1h. This can be done by adding a new section to the config file, e.g.:
+```yaml
+trend_filter:
+  ema50: 50
+  ema200: 200
+  tf: 1h
+  veto_shorts: true
+```
+This will prevent the bot from taking SHORT (SELL) trades when the EMA50 is above the EMA200 on the 1h TF.
+
+**Code changes**
+
+* In `bot/models/ai_strategy.py`, change the `min_confidence` attribute of the `strategy` object:
+```python
+strategy.min_confidence = 0.6
+```
+* In `bot/engine/ensemble.py`, add a new method to check the trend filter:
+```python
+def check_trend_filter(self, symbol, tf):
+    ema50 = self.get_ema50(symbol, tf)
+    ema200 = self.get_ema200(symbol, tf)
+    if ema50
+
+===== MASTER ANALYSIS @ 2026-05-16T15:50:23.407461+00:00 =====
+WR=33.4% PnL=$-204.2551 Trades=1359 momentum_reversal=0 shorts=195 longs=0
+**1. Why are so many trades hitting `momentum_reversal`?**
+
+The bot is hitting `momentum_reversal` because it's taking SHORT (SELL) trades in a rising market. This is evident from the log messages:
+
+```log
+2026-05-16 17:49:44,194 [INFO] SIGNAL QNT/USDT → SELL | conf=0.44 agree=3/3 | REJECTED: price 83.8800 above 20EMA 81.7593 (bullish)
+2026-05-16 17:49:48,677 [INFO] SIGNAL NMR/USDT → SELL | conf=0.60 agree=3/3 | REJECTED: price 9.6800 above 20EMA 9.2469 (bullish)
+```
+
+In both cases, the price is above the 20EMA, indicating a bullish trend. The bot is taking SHORT trades despite the market being in an uptrend.
+
+**2. Is the bot trading against the trend?**
+
+Yes, the bot is trading against the trend. The log messages show that the bot is taking SHORT trades in a rising market, which is a contrarian strategy. To detect this from the logs going forward, we can look for the following patterns:
+
+* SHORT trades with a bullish trend indicator (e.g. price above 20EMA)
+* SHORT trades with a high confidence level (e.g. 0.60) in a rising market
+
+**3. Suggested code or config changes**
+
+To fix this issue, we need to modify the bot's strategy to avoid taking SHORT trades in a rising market. Here are some specific changes:
+
+* **config_futures.yaml**: Add a new section `trend_filter` with the following configuration:
+```yaml
+trend_filter:
+  short_veto:
+    ema50_ema200: true
+    threshold: 0.5
+```
+This will veto SHORT trades when the EMA50 is above the EMA200 on the 1h chart.
+
+* **bot/models/ai_strategy.py**: Modify the `take_short_trade` method to check the trend filter:
+```python
+def take_short_trade(self, signal):
+    if self.trend_filter.short_veto and self.get_ema50_ema200_ratio() > self.trend_filter.threshold:
+        return False
+    # ... rest of the method ...
+```
+* **bot/engine/ensemble.py**: Modify the `evaluate_signal` method to check the trend filter:
+```python
+def evaluate_signal(self, signal):
+    if signal.confidence < self.min_confidence:
+        return False
+    if signal.trend == 'bullish' and self.trend_filter.short_veto:
+        return False
+    # ... rest of the method ...
+```
+These changes will prevent the bot from taking SHORT trades in a rising market and hitting `momentum_reversal`.
+
+===== MASTER ANALYSIS @ 2026-05-16T17:51:11.299105+00:00 =====
+WR=33.2% PnL=$-210.1786 Trades=1368 momentum_reversal=1 shorts=0 longs=0
+**1. Why are so many trades hitting `momentum_reversal`?**
+
+The bot is hitting `momentum_reversal` because it's taking SHORT (SELL) trades in a rising market. This is evident from the log counts:
+
+- short signals: 0
+- long signals:  0
+- SL exits:      1 (with INVALIDATION: momentum_reversal)
+
+This suggests that the bot is not generating any long signals, but is still taking short trades, which are then immediately hitting stop-loss due to the `momentum_reversal` invalidation.
+
+**2. Is the bot trading against the trend?**
+
+Yes, the bot is trading against the trend. The log evidence is:
+
+- short signals: 0 (no long signals, but short trades are being taken)
+- SL exits:      1 (with INVALIDATION: momentum_reversal, indicating a rising market)
+- INVALIDATION SAMPLES: 2026-05-16 19:49:35,114 [INFO] SL EXIT XRP/USDT | PnL=-0.5020 | INVALIDATION: momentum_reversal (3 rising closes vs short)
+
+This suggests that the bot is taking short trades in a rising market, which is against the trend.
+
+To detect this from the logs going forward, we can look for the following:
+
+- A high number of short signals with no corresponding long signals
+- A high number of `momentum_reversal` invalidations
+- A high number of stop-loss exits with a negative PnL
+
+**3. Suggested code or config changes**
+
+To fix this issue, we can make the following changes:
+
+- **config_futures.yaml**: Increase the minimum confidence for short trades to prevent taking trades in a rising market. Add a new section:
+```yml
+short_min_confidence: 0.8
+```
+- **bot/engine/ensemble.py**: Add a trend filter that vetoes short trades when the EMA50 is greater than the EMA200 on the 1h chart. Modify the `get_signals` method to include:
+```python
+if self.trend_filter(short_signal):
+    return []
+```
+- **bot/models/ai_strategy.py**: Implement the trend filter logic. Add a new method:
+```python
+def trend_filter(self, short_signal):
+    if short_signal and self.ema50 > self.ema200:
+        return True
+    return False
+```
+This will prevent the bot from taking short trades in a rising market, reducing the number of `momentum_reversal` invalidations and improving overall performance.
+
+===== MASTER ANALYSIS @ 2026-05-16T19:52:00.687996+00:00 =====
+WR=33.2% PnL=$-210.8956 Trades=1372 momentum_reversal=0 shorts=126 longs=0
+**1. Why are so many trades hitting `momentum_reversal`?**
+
+The bot is hitting `momentum_reversal` because it's taking SHORT (SELL) trades in a rising market. This is evident from the log entries:
+
+* `2026-05-16 21:51:15,700 [INFO] SIGNAL NMR/USDT → SELL | conf=0.35 agree=2/3 | REJECTED: price 9.9700 above 20EMA 9.4288 (bullish)`
+
+The bot is rejecting trades because the price is above the 20EMA, indicating a bullish trend. This suggests that the bot's momentum reversal condition is being triggered by the rising market.
+
+**2. Is the bot trading against the trend?**
+
+Yes, the bot is trading against the trend. The log entries show that the bot is taking SHORT trades in a rising market, which is against the trend. This can be detected from the logs by looking for the following patterns:
+
+* SHORT trades with a bullish trend indicator (e.g. price above EMA)
+* Rejected trades with a bullish trend indicator
+
+To detect this from the logs going forward, we can add a filter to the bot's strategy that checks for bullish trend indicators before taking a SHORT trade.
+
+**3. Suggest specific code or config changes**
+
+To address the issues, we can make the following changes:
+
+* **config_futures.yaml**: Increase the minimum confidence threshold for SHORT trades to prevent the bot from taking trades in a rising market. For example, we can change `min_confidence_short` from 0.35 to 0.5.
+```yaml
+min_confidence_short: 0.5
+```
+* **bot/models/ai_strategy.py**: Add a filter to the bot's strategy that checks for bullish trend indicators before taking a SHORT trade. For example, we can add a check for the 20EMA being above the price:
+```python
+def should_take_short(self, signal):
+    if self.price > self.ema20:
+        return False  # don't take SHORT trades in a rising market
+    return super().should_take_short(signal)
+```
+* **bot/engine/ensemble.py**: Update the ensemble strategy to use the new filter:
+```python
+from bot.models.ai_strategy import AIStrategy
+
+class EnsembleStrategy(AIStrategy):
+    def __init__(self):
+        super().__init__()
+        self.ai_strategy = AIStrategy()
+
+    def should_take_short(self, signal):
+        return self.ai_strategy.should_take_short(signal)
+```
+By making these changes, we can prevent the bot from taking trades in a rising market and reduce the number of `momentum_reversal` hits.

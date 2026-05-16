@@ -29,10 +29,13 @@ class EnsembleResult:
 class EnsembleEngine:
     BASE_AGENT_WEIGHTS = {"smc": 0.35, "technical": 0.40, "macro_flow": 0.25}
 
-    def __init__(self, smc_agent, tech_agent, macro_agent=None):
+    def __init__(self, smc_agent, tech_agent, macro_agent=None, trend_filter=None):
         self.smc     = smc_agent
         self.tech    = tech_agent
         self.macro   = macro_agent
+        # trend_filter: dict from config.trend_filter — vetoes counter-trend signals
+        # using a per-symbol higher-TF EMA(fast)/EMA(slow) cross check.
+        self.trend_filter = trend_filter or {}
 
     def _regime_weights(self, regime: str) -> dict:
         w = dict(self.BASE_AGENT_WEIGHTS)
@@ -86,7 +89,41 @@ class EnsembleEngine:
                                  threshold_mult=threshold_mult)
         if n_failed >= 1:
             result.agents_ok = False
+
+        # ── Higher-TF trend veto ───────────────────────────────────────────
+        # Vetoes counter-trend signals using EMA(fast)/EMA(slow) on the df we
+        # already receive (the bot passes df_1h here). Convert to HOLD only —
+        # never flip direction.
+        if self.trend_filter.get("enabled") and result.action in ("BUY", "SELL"):
+            veto_reason = self._check_trend_veto(df, result.action)
+            if veto_reason:
+                log.info(f"TREND VETO {symbol} → HOLD (was {result.action}): {veto_reason}")
+                result.action = "HOLD"
+                result.source = f"trend_veto:{veto_reason}"
         return result
+
+    def _check_trend_veto(self, df: pd.DataFrame, action: str) -> Optional[str]:
+        """Return a reason string if `action` should be vetoed, else None."""
+        cfg       = self.trend_filter
+        ema_fast  = int(cfg.get("ema_fast", 50))
+        ema_slow  = int(cfg.get("ema_slow", 200))
+        veto_sh   = bool(cfg.get("veto_shorts", True))
+        veto_lo   = bool(cfg.get("veto_longs", True))
+        try:
+            if df is None or len(df) < ema_slow + 5:
+                return None  # not enough history → no veto
+            close = df["close"]
+            ef = float(close.ewm(span=ema_fast, adjust=False).mean().iloc[-1])
+            es = float(close.ewm(span=ema_slow, adjust=False).mean().iloc[-1])
+        except Exception as e:
+            log.debug(f"trend_filter compute failed: {e}")
+            return None
+        tf = cfg.get("tf", "1h")
+        if action == "SELL" and veto_sh and ef > es:
+            return f"uptrend EMA{ema_fast}>{ema_slow} on {tf} (SHORT blocked)"
+        if action == "BUY" and veto_lo and ef < es:
+            return f"downtrend EMA{ema_fast}<{ema_slow} on {tf} (LONG blocked)"
+        return None
 
     def _aggregate(self, signals: list, profile,
                    market_ctx: dict = None, regime: str = "RANGING",
@@ -109,7 +146,21 @@ class EnsembleEngine:
             buy_score  = buy_score / total_w
             sell_score = sell_score / total_w
 
-        # Directional bias: reduce net_score when fighting the trend
+              # ─── HARD TREND OVERRIDE (prevents counter-trend signals) ───
+        trend_dir = (market_ctx or {}).get("trend_direction", "NEUTRAL") if market_ctx else "NEUTRAL"
+        if trend_dir == "BULLISH":
+            if net < 0:
+                net = net * 0.05
+                buy_score = buy_score * 0.05
+                sell_score = sell_score * 0.05
+        elif trend_dir == "BEARISH":
+            if net > 0:
+                net = net * 0.05
+                buy_score = buy_score * 0.05
+                sell_score = sell_score * 0.05 
+
+
+       # Directional bias: reduce net_score when fighting the trend
         _bias_ctx = market_ctx or {}
         trend_dir = _bias_ctx.get("trend_direction", "NEUTRAL")
         if trend_dir == "BEARISH" and net > 0:

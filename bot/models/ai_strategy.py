@@ -295,8 +295,8 @@ class RandomForestStrategy:
               atr_k: float = 0.5, class_weights: dict = None):
         log.info("Training Random Forest (walk-forward)...")
         if feat_df is not None and labels_s is not None:
-            feat   = feat_df
-            labels = labels_s
+            feat   = feat_df.reset_index(drop=True)
+            labels = labels_s.reset_index(drop=True)
         else:
             feat   = make_features(df)
             labels = make_labels(df, forward_bars=forward_bars, atr_k=atr_k).reindex(feat.index).dropna()
@@ -447,8 +447,8 @@ class LightGBMStrategy:
               atr_k: float = 0.5, class_weights: dict = None):
         log.info("Training LightGBM (walk-forward)...")
         if feat_df is not None and labels_s is not None:
-            feat   = feat_df
-            labels = labels_s
+            feat   = feat_df.reset_index(drop=True)
+            labels = labels_s.reset_index(drop=True)
         else:
             feat   = make_features(df)
             labels = make_labels(df, forward_bars=forward_bars, atr_k=atr_k).reindex(feat.index).dropna()

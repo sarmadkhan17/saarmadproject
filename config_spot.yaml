@@ -21,7 +21,7 @@ risk:
   max_open_trades: 5
   max_portfolio_heat: 0.5
   max_position_pct: 0.03
-  stop_loss_atr_multiplier: 1.5
+  stop_loss_atr_multiplier: 4.0
   stop_loss_min_pct: 0.01
   take_profit_atr_multiplier: 3.0
   take_profit_pct: 0.03
@@ -67,3 +67,10 @@ training:
   - 1d
   use_dataset_pipeline: true
   use_real_api: true
+trend_filter:
+  ema_fast: 50
+  ema_slow: 200
+  enabled: true
+  tf: 1h
+  veto_longs: true
+  veto_shorts: true

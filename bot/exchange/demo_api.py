@@ -92,6 +92,21 @@ class BinanceDemoClient:
             log.error(f"Signed GET {path}: {r.text}")
             raise
 
+    def _algo_signed_post(self, path: str, params: dict = None) -> dict:
+        """Signed POST request to the algo order endpoint (/fapi/v1/algoOrder)."""
+        params = params or {}
+        params["timestamp"]  = int(time.time() * 1000)
+        params["recvWindow"] = 10000
+        params["signature"]  = self._sign(params)
+        url = f"{self.base_url}/fapi/v1/algoOrder"
+        try:
+            r = self.session.post(url, params=params, timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError:
+            log.error(f"Algo Signed POST {path}: {r.text}")
+            raise
+
     def _signed_post(self, path: str, params: dict = None) -> dict:
         """Signed POST request (orders, leverage)."""
         params = params or {}
@@ -273,7 +288,7 @@ class BinanceDemoClient:
         }
 
     def create_stop_market_order(self, symbol: str, side: str, amount: float, stop_price: float, params: dict = None) -> dict:
-        """Place a STOP_MARKET stop-loss order on the demo FAPI."""
+        """Place a STOP_MARKET stop-loss order on the demo FAPI via the Algo Order endpoint."""
         sym = self._normalize_symbol(symbol)
         amount = self._round_amount(symbol, amount)
         rounded_stop = self._round_price(symbol, stop_price)
@@ -284,18 +299,19 @@ class BinanceDemoClient:
         order_params = {
             "symbol":      sym,
             "side":        side.upper(),
+            "positionSide": extra.get("positionSide", "BOTH"),
             "type":        "STOP_MARKET",
             "stopPrice":   rounded_stop,
             "quantity":    amount,
             "workingType": working_type,
             "reduceOnly":  "true",
+            "priceProtect":"TRUE",
         }
 
-        path = "/order"
-        data = self._signed_post(path, order_params)
+        data = self._algo_signed_post("/algoOrder", order_params)
 
         return {
-            "id":        str(data.get("orderId", "")),
+            "id":        str(data.get("algoId", "")),
             "symbol":    symbol,
             "side":      side,
             "amount":    float(data.get("origQty", amount)),
@@ -306,8 +322,10 @@ class BinanceDemoClient:
         }
 
     def cancel_order(self, order_id: str, symbol: str) -> dict:
-        """Cancel an open order."""
+        """Cancel an open order. Tries regular endpoint first, then algo endpoint."""
         sym = self._normalize_symbol(symbol)
+
+        # Try regular endpoint first
         params = {
             "symbol":  sym,
             "orderId": order_id,
@@ -320,16 +338,36 @@ class BinanceDemoClient:
             r = self.session.delete(url, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
+            return {
+                "id":     str(data.get("orderId", "")),
+                "symbol": symbol,
+                "status": data.get("status", "cancelled").lower(),
+                "info":   data,
+            }
         except requests.exceptions.HTTPError:
-            log.error(f"Cancel order {symbol}: {r.text}")
-            raise
-
-        return {
-            "id":     str(data.get("orderId", "")),
-            "symbol": symbol,
-            "status": data.get("status", "cancelled").lower(),
-            "info":   data,
-        }
+            err_text = r.text if 'r' in dir() else ""
+            # If regular cancel failed, try algo endpoint
+            algo_params = {
+                "symbol": sym,
+                "algoId": order_id,
+                "timestamp": int(time.time() * 1000),
+                "recvWindow": 10000,
+            }
+            algo_params["signature"] = self._sign(algo_params)
+            algo_url = f"{self.base_url}/fapi/v1/algoOrder"
+            try:
+                r2 = self.session.delete(algo_url, params=algo_params, timeout=15)
+                r2.raise_for_status()
+                data2 = r2.json()
+                return {
+                    "id":     str(data2.get("algoId", order_id)),
+                    "symbol": symbol,
+                    "status": "cancelled",
+                    "info":   data2,
+                }
+            except requests.exceptions.HTTPError:
+                log.error(f"Cancel order {symbol} (both endpoints): regular={err_text} algo={r2.text}")
+                raise
 
     def fetch_open_orders(self, symbol: str = None) -> list:
         """Get all open orders for a symbol or all symbols."""

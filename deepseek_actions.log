@@ -1,0 +1,3 @@
+2026-05-16T23:22:02.141960 - DeepSeek Admin started
+2026-05-16T23:22:03.166834 - DeepSeek says: {"min_confidence": 0.45}
+2026-05-16T23:22:03.184172 - Applied config: {'strategy': {'min_confidence': 0.45}}
