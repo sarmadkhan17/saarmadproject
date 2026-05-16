@@ -265,10 +265,11 @@ class ExitEngine:
 
     def __init__(self, default_trail_mult: float = 2.0):
         self._default_trail = default_trail_mult
-        self._peaks:      dict = {}   # best price seen (low for shorts, high for longs)
-        self._entry_atrs: dict = {}   # ATR at initialisation
-        self._tp1_done:   dict = {}
-        self._be_active:  dict = {}   # breakeven clamp armed
+        self._peaks:       dict = {}   # best price seen (low for shorts, high for longs)
+        self._entry_atrs:  dict = {}   # ATR at initialisation
+        self._tp1_done:    dict = {}
+        self._be_active:   dict = {}   # breakeven clamp armed
+        self._entry_times: dict = {}   # tz-aware UTC datetime at entry
         self._dirty = False
         self._file  = DATA / f"exit_engine_{BOT_MODE}.json"
         self._load()
@@ -283,6 +284,16 @@ class ExitEngine:
             self._entry_atrs = d.get("entry_atrs", {})
             self._tp1_done   = d.get("tp1_done", {})
             self._be_active  = d.get("be_active", {})
+            raw_times        = d.get("entry_times", {})
+            self._entry_times = {}
+            for k, v in raw_times.items():
+                try:
+                    dt = datetime.fromisoformat(v)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    self._entry_times[k] = dt
+                except (TypeError, ValueError):
+                    pass
         except Exception:
             pass
 
@@ -290,10 +301,11 @@ class ExitEngine:
         tmp = self._file.with_suffix(".tmp.json")
         with open(tmp, "w") as f:
             json.dump({
-                "peaks":      self._peaks,
-                "entry_atrs": self._entry_atrs,
-                "tp1_done":   self._tp1_done,
-                "be_active":  self._be_active,
+                "peaks":       self._peaks,
+                "entry_atrs":  self._entry_atrs,
+                "tp1_done":    self._tp1_done,
+                "be_active":   self._be_active,
+                "entry_times": {k: v.isoformat() for k, v in self._entry_times.items()},
             }, f)
         tmp.replace(self._file)
         self._dirty = False
@@ -303,17 +315,19 @@ class ExitEngine:
             self._save()
 
     def cleanup(self, trade_id: str):
-        for store in (self._peaks, self._entry_atrs, self._tp1_done, self._be_active):
+        for store in (self._peaks, self._entry_atrs, self._tp1_done,
+                      self._be_active, self._entry_times):
             store.pop(trade_id, None)
         self._save()
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _init(self, trade_id: str, price: float, atr: float):
-        self._peaks[trade_id]      = price
-        self._entry_atrs[trade_id] = max(atr, 1e-9)
-        self._tp1_done[trade_id]   = False
-        self._be_active[trade_id]  = False
+        self._peaks[trade_id]       = price
+        self._entry_atrs[trade_id]  = max(atr, 1e-9)
+        self._tp1_done[trade_id]    = False
+        self._be_active[trade_id]   = False
+        self._entry_times[trade_id] = datetime.now(timezone.utc)
         self._dirty = True
 
     def _update_peak(self, trade_id: str, price: float, atr: float, is_short: bool):
@@ -369,7 +383,9 @@ class ExitEngine:
 
         # ── 1. Early invalidation (pre-TP1, only when trade is losing) ────────
         if early_exit_enabled and not tp1_done:
-            reason = self._check_invalidation(entry, price, entry_atr, gain, is_short, candle_df)
+            reason = self._check_invalidation(
+                trade_id, entry, price, entry_atr, gain, is_short, candle_df,
+            )
             if reason:
                 return 1.0, f"INVALIDATION: {reason}"
 
@@ -417,14 +433,16 @@ class ExitEngine:
     # ── Signal helpers ────────────────────────────────────────────────────────
 
     def _check_invalidation(
-        self, entry: float, price: float, entry_atr: float,
+        self, trade_id: str, entry: float, price: float, entry_atr: float,
         gain: float, is_short: bool, candle_df,
     ) -> str:
         """Return non-empty reason when pre-TP1 trade should be cut fast."""
         if candle_df is None or len(candle_df) < 5:
             return ""
-        # Only invalidate when clearly losing (more than 0.3R underwater)
-        if gain > -0.3 * entry_atr:
+        # Only invalidate when clearly losing (more than 1.0R underwater).
+        # 0.3R was inside typical entry slippage on low-ATR symbols and tripped
+        # on every short before any real adverse move developed.
+        if gain > -1.0 * entry_atr:
             return ""
 
         # Volume collapse: last completed bar volume < 35% of 20-bar avg
@@ -442,11 +460,28 @@ class ExitEngine:
         except Exception:
             pass
 
-        # Momentum reversal: 3 consecutive closed candles moving against trade
+        # Momentum reversal: 3 consecutive closed candles moving against trade,
+        # but only candles that closed AFTER entry. The previous version used
+        # iloc[-4:-1] unconditionally, so a short opened on the top of a 3-bar
+        # bounce was invalidated on the very next scan by the pre-entry rally.
         try:
+            entry_time = self._entry_times.get(trade_id)
             c = candle_df["close"]
-            if len(c) >= 4:
-                c1, c2, c3 = float(c.iloc[-4]), float(c.iloc[-3]), float(c.iloc[-2])
+            if entry_time is not None and isinstance(c.index, pd.DatetimeIndex):
+                idx = c.index
+                idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+                # Strictly post-entry AND strictly before the latest row
+                # (iloc[-1] is the forming candle; only fully closed bars count).
+                post_mask = (idx_utc > entry_time) & (idx_utc < idx_utc[-1])
+                c_post = c[post_mask]
+            else:
+                # No entry_time recorded (legacy state) or no datetime index —
+                # fall back to original window so behaviour matches pre-fix.
+                c_post = c.iloc[:-1]
+            if len(c_post) >= 3:
+                c1 = float(c_post.iloc[-3])
+                c2 = float(c_post.iloc[-2])
+                c3 = float(c_post.iloc[-1])
                 if is_short and c1 < c2 < c3:
                     return "momentum_reversal (3 rising closes vs short)"
                 if not is_short and c1 > c2 > c3:
