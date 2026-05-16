@@ -41,7 +41,7 @@ scanner:
   top_n: 25
 strategy:
   htf_filter_mode: hard
-  min_confidence: 0.45
+  min_confidence: 0.55
   min_votes: 2
   trading_profile: AGGRESSIVE
 training:

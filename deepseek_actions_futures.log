@@ -1,3 +1,5 @@
 2026-05-17T00:02:07.357216 [futures] - DeepSeek Admin started in futures mode
 2026-05-17T00:02:08.307056 [futures] - DeepSeek says: {"min_confidence": 0.55}
 2026-05-17T00:02:08.330976 [futures] - Applied config: {'strategy': {'min_confidence': 0.55}}
+2026-05-17T00:32:11.475440 [futures] - DeepSeek says: {"min_confidence": 0.45}
+2026-05-17T00:32:11.496823 [futures] - Applied config: {'strategy': {'min_confidence': 0.45}}
