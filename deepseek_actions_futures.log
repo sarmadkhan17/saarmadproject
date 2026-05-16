@@ -102,3 +102,36 @@
 2026-05-17T00:46:04.350766 [futures] - Config changed: {'risk': {'take_profit_atr_multiplier': 6.0}}
 2026-05-17T00:46:12.662111 [futures] - Bot restarted successfully
 2026-05-17T00:46:12.662556 [futures] - DeepSeek actions: config strategy.min_confidence=0.48, config risk.stop_loss_atr_multiplier=7.0, config risk.take_profit_atr_multiplier=6.0, restarted bot
+2026-05-17T00:50:39.361682 [futures] - DeepSeek Full Agent started in futures mode
+2026-05-17T00:50:39.383252 [futures] - Working on branch ai-agent-futures
+2026-05-17T00:50:41.442377 [futures] - DeepSeek raw response: ```json
+[
+    {
+        "type": "config_change",
+        "section": "strategy",
+        "key": "min_confidence",
+        "value": 0.43
+    },
+    {
+        "type": "config_change",
+        "section": "risk",
+        "key": "max_consecutive_losses",
+        "value": 6
+    },
+    {
+        "type": "config_change",
+        "section": "risk",
+        "key": "stop_loss_atr_multiplier",
+        "value": 7.5
+    },
+    {
+        "type": "config_change",
+        "section": "risk",
+        "key": "take_p
+2026-05-17T00:50:41.464413 [futures] - Config changed: {'strategy': {'min_confidence': 0.43}}
+2026-05-17T00:50:41.475173 [futures] - Config changed: {'risk': {'max_consecutive_losses': 6}}
+2026-05-17T00:50:41.488781 [futures] - Config changed: {'risk': {'stop_loss_atr_multiplier': 7.5}}
+2026-05-17T00:50:41.499821 [futures] - Config changed: {'risk': {'take_profit_atr_multiplier': 6.5}}
+2026-05-17T00:50:41.510805 [futures] - Config changed: {'scanner': {'min_volume_usdt': 100000000}}
+2026-05-17T00:50:41.525384 [futures] - Config changed: {'scanner': {'top_n': 20}}
+2026-05-17T00:50:41.525587 [futures] - DeepSeek actions: config strategy.min_confidence=0.43, config risk.max_consecutive_losses=6, config risk.stop_loss_atr_multiplier=7.5, config risk.take_profit_atr_multiplier=6.5, config scanner.min_volume_usdt=100000000, config scanner.top_n=20
