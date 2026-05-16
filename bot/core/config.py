@@ -28,6 +28,8 @@ def load_env():
                     key, val = line.split("=", 1)
                     key = key.strip()
                     val = val.strip()
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                        val = val[1:-1]
                     if val:
                         os.environ[key] = val
 
