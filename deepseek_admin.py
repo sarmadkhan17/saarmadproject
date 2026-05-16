@@ -102,7 +102,7 @@ def apply_config(changes):
 def restart_bot():
     subprocess.run(["pkill", "-f", "launcher.py"])
     time.sleep(2)
-    subprocess.Popen(["python3", str(BOT_DIR / "launcher.py")], cwd=BOT_DIR)
+    subprocess.Popen(["python3", str(BOT_DIR / "bot/launcher.py")], cwd=BOT_DIR / "bot")
 
 def ask_deepseek(prompt):
     headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
