@@ -48,6 +48,7 @@ def _send_telegram_alert(text: str):
 
 
 def _write_bot_mode_to_env(mode: str):
+    os.environ["BOT_MODE"] = mode
     env_path = Path.home() / "cryptobot_v3" / ".env"
     if not env_path.exists():
         return
