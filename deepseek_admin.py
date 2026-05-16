@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DeepSeek Autonomous Admin – watches the bot, fixes problems, saves changes on 'ai-agent' branch.
+DeepSeek Autonomous Admin – mode‑aware (spot/futures).
 """
 
 import os
@@ -11,32 +11,55 @@ import yaml
 import requests
 import subprocess
 import shutil
+import re
 from pathlib import Path
 from datetime import datetime
 
-# ========== SETTINGS – YOU MUST CHANGE THESE ==========
-DEEPSEEK_API_KEY = "sk-2a5f5a8a34f34ffcbb3463c1b8a3f645"   # <-- PUT YOUR REAL API KEY HERE
-TELEGRAM_BOT_TOKEN = "8735492279:AAFhM25BjKK7hyNpvqVatdDTIXqMVsLe_Tg"          # Optional: leave empty for now
-TELEGRAM_CHAT_ID = "-5155369332"            # Optional: leave empty for now
-# ======================================================
+# ========== SETTINGS – YOUR EXISTING CREDENTIALS ==========
+DEEPSEEK_API_KEY = "sk-2a5f5a8a34f34ffcbb3463c1b8a3f645"
+TELEGRAM_BOT_TOKEN = "8735492279:AAFhM25BjKK7hyNpvqVatdDTIXqMVsLe_Tg"
+TELEGRAM_CHAT_ID = "-5155369332"
+# ==========================================================
 
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 BOT_DIR = Path("/root/cryptobot_v3")
-LOG_FILE = BOT_DIR / "logs/futures_bot.log"
-STATE_FILE = BOT_DIR / "data/futures_state.json"
-CONFIG_FILE = BOT_DIR / "config_futures.yaml"
-CONFIG_BACKUP = BOT_DIR / "config_futures.backup.yaml"
-ACTION_LOG = BOT_DIR / "deepseek_actions.log"
-AI_BRANCH = "ai-agent"
 INTERVAL_SECONDS = 1800   # 30 minutes
 AUTO_APPLY_CONFIG = True
 AUTO_COMMIT = True
 AUTO_PUSH = False   # Set to True if you have a git remote
 
+def get_current_mode():
+    env_path = BOT_DIR / ".env"
+    if not env_path.exists():
+        return "futures"
+    for line in env_path.read_text().splitlines():
+        if line.startswith("BOT_MODE="):
+            mode = line.split("=", 1)[1].strip().strip('"').strip("'").lower()
+            if mode in ("spot", "futures"):
+                return mode
+    return "futures"
+
+CURRENT_MODE = get_current_mode()
+
+# Set paths based on current mode
+if CURRENT_MODE == "spot":
+    LOG_FILE = BOT_DIR / "logs/spot_bot.log"
+    STATE_FILE = BOT_DIR / "data/state.json"
+    CONFIG_FILE = BOT_DIR / "config_spot.yaml"
+    ACTION_LOG = BOT_DIR / f"deepseek_actions_spot.log"
+else:
+    LOG_FILE = BOT_DIR / "logs/futures_bot.log"
+    STATE_FILE = BOT_DIR / "data/futures_state.json"
+    CONFIG_FILE = BOT_DIR / "config_futures.yaml"
+    ACTION_LOG = BOT_DIR / f"deepseek_actions_futures.log"
+
+CONFIG_BACKUP = BOT_DIR / f"config_{CURRENT_MODE}.backup.yaml"
+AI_BRANCH = f"ai-agent-{CURRENT_MODE}"
+
 def log_action(msg):
     with open(ACTION_LOG, 'a') as f:
-        f.write(f"{datetime.now().isoformat()} - {msg}\n")
-    print(msg)
+        f.write(f"{datetime.now().isoformat()} [{CURRENT_MODE}] - {msg}\n")
+    print(f"[{CURRENT_MODE}] {msg}")
 
 def send_telegram(msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -99,22 +122,10 @@ def apply_config(changes):
             yaml.dump(config, f)
     return modified
 
-def _read_bot_mode_from_env_file():
-    env_path = BOT_DIR / ".env"
-    if not env_path.exists():
-        return ""
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("BOT_MODE="):
-            return line.split("=", 1)[1].strip().strip('"').strip("'").lower()
-    return ""
-
-
 def restart_bot():
     subprocess.run(["pkill", "-f", "launcher.py"])
     time.sleep(2)
-    mode = _read_bot_mode_from_env_file() or "futures"
-    env = {**os.environ, "BOT_MODE": mode}
+    env = {**os.environ, "BOT_MODE": CURRENT_MODE}
     subprocess.Popen(
         ["python3", str(BOT_DIR / "bot/launcher.py")],
         cwd=BOT_DIR / "bot",
@@ -135,14 +146,15 @@ def ask_deepseek(prompt):
     return f"API error: {resp.text}"
 
 def main():
-    log_action("DeepSeek Admin started")
+    log_action(f"DeepSeek Admin started in {CURRENT_MODE} mode")
     git_ensure_branch()
     while True:
         try:
             logs = read_logs()
             state = read_state()
             perf, mom = get_performance(state)
-            prompt = f"""Bot performance: {perf}
+            prompt = f"""Bot mode: {CURRENT_MODE}
+Performance: {perf}
 Momentum reversal count: {mom}
 Log tail:
 {logs[-2000:]}
@@ -155,7 +167,6 @@ If win rate <45% or momentum_reversal >3, suggest one config change (min_confide
             changes = {}
             try:
                 if '"min_confidence"' in answer:
-                    import re
                     m = re.search(r'"min_confidence":\s*([0-9.]+)', answer)
                     if m:
                         changes["strategy"] = {"min_confidence": float(m.group(1))}

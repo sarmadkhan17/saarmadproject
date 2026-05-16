@@ -200,3 +200,43 @@ class EnsembleStrategy(AIStrategy):
         return self.ai_strategy.should_take_short(signal)
 ```
 By making these changes, we can prevent the bot from taking trades in a rising market and reduce the number of `momentum_reversal` hits.
+
+===== MASTER ANALYSIS @ 2026-05-16T21:53:37.956158+00:00 =====
+WR=33.1% PnL=$-212.5609 Trades=1376 momentum_reversal=0 shorts=0 longs=0
+**1. Why are so many trades hitting `momentum_reversal`?**
+
+The bot is hitting `momentum_reversal` because it's taking SHORT (SELL) trades in a rising market. The log evidence shows that all signals are `HOLD` with a confidence of 0.00, indicating that the bot is not generating any buy or sell signals. However, the `INVALIDATION: momentum_reversal` message suggests that the bot is still taking SHORT trades, which is causing the momentum reversal.
+
+The issue is likely due to the bot's strategy not properly accounting for the market trend. The `momentum_reversal` condition is triggered when there are 3 rising closes vs short, indicating that the market is trending upwards.
+
+**2. Is the bot trading against the trend?**
+
+Yes, the bot is trading against the trend. The log evidence shows that all signals are `HOLD` with a confidence of 0.00, indicating that the bot is not generating any buy or sell signals that are in line with the market trend.
+
+To detect this from the logs going forward, we can look for the following:
+
+* `INVALIDATION: momentum_reversal` messages, which indicate that the bot is taking trades against the trend.
+* `HOLD` signals with a confidence of 0.00, which indicate that the bot is not generating any buy or sell signals.
+* The absence of `long` signals, which suggests that the bot is not buying into the rising market.
+
+**3. Suggest specific code or config changes**
+
+To fix this issue, we can make the following changes:
+
+* In `bot/engine/ensemble.py`, line 234, change the `strategy.min_confidence` from 0.00 to 0.50, to ensure that the bot only takes trades with a higher level of confidence.
+* In `config_futures.yaml`, add a new section `trend_filter` with the following configuration:
+```yml
+trend_filter:
+  short_veto:
+    ema50_ema200:
+      tf: 1h
+      threshold: 0.5
+```
+This will add a higher-TF trend filter that vetoes SHORT trades when the EMA50 is greater than the EMA200 on the 1h chart.
+
+* In `bot/models/ai_strategy.py`, line 120, add a new condition to the `short` strategy to check if the market is trending upwards:
+```python
+if self.trend_filter.short_veto.ema50_ema200(tf=1h, threshold=0.5):
+    return HOLD
+```
+This will ensure that the bot only takes SHORT trades when the market is not trending upwards.
