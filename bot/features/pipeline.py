@@ -404,7 +404,7 @@ def build_training_dataset(
         try:
             sym_features_by_tf = {}
             for tf in timeframes:
-                df = feed.fetch_ohlcv(sym, tf, limit=5000)
+                df = feed.fetch_ohlcv(sym, tf, limit=0)
                 if df is None or len(df) < min_bars:
                     log.info(f"  {sym}/{tf}: insufficient bars ({len(df) if df is not None else 0}/{min_bars})")
                     continue
@@ -435,7 +435,7 @@ def build_training_dataset(
                 continue
 
             # Compute labels from primary timeframe raw data
-            primary_df = feed.fetch_ohlcv(sym, primary_tf, limit=5000)
+            primary_df = feed.fetch_ohlcv(sym, primary_tf, limit=0)
             if primary_df is None:
                 continue
             if _HAS_PANDAS and isinstance(primary_df, pd.DataFrame):
@@ -703,7 +703,7 @@ def build_raw_combined(feed, symbols: List[str], timeframe: str = "1h",
 
     parts = []
     for sym in symbols:
-        df = feed.fetch_ohlcv(sym, timeframe, limit=5000)
+        df = feed.fetch_ohlcv(sym, timeframe, limit=0)
         if df is not None and len(df) >= min_bars:
             parts.append(df)
 
