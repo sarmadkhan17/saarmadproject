@@ -92,9 +92,7 @@ class FuturesBot(BaseBot):
             return True  # fail-open
 
     def _effective_leverage(self, regime: str) -> int:
-        """Halve leverage during HIGH_VOL or CRASH regimes."""
-        if regime in ("HIGH_VOL", "CRASH"):
-            return max(1, self.leverage // 2)
+        """Always use configured leverage regardless of regime."""
         return self.leverage
 
     def _place_buy(self, symbol, amount):

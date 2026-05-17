@@ -158,7 +158,7 @@ _PRESETS = {
     "AGGRESSIVE": TradingProfile(
         name="AGGRESSIVE",
         # 1-agent minimum: SMC neutral in STRONG_TREND leaves only Tech; direction filtered at Gate 4b
-        min_confidence=0.42, min_agent_agreement=1, net_score_threshold=0.28,
+        min_confidence=0.42, min_agent_agreement=1, net_score_threshold=0.05,
         ml_prob_threshold=0.62, smc_sub_checks_min=1,
         # Breakout focus: ADX floor + volume spike primary signal
         adx_min=20.0, min_quality_score=0.30,
@@ -173,11 +173,10 @@ _PRESETS = {
         # Soft HTF (not "none" — blind to daily trend causes outsized losses)
         htf_filter_mode="soft", btc_momentum_filter=True,
         # Momentum: SL 2×, TP 3.5×, trail 2.2× — respects crypto noise, still harvests fast moves
-        position_size_pct=0.015, stop_loss_atr_mult=2.0, take_profit_atr_mult=3.5,
-        max_correlation=0.55, max_portfolio_heat=0.50, trailing_activation_atr=0.6, size_mult=1.0,
-        # Exit: early invalidation on; trail wider than before; no dynamic extension
-        tp1_fraction=0.50, tp1_r_mult=2.0, trail_atr_mult=2.2,
-        early_exit_enabled=True, dynamic_tp_enabled=False,
+        position_size_pct=0.025, stop_loss_atr_mult=2.0, take_profit_atr_mult=3.5,
+
+        early_exit_enabled=True, dynamic_tp_enabled=True,
+        tp1_fraction=0.50, tp1_r_mult=2.0, trail_atr_mult=3.0,
     ),
 
     # ── CONFLUENCE: quality overlay — highest bar, all dimensions required ─────

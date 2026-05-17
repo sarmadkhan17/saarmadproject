@@ -146,15 +146,21 @@ class EnsembleEngine:
             buy_score  = buy_score / total_w
             sell_score = sell_score / total_w
 
+        log.debug(f"ENSEMBLE DEBUG: regime={regime} weights={weights} net={net:.4f} buy={buy_score:.4f} sell={sell_score:.4f}")
+        log.debug(f"ENSEMBLE DEBUG: market_ctx={market_ctx}")
+
               # ─── HARD TREND OVERRIDE (prevents counter-trend signals) ───
         trend_dir = (market_ctx or {}).get("trend_direction", "NEUTRAL") if market_ctx else "NEUTRAL"
+        log.debug(f"ENSEMBLE DEBUG: trend_dir={trend_dir} net_before_override={net:.4f}")
         if trend_dir == "BULLISH":
             if net < 0:
+                log.debug(f"ENSEMBLE DEBUG: HARD OVERRIDE bullish+net<0: {net:.4f} → {net*0.05:.4f}")
                 net = net * 0.05
                 buy_score = buy_score * 0.05
                 sell_score = sell_score * 0.05
         elif trend_dir == "BEARISH":
             if net > 0:
+                log.debug(f"ENSEMBLE DEBUG: HARD OVERRIDE bearish+net>0: {net:.4f} → {net*0.05:.4f}")
                 net = net * 0.05
                 buy_score = buy_score * 0.05
                 sell_score = sell_score * 0.05 
@@ -172,12 +178,15 @@ class EnsembleEngine:
 
         # ── Hard block: volume so thin price discovery is unreliable ────────────
         ctx = market_ctx or {}
-        if ctx.get("vol_ratio", 1.0) < 0.5:
+        vol_ratio = ctx.get("vol_ratio", 1.0)
+        log.debug(f"ENSEMBLE DEBUG: vol_ratio={vol_ratio} adx={ctx.get('adx', 25.0)}")
+        if vol_ratio < 0.25:
+            log.debug(f"ENSEMBLE DEBUG: LOW VOLUME BLOCK triggered (vol_ratio={vol_ratio})")
             return EnsembleResult("HOLD", 0.0, 0.0, 0.0, 0.0, 0, len(signals), signals, "low_volume_block")
 
         # ── Confidence decay for low-quality market conditions ───────────────
         decay = 1.0
-        if ctx.get("vol_ratio", 1.0) < 0.7:           # low-but-not-empty volume band
+        if vol_ratio < 0.7:           # low-but-not-empty volume band
             decay *= 0.75
         if abs(buy_score - sell_score) < 0.05:         # conflicting agents
             decay *= 0.80
@@ -186,11 +195,12 @@ class EnsembleEngine:
         net        *= decay
         buy_score  *= decay
         sell_score *= decay
+        log.debug(f"ENSEMBLE DEBUG: decay={decay} net_after_decay={net:.4f}")
 
         # ── Dynamic threshold ────────────────────────────────────────────────────
         base_threshold = getattr(profile, 'net_score_threshold', 0.25) * threshold_mult
         direction_conviction = abs(buy_score - sell_score)
-        threshold = max(0.20, base_threshold * (1.0 - direction_conviction * 0.25))
+        threshold = max(0.03, base_threshold * (1.0 - direction_conviction * 0.25))
         if net > threshold:
             action = "BUY"
         elif net < -threshold:
@@ -200,11 +210,13 @@ class EnsembleEngine:
 
         # Agent agreement
         agreement = sum(1 for s in signals if s.net_score * net > 0)
+        log.debug(f"ENSEMBLE DEBUG: agreement={agreement}/{len(signals)} threshold={threshold:.4f} net={net:.4f}")
 
         # ── Variance-weighted confidence: penalise agent disagreement ──────────
         agent_weights_list = [weights.get(s.agent, 0.30) for s in signals]
         total_w_conf = sum(agent_weights_list) + 1e-9
         weighted_conf = sum(s.confidence * w for s, w in zip(signals, agent_weights_list)) / total_w_conf
+        log.debug(f"ENSEMBLE DEBUG: agent_confidences={[s.confidence for s in signals]} weighted_conf={weighted_conf:.4f}")
 
         net_scores = [s.net_score for s in signals]
         net_var = float(np.var(net_scores)) if len(net_scores) > 1 else 0.0
@@ -213,6 +225,7 @@ class EnsembleEngine:
         alignment = max(0.3, agreement / max(len(signals), 1))
 
         confidence = min(0.95, max(0.35, weighted_conf * consensus_factor * alignment))
+        log.debug(f"ENSEMBLE DEBUG: net_var={net_var:.4f} consensus={consensus_factor:.4f} alignment={alignment:.4f} confidence={confidence:.4f}")
 
         return EnsembleResult(
             action=action,

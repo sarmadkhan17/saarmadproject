@@ -372,6 +372,7 @@ class RandomForestStrategy:
         joblib.dump(self.feature_cols, self.feat_path)
         with open(self.meta_path, "w") as f:
             json.dump(self.metadata, f, indent=2)
+        self._log_feature_importance("RF")
         log.info(f"RF trained! Test={new_acc:.2%} WF={wf_acc:.2%}")
         return self.metadata
 
@@ -396,6 +397,22 @@ class RandomForestStrategy:
         except Exception as e:
             log.warning(f"RF predict error: {e}")
             return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
+
+    def _log_feature_importance(self, model_name: str, top_n: int = 15):
+        """Log top-N feature importances after training."""
+        if not self.is_trained or self.feature_cols is None:
+            return
+        try:
+            importances = self.model.feature_importances_
+            indices = np.argsort(importances)[::-1][:top_n]
+            total = importances.sum()
+            parts = []
+            for i, idx in enumerate(indices):
+                pct = importances[idx] / total * 100
+                parts.append(f"{self.feature_cols[idx]}={pct:.1f}%")
+            log.info(f"{model_name} Top-{top_n} features: {' | '.join(parts)}")
+        except Exception as e:
+            log.debug(f"Feature importance logging failed: {e}")
 
     def predict_numpy(self, X: "np.ndarray"):
         """Predict from pre-scaled numpy array (1 row × N features). No make_features() involved."""
@@ -535,6 +552,7 @@ class LightGBMStrategy:
         joblib.dump(self.feature_cols, self.feat_path)
         with open(self.meta_path, "w") as f:
             json.dump(self.metadata, f, indent=2)
+        self._log_feature_importance("LGBM")
         log.info(f"LightGBM trained! Test={new_acc:.2%} WF={wf_acc:.2%}")
         return self.metadata
 
@@ -559,6 +577,22 @@ class LightGBMStrategy:
         except Exception as e:
             log.warning(f"LightGBM predict error: {e}")
             return {"action": "HOLD", "confidence": 0.30, "probs": [0.33, 0.34, 0.33]}
+
+    def _log_feature_importance(self, model_name: str, top_n: int = 15):
+        """Log top-N feature importances after training."""
+        if not self.is_trained or self.feature_cols is None:
+            return
+        try:
+            importances = self.model.feature_importances_
+            indices = np.argsort(importances)[::-1][:top_n]
+            total = importances.sum()
+            parts = []
+            for i, idx in enumerate(indices):
+                pct = importances[idx] / total * 100
+                parts.append(f"{self.feature_cols[idx]}={pct:.1f}%")
+            log.info(f"{model_name} Top-{top_n} features: {' | '.join(parts)}")
+        except Exception as e:
+            log.debug(f"Feature importance logging failed: {e}")
 
     def predict_numpy(self, X: "np.ndarray"):
         """Predict from pre-scaled numpy array (1 row × N features). No make_features() involved."""

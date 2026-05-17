@@ -34,7 +34,8 @@ REGIME_ADJUSTMENTS: Dict[str, Dict] = {
     "RANGING":   {"min_conf_delta": -0.10, "size_mult": 0.70},
     "TRENDING":  {"min_conf_delta": -0.05, "size_mult": 1.15},
     "HIGH_VOL":  {"min_conf_delta":  0.03, "size_mult": 0.60},
-    "CRASH":     {"min_conf_delta":  0.08, "size_mult": 0.40},
+    # TEMP: lowered CRASH min_conf_delta from 0.08 to 0.02 for testing
+    "CRASH":     {"min_conf_delta":  0.02, "size_mult": 0.40},
 }
 
 _PROFILE_MODIFIERS = {

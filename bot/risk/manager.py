@@ -129,10 +129,11 @@ class MarketRegimeGate:
 
         if chg_4h < -0.05 or chg_24h < -0.10:
             # gate=True: allow short entries; allow_longs=False blocks the other side
+            # TEMP: lowered min_conf from 0.65 to 0.40 for testing
             return dict(regime="CRASH", gate=True,
                         allow_longs=False, allow_shorts=True,
                         trend_direction="BEARISH", trend_strength="STRONG",
-                        min_conf=0.65, size_mult=0.4,
+                        min_conf=0.40, size_mult=0.4,
                         breadth=breadth, bear_breadth=bear_breadth,
                         vol_ratio=vol_ratio, adx=adx_val)
 
@@ -439,14 +440,15 @@ class ExitEngine:
         """Return non-empty reason when pre-TP1 trade should be cut fast."""
         if candle_df is None or len(candle_df) < 5:
             return ""
-        # Only invalidate when clearly losing (more than 1.0R underwater).
-        # 0.3R was inside typical entry slippage on low-ATR symbols and tripped
+        # Only invalidate when clearly losing (more than 1.5R underwater).
+        # 1.0R was inside typical entry slippage on low-ATR symbols and tripped
         # on every short before any real adverse move developed.
-        if gain > -1.0 * entry_atr:
+        if gain > -1.5 * entry_atr:
             return ""
 
-        # Volume collapse: last completed bar volume < 35% of 20-bar avg
+        # Volume collapse: last completed bar volume < 20% of 20-bar avg
         # Use iloc[-2] — iloc[-1] is the forming (incomplete) candle with near-zero volume
+        # Also require avg volume > 100 to avoid false signals on illiquid pairs
         try:
             vol = candle_df["volume"]
             if len(vol) >= 22:
@@ -455,12 +457,12 @@ class ExitEngine:
                 n = min(len(vol) - 2, 20)
                 avg = float(vol.iloc[-n-1:-1].mean()) if n > 0 else 0.0
             cur = float(vol.iloc[-2])
-            if avg > 0 and cur < 0.35 * avg:
-                return f"volume_collapse ({cur:.0f} < 35% avg {avg:.0f})"
+            if avg > 100 and cur < 0.20 * avg:
+                return f"volume_collapse ({cur:.0f} < 20% avg {avg:.0f})"
         except Exception:
             pass
 
-        # Momentum reversal: 3 consecutive closed candles moving against trade,
+        # Momentum reversal: 4 consecutive closed candles moving against trade,
         # but only candles that closed AFTER entry. The previous version used
         # iloc[-4:-1] unconditionally, so a short opened on the top of a 3-bar
         # bounce was invalidated on the very next scan by the pre-entry rally.
@@ -478,14 +480,17 @@ class ExitEngine:
                 # No entry_time recorded (legacy state) or no datetime index —
                 # fall back to original window so behaviour matches pre-fix.
                 c_post = c.iloc[:-1]
-            if len(c_post) >= 3:
-                c1 = float(c_post.iloc[-3])
-                c2 = float(c_post.iloc[-2])
-                c3 = float(c_post.iloc[-1])
-                if is_short and c1 < c2 < c3:
-                    return "momentum_reversal (3 rising closes vs short)"
-                if not is_short and c1 > c2 > c3:
-                    return "momentum_reversal (3 falling closes vs long)"
+            if len(c_post) >= 4:
+                c1 = float(c_post.iloc[-4])
+                c2 = float(c_post.iloc[-3])
+                c3 = float(c_post.iloc[-2])
+                c4 = float(c_post.iloc[-1])
+                # Require minimum 0.5R move to avoid noise triggers
+                min_move = 0.5 * entry_atr
+                if is_short and c1 < c2 < c3 < c4 and (c4 - c1) > min_move:
+                    return "momentum_reversal (4 rising closes vs short)"
+                if not is_short and c1 > c2 > c3 > c4 and (c1 - c4) > min_move:
+                    return "momentum_reversal (4 falling closes vs long)"
         except Exception:
             pass
 
@@ -558,9 +563,9 @@ class KellyCriterionSizer:
     KELLY_FRAC_MAX     = 0.25
     KELLY_FRAC_DEFAULT = 0.15
 
-    MIN_PCT  = 0.008   # 0.8% floor — ~$30 minimum on $3800 account
-    BASE_PCT = {"spot": 0.018, "futures": 0.012}
-    MAX_PCT  = {"spot": 0.050, "futures": 0.035}
+    MIN_PCT  = 0.015   # 1.5% floor — ~$260 minimum on $3400 account (5x leveraged)
+    BASE_PCT = {"spot": 0.018, "futures": 0.025}
+    MAX_PCT  = {"spot": 0.050, "futures": 0.060}
 
     def __init__(self, config=None):
         cfg = config or {}
@@ -590,7 +595,7 @@ class KellyCriterionSizer:
         usdt   = balance * pos_pct * self.leverage
         amount = usdt / price
 
-        log.debug(
+        log.info(
             f"Sizer [{mode}]: base={dynamic_rp*100:.3f}% "
             f"Q={q_scalar:.2f} R={r_scalar:.2f} V={v_scalar:.2f} C={c_scalar:.2f} "
             f"→ {pos_pct*100:.3f}% × {self.leverage}x = ${usdt:.2f} "
@@ -603,14 +608,14 @@ class KellyCriterionSizer:
         base = self.BASE_PCT.get(BOT_MODE, 0.008)
         closed = [t for t in recent_trades if t.get("status") == "closed"]
 
-        # Losing streak: ≥3 of last 5 closed trades losing → 65% of base
+        # Losing streak: ≥4 of last 5 closed trades losing → 80% of base
         recent_5 = closed[-5:]
-        streak_on = len(recent_5) >= 3 and sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 3
+        streak_on = len(recent_5) >= 3 and sum(1 for t in recent_5 if t.get("pnl", 0) <= 0) >= 4
         if streak_on:
             if not self._streak_active:
-                log.warning("Losing streak — dynamic risk reduced to 65% of base")
+                log.warning("Losing streak — dynamic risk reduced to 80% of base")
                 self._streak_active = True
-            return round(base * 0.65, 6)
+            return round(base * 0.80, 6)
         if self._streak_active:
             log.info("Losing streak cleared — risk normalizing")
             self._streak_active = False
@@ -619,9 +624,9 @@ class KellyCriterionSizer:
         if len(closed) >= 5 and balance > 0:
             rolling_pnl = sum(t.get("pnl", 0) for t in closed[-10:])
             ratio = rolling_pnl / (balance + 1e-9)
-            if ratio < -0.04:   return round(base * 0.60, 6)   # heavy drawdown
-            if ratio < -0.02:   return round(base * 0.75, 6)   # moderate drawdown
-            if ratio >  0.03:   return round(base * 1.05, 6)   # stable profitability
+            if ratio < -0.06:   return round(base * 0.70, 6)   # heavy drawdown
+            if ratio < -0.03:   return round(base * 0.85, 6)   # moderate drawdown
+            if ratio >  0.02:   return round(base * 1.05, 6)   # stable profitability
 
         return base
 

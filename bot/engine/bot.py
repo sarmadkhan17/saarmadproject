@@ -527,7 +527,7 @@ class BaseBot:
         train_tfs    = training_cfg.get("timeframes", ["1h", "4h", "1d"])
 
         # Build pipeline dataset (for stats + caching only — not used for training features)
-        symbols = training_cfg.get("symbols", [])  # anchor coins only — no scanner injection
+        symbols = training_cfg.get("symbols")  # anchor coins only — no scanner injection
 
         dataset_stats = build_training_dataset(
             self.training_feed, self.config, symbols=symbols,
@@ -678,6 +678,11 @@ class BaseBot:
             model_dir = DATA_DIR / self.MODE
             if (model_dir / "rf_model.pkl").exists() and (model_dir / "lgbm_model.pkl").exists():
                 self.log.info(f"Quick retrain SKIPPED — models already exist for {self.MODE}")
+                # Reload models from disk into memory
+                self.ai.rf._load()
+                self.ai.lgbm._load()
+                self.ml_agent._scaler = None  # force reload of feature metadata
+                self.log.info(f"AI models reloaded: RF={self.ai.rf.is_trained} LGBM={self.ai.lgbm.is_trained}")
                 self._write_training_status("completed", source="startup", duration_seconds=0,
                                             note="models already exist, skipped")
                 return
@@ -774,12 +779,16 @@ class BaseBot:
             self._check_model_health(results)
             self.agents.invalidate_cache()
             self.ml_agent._scaler = None  # force reload of fresh feature metadata next cycle
+            # Reload AI models from disk (they were just saved by train_all)
+            self.ai.rf._load()
+            self.ai.lgbm._load()
+            self.log.info(f"AI models reloaded: RF={self.ai.rf.is_trained} LGBM={self.ai.lgbm.is_trained}")
 
             try:
                 btc_df = fetched.get("BTC/USDT") or self.training_feed.fetch_training_data(
-                    ["BTC/USDT"], timeframe="1h", limit=1000, min_bars=100
+                    ["BTC/USDT"], timeframe="1h", limit=0, min_bars=2000
                 ).get("BTC/USDT")
-                if btc_df is not None and len(btc_df) >= 200:
+                if btc_df is not None and len(btc_df) >= self.hmm_regime.MIN_BARS:
                     hmm_result = self.hmm_regime.train(btc_df)
                     self.log.info(f"HMM regime trained: {hmm_result}")
                 else:
@@ -1381,36 +1390,43 @@ class BaseBot:
         """
         import time as _time
         our_syms = {t["symbol"] for t in d.get("trades", []) if t.get("status") == "open"}
+        self.log.info(f"Sync import check: {len(positions)} positions, {len(our_syms)} tracked: {our_syms}")
         for pos in positions:
-            sym = pos["symbol"]
-            if sym in our_syms or float(pos.get("amount", 0)) == 0:
-                continue
-            notional = float(pos.get("amount", 0)) * float(pos.get("entry_price", 0))
-            if notional < 5.0:
-                self.log.debug(f"Sync: skipping dust {sym} notional=${notional:.4f}")
-                continue
-            trade = {
-                "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
-                "symbol":          sym,
-                "side":            pos["side"],
-                "amount":          pos["amount"],
-                "price":           pos["entry_price"],
-                "mark_price":      pos.get("mark_price", 0),
-                "live_pnl":        round(pos["pnl"], 6),
-                "timestamp":       datetime.now(timezone.utc).isoformat(),
-                "strategy":        "synced_from_position",
-                "timeframe":       f"AUTO-{self.MODE}",
-                "status":          "open",
-                "mode":            self.MODE,
-                "leverage":        pos.get("leverage", 5),
-                "sl_order_id":     "",
-                "pnl":             0.0,
-                "close_price":     0.0,
-                "close_timestamp": ""
-            }
-            d["trades"].append(trade)
-            d["stats"]["total_trades"] += 1
-            self.log.info(f"Sync: imported {sym} {pos['side']} from exchange")
+            try:
+                sym = pos["symbol"]
+                amt = float(pos.get("amount", 0))
+                self.log.info(f"Sync import: checking {sym} amt={amt}")
+                if sym in our_syms or amt == 0:
+                    self.log.info(f"Sync: skipping {sym} (tracked={sym in our_syms} amt={amt})")
+                    continue
+                notional = amt * float(pos.get("entry_price", 0))
+                if notional < 5.0:
+                    self.log.info(f"Sync: skipping dust {sym} notional=${notional:.4f}")
+                    continue
+                trade = {
+                    "id":              f"sync_pos_{sym.replace('/','_')}_{int(_time.time())}",
+                    "symbol":          sym,
+                    "side":            pos["side"],
+                    "amount":          pos["amount"],
+                    "price":           pos["entry_price"],
+                    "mark_price":      pos.get("mark_price", 0),
+                    "live_pnl":        round(pos["pnl"], 6),
+                    "timestamp":       datetime.now(timezone.utc).isoformat(),
+                    "strategy":        "synced_from_position",
+                    "timeframe":       f"AUTO-{self.MODE}",
+                    "status":          "open",
+                    "mode":            self.MODE,
+                    "leverage":        pos.get("leverage", 5),
+                    "sl_order_id":     "",
+                    "pnl":             0.0,
+                    "close_price":     0.0,
+                    "close_timestamp": ""
+                }
+                d["trades"].append(trade)
+                d["stats"]["total_trades"] += 1
+                self.log.info(f"Sync: imported {sym} {pos['side']} from exchange (notional=${notional:.2f})")
+            except Exception as e:
+                self.log.warning(f"Sync import error for position: {e}")
 
     def _cleanup_ghost_trades(self, exchange_syms: set, d: dict) -> None:
         """Cancel trades that are open in state but missing from the exchange for >60s.
@@ -1532,11 +1548,12 @@ class BaseBot:
                 if position_fetch_ok:
                     self._cleanup_ghost_trades(exchange_syms, d)
 
-            self.state.state["stats"]["balance"]      = round(usdt, 2)
-            self.state.state["stats"]["last_sync"]     = datetime.now(timezone.utc).isoformat()
-            self.state.state["stats"]["total_live_pnl"] = round(
-                sum(t.get("live_pnl", 0.0) for t in d.get("trades", []) if t.get("status") == "open"), 4
-            )
+                # Update stats inside the lock to avoid race condition with periodic flush
+                d["stats"]["balance"]      = round(usdt, 2)
+                d["stats"]["last_sync"]     = datetime.now(timezone.utc).isoformat()
+                d["stats"]["total_live_pnl"] = round(
+                    sum(t.get("live_pnl", 0.0) for t in d.get("trades", []) if t.get("status") == "open"), 4
+                )
             self.log.info(f"Sync saving balance=${usdt:.2f}")
         except Exception as e:
             self.log.warning(f"Sync error: {e}")
@@ -1704,6 +1721,8 @@ class BaseBot:
         return hash(tuple(sorted(coins)))
 
     def _retrain_if_watchlist_changed(self, new_coins):
+        """Log watchlist changes but do NOT retrain — models learn general patterns
+        from a fixed anchor-coin dataset (config training.symbols), not the live watchlist."""
         new_hash = self._get_watchlist_hash(new_coins)
         if hasattr(self, '_last_watchlist_hash') and self._last_watchlist_hash == new_hash:
             return
@@ -1717,15 +1736,10 @@ class BaseBot:
                     self.notifier.send(
                         f"ℹ️ <b>Watchlist changed [{self.MODE.upper()}]</b> — {change_count} coins\n"
                         f"Added: {added or 'none'}\n"
-                        f"Removed: {removed or 'none'}\n"
-                        f"Retraining models on new coin set…"
+                        f"Removed: {removed or 'none'}"
                     )
                 except Exception:
                     pass
-                try:
-                    self._with_training_heartbeat(lambda: self._train(quick=True, force=True), source="watchlist")
-                except Exception as e:
-                    self.log.error(f"Watchlist retrain error: {e}", exc_info=True)
         self._last_watchlist_hash = new_hash
         self._last_watchlist      = list(new_coins)
 
