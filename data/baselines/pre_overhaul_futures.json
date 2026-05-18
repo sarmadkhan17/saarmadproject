@@ -1,0 +1,16 @@
+{
+  "captured_at": "2026-05-18T23:29:48.132734+00:00",
+  "source_state": "data/futures_state.json",
+  "closed_count": 196,
+  "wins": 57,
+  "losses": 139,
+  "win_rate": 0.29081632653061223,
+  "net_pnl": -41.24524633,
+  "avg_duration_hours": 1.4349489795918366,
+  "side_mix": {
+    "short": 175,
+    "long": 21
+  },
+  "stats_balance": 3419.79,
+  "stats_total_pnl": -200.32799844660425
+}
