@@ -25,3 +25,7 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 2
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
