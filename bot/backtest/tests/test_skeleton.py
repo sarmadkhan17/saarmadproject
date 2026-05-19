@@ -35,7 +35,8 @@ def test_pipeline_eval_cli_help():
     assert result.returncode == 0
 
 
-def test_pipeline_eval_unimplemented_returns_nonzero_with_clear_message():
+def test_pipeline_eval_run_without_components_exits_nonzero():
+    # Phase 2: harness is implemented; --run fails only because
+    # components.trend_filter (Task 6) is not yet present.
     result = _run("bot.backtest.pipeline_eval", "--run")
     assert result.returncode != 0
-    assert "not implemented" in result.stderr.lower() or "not implemented" in result.stdout.lower()
