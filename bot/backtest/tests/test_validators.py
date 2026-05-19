@@ -39,8 +39,10 @@ def test_monotonic_decline_vetoes_longs_passes():
     assert result["passed"] is True
 
 def test_monotonic_decline_vetoes_longs_fails_when_long_slips_in():
-    records = [_rec("BTCUSDT", f"2026-04-01T{h:02d}:00:00+00:00", False) for h in range(24)]
-    # Inject one offending long_allowed=True
+    # 24h decline window with slow=down + strong; inject one stray long_allowed.
+    records = [_rec("BTCUSDT", f"2026-04-01T{h:02d}:00:00+00:00", False,
+                    fast="down", slow="down", strong=True) for h in range(24)]
     records[10]["long_allowed"] = True
     result = monotonic_decline_vetoes_longs(records)
     assert result["passed"] is False
+    assert result["details"]["offending"][0]["symbol"] == "BTCUSDT"

@@ -60,20 +60,44 @@ def rally_window_admits_longs(records: list, min_long_admits: int = 4) -> dict:
 def monotonic_decline_vetoes_longs(records: list) -> dict:
     """Spec §4.3.2: on a monotonic-decline window, longs must remain vetoed.
 
-    Implementation: assert that no record in the replay set has
-    long_allowed=True. Any long admission is considered a veto failure.
-    Offending records are capped at 5 in the details output.
+    Implementation: for each symbol's records, find any 24h window where
+    slow_direction='down' for every record AND slow_strong=True for every
+    record. In such a window, every long_allowed must be False. Spans
+    smaller than 4 records are ignored to avoid false alarms on tiny
+    replay datasets.
     """
-    offending: list = []
+    by_sym: dict = defaultdict(list)
     for r in records:
-        if r["long_allowed"]:
-            offending.append({"symbol": r["symbol"], "ts": r["ts"],
-                               "long_allowed": True})
-            if len(offending) >= 5:
+        by_sym[r["symbol"]].append(r)
+    offending: list = []
+    for sym, rows in by_sym.items():
+        rows.sort(key=lambda r: r["ts"])
+        ts_arr   = [_parse(r["ts"]) for r in rows]
+        window = timedelta(hours=24)
+        left = 0
+        run_down = 0
+        run_long = 0
+        for right in range(len(rows)):
+            r = rows[right]
+            if r["slow_direction"] == "down" and r["slow_strong"]:
+                run_down += 1
+            if r["long_allowed"]:
+                run_long += 1
+            while ts_arr[right] - ts_arr[left] > window:
+                lr = rows[left]
+                if lr["slow_direction"] == "down" and lr["slow_strong"]:
+                    run_down -= 1
+                if lr["long_allowed"]:
+                    run_long -= 1
+                left += 1
+            span = right - left + 1
+            if span >= 4 and run_down == span and run_long > 0:
+                offending.append({"symbol": sym, "ts": r["ts"],
+                                  "long_admits_in_window": run_long})
                 break
     passed = len(offending) == 0
     return {
         "name": "monotonic_decline_vetoes_longs",
         "passed": passed,
-        "details": {"offending": offending},
+        "details": {"offending": offending[:5]},
     }
