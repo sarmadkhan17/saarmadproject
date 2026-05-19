@@ -84,8 +84,18 @@ def test_buy_in_bullish_trend_not_damped():
     assert bullish.net_score == pytest.approx(neutral.net_score, abs=0.001)
 
 
-def test_30pct_reduction_magnitude():
-    """Verify the reduction factor is exactly 0.70 (30% reduction)."""
+def test_counter_trend_signal_strongly_damped():
+    """
+    Counter-trend signals are damped by multiple mechanisms that have
+    compounded over time:
+      - 9a0f9a5f: directional bias damp (×0.70) on counter-trend net
+      - 349f7182: hard trend override (×0.05) on counter-trend net
+      - conflicting-agents decay (×0.80) triggers downstream when the override
+        makes buy/sell asymmetry small
+    Combined, the bearish-vs-neutral ratio collapses to single-digit percent.
+    This test pins the qualitative invariant (heavy damping) rather than the
+    exact multiplier so it survives future tuning of any single mechanism.
+    """
     engine = _engine()
     signals = [_signal("smc", 0.50), _signal("technical", 0.50)]
     bearish = engine._aggregate(signals, MagicMock(net_score_threshold=0.01),
@@ -96,4 +106,6 @@ def test_30pct_reduction_magnitude():
                                 regime="RANGING")
     if neutral.net_score > 0:
         ratio = bearish.net_score / neutral.net_score
-        assert abs(ratio - 0.70) < 0.05, f"Expected ~0.70 reduction, got ratio={ratio:.3f}"
+        assert ratio < 0.10, (
+            f"Counter-trend ratio must be <0.10 (heavy damping), got ratio={ratio:.3f}"
+        )

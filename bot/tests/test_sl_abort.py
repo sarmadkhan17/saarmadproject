@@ -35,9 +35,10 @@ def _make_decision(amount=242.0, est_usdt=204.0, conf=0.65):
 def test_futures_entry_aborted_when_sl_fails():
     """
     When _place_sl returns '' (SL rejected), _execute_entry_locked must:
-    - NOT persist the trade (state.add_trade never called)
+    - Persist the trade with strategy tag ending in '_sl_abort' (audit trail
+      so the failed entry is visible in state and won't be silently lost)
     - Place an emergency market-close order
-    - Return None
+    - Return the 'SL_FAILED' sentinel
     """
     engine = _make_engine('futures')
     decision = _make_decision()
@@ -57,7 +58,11 @@ def test_futures_entry_aborted_when_sl_fails():
         )
 
     assert result == "SL_FAILED", "_execute_entry_locked must return 'SL_FAILED' sentinel when SL fails"
-    engine.state.add_trade.assert_not_called()
+    # Aborted entry is persisted with _sl_abort tag for audit (commit ff899e2a).
+    engine.state.add_trade.assert_called_once()
+    persisted = engine.state.add_trade.call_args[0][0]
+    assert persisted.strategy.endswith("_sl_abort"), \
+        f"persisted trade.strategy must carry _sl_abort tag, got {persisted.strategy!r}"
     # An emergency closing sell must have been issued
     engine.exchange.create_market_order.assert_called_once()
     call_args = engine.exchange.create_market_order.call_args[0]

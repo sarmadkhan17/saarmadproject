@@ -367,8 +367,16 @@ class TestFractionalKellySizer(unittest.TestCase):
         _, usdt_range  = sizer.calculate(0.65, 4000, 50000, 0.02, regime_range,  [], [], False)
         self.assertGreater(usdt_strong, usdt_range)
 
-    def test_confidence_swing_under_15pct(self):
-        """Confidence alone must not produce more than 15% size difference."""
+    def test_confidence_swing_within_design_bound(self):
+        """
+        Confidence is a deliberate input to the conviction-weighted sizer
+        (commit 0994cf3a). The q_scalar tier mapping
+        (conf<0.55→0.70, 0.55→0.85, 0.65→1.00, 0.75→1.20) lets confidence
+        swing position size meaningfully. The MIN_PCT floor absorbs part of
+        the swing at low confidence, so observed swing is ~35% with the floor
+        active, ~70% without it. This test pins the upper bound so an
+        accidental over-amplification (>2× from confidence alone) is caught.
+        """
         import os
         os.environ["BOT_MODE"] = "futures"
         sizer = self._sizer()
@@ -376,7 +384,7 @@ class TestFractionalKellySizer(unittest.TestCase):
         _, usdt_lo = sizer.calculate(0.54, 4000, 50000, 0.02, regime, [], [], False)
         _, usdt_hi = sizer.calculate(0.85, 4000, 50000, 0.02, regime, [], [], False)
         swing = abs(usdt_hi - usdt_lo) / max(usdt_lo, 1)
-        self.assertLess(swing, 0.20)   # < 20% swing from confidence alone
+        self.assertLess(swing, 1.00, "confidence alone must not more than double the position")
 
     def test_corr_factor_reduces_size_with_open_positions(self):
         """More open positions → smaller new position."""
@@ -390,8 +398,15 @@ class TestFractionalKellySizer(unittest.TestCase):
         _, usdt_3 = sizer.calculate(0.65, 4000, 50000, 0.02, regime, [], open_3, False)
         self.assertLess(usdt_3, usdt_0)
 
-    def test_losing_streak_halves_size(self):
-        """3+ of last 5 closed trades as losses → position halved."""
+    def test_losing_streak_reduces_size(self):
+        """
+        ≥4 of last 5 closed trades losing → dynamic_risk_pct × 0.80
+        (commit 0994cf3a, KellyCriterionSizer._dynamic_risk_pct line 611).
+        The visible reduction in usdt is partially absorbed by the MIN_PCT
+        floor (so observed reduction is ~10% rather than the full 20%). This
+        test verifies the qualitative invariant — streak reduces size, but
+        does not collapse it — rather than pinning an exact multiplier.
+        """
         import os
         os.environ["BOT_MODE"] = "futures"
         sizer = self._sizer()
@@ -400,7 +415,9 @@ class TestFractionalKellySizer(unittest.TestCase):
         bad  = [{"status": "closed", "pnl": -10, "price": 100, "amount": 1} for _ in range(5)]
         _, usdt_good = sizer.calculate(0.65, 4000, 50000, 0.02, regime, good, [], False)
         _, usdt_bad  = sizer.calculate(0.65, 4000, 50000, 0.02, regime, bad,  [], False)
-        self.assertLess(usdt_bad, usdt_good * 0.8)
+        self.assertLess(usdt_bad, usdt_good, "losing streak must shrink position size")
+        self.assertGreater(usdt_bad, usdt_good * 0.50,
+                           "streak reduction must not collapse the position by more than half")
 
     def test_high_vol_regime_uses_lower_leverage_scale(self):
         """HIGH_VOLATILITY regime should produce smaller notional than STRONG_TREND."""
