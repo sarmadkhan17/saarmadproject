@@ -24,6 +24,7 @@ except ImportError:
     log.warning("hmmlearn not installed — HMM regime disabled")
 
 from core.config import DATA_DIR
+from data.freshness import Freshness
 
 DATA = DATA_DIR
 
@@ -76,7 +77,6 @@ class HMMRegimeModel:
 
     N_STATES  = 4
     MIN_BARS  = 200
-    _CACHE_TTL = 300  # seconds before re-inferring state
 
     def __init__(self):
         self.model_path = DATA / "hmm_regime.pkl"
@@ -86,7 +86,7 @@ class HMMRegimeModel:
         self.is_trained                   = False
         self.metadata: Dict               = {}
         self._last_regime: str            = "RANGING"
-        self._last_infer_time: float      = 0.0
+        self._fresh: Freshness            = Freshness()
         self._regime_history: deque       = deque(maxlen=3)  # Step 5: smoothing
         self._load()
 
@@ -200,17 +200,14 @@ class HMMRegimeModel:
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def predict(self, df) -> str:
+    def _run_inference(self, df) -> str:
         """
-        Return current regime name. Caches result for _CACHE_TTL seconds.
-        Falls back to 'RANGING' on any error.
+        Run HMM decoding on df and return regime label string.
+        Does NOT touch caching state — Freshness handles that in predict().
+        Falls back to self._last_regime on any error.
         """
         if not self.is_trained or not _HMM_AVAILABLE:
             return "RANGING"
-        import time
-        now = time.time()
-        if now - self._last_infer_time < self._CACHE_TTL:
-            return self._last_regime
         try:
             X = _extract_features(df)
             if X is None:
@@ -232,11 +229,23 @@ class HMMRegimeModel:
                     f"→ holding {self._last_regime}"
                 )
 
-            self._last_infer_time = now
             return self._last_regime
         except Exception as e:
             log.warning(f"HMM predict error: {e}")
             return self._last_regime
+
+    def predict(self, df, max_age_seconds: float = 60.0) -> str:
+        """
+        Return current regime name. Uses Freshness contract — callers declare
+        their max_age_seconds; default 60 s (was 300 s hardcoded).
+        Falls back to 'RANGING' when untrained (_run_inference handles that).
+        """
+        cached = self._fresh.get("regime", max_age_seconds)
+        if cached is not None:
+            return cached
+        regime = self._run_inference(df)
+        self._fresh.set("regime", regime)
+        return regime
 
     # ── Adjustment API ────────────────────────────────────────────────────────
 
