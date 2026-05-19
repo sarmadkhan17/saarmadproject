@@ -68,9 +68,23 @@ training:
   use_dataset_pipeline: true
   use_real_api: true
 trend_filter:
+  enabled: true
+  use_two_tier: false       # P3 flag; flip in a separate commit after replay
+  # legacy single-tier (unchanged; used when use_two_tier=false)
+  tf: 1h
   ema_fast: 50
   ema_slow: 200
-  enabled: true
-  tf: 1h
   veto_longs: true
   veto_shorts: true
+  # two-tier (used when use_two_tier=true)
+  fast:
+    tf: 15m
+    ema_fast: 20
+    ema_slow: 50
+    slope_lookback: 10
+  slow:
+    tf: 1h
+    ema_fast: 50
+    ema_slow: 200
+    slope_lookback: 20
+  strong_slope_pct: 0.002   # 0.2 %/bar = "strongly opposed"
