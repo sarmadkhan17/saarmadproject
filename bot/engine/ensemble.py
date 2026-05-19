@@ -55,7 +55,9 @@ class EnsembleEngine:
 
     def run(self, symbol: str, dfs: dict, profile,
             market_ctx: dict = None) -> EnsembleResult:
-        df = dfs.get("1h") if isinstance(dfs, dict) else dfs  # back-compat shim
+        if not isinstance(dfs, dict):
+            dfs = {"1h": dfs}  # back-compat: caller passed a bare DataFrame
+        df = dfs.get("1h")
         agents = {"smc": self.smc, "technical": self.tech}
         if self.macro is not None:
             agents["macro_flow"] = self.macro
@@ -97,8 +99,9 @@ class EnsembleEngine:
             result.agents_ok = False
 
         # ── Higher-TF trend veto ───────────────────────────────────────────
-        # Vetoes counter-trend signals using EMA(fast)/EMA(slow) on the df we
-        # already receive (the bot passes df_1h here). Convert to HOLD only —
+        # Vetoes counter-trend signals via _apply_trend_filter, which routes
+        # through TrendFilter (two-tier) or _check_trend_veto (legacy) based
+        # on the trend_filter.use_two_tier flag. Convert to HOLD only —
         # never flip direction.
         if self.trend_filter.get("enabled") and result.action in ("BUY", "SELL"):
             veto_reason = self._apply_trend_filter(result.action, dfs)
