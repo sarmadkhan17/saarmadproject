@@ -47,6 +47,11 @@ fi
 screen -dmS "$SCREEN_NAME" bash -c "cd $BOT_DIR/bot && BOT_MODE=$MODE python3 launcher.py"
 sleep 2
 
+# Start watchdog in its own screen
+WATCHDOG_NAME="watchdog_$MODE"
+pkill -f "tools.watchdog.*--mode $MODE" 2>/dev/null || true
+screen -dmS "$WATCHDOG_NAME" bash -c "cd $BOT_DIR && python3 -m tools.watchdog --mode $MODE --interval 60"
+
 echo ""
 echo "✅ Bot started in $MODE mode!"
 screen -ls | grep -E "cryptobot|dashboard"
