@@ -1951,11 +1951,14 @@ class BaseBot:
         balance     = self.get_usdt_balance()
         max_reached = len(open_trades) >= self.max_open
 
-        # Pre-fetch 1h OHLCV for all symbols once — shared between GNN and analysis
+        # Pre-fetch 1h OHLCV for all symbols once — shared between GNN and analysis.
+        # NOTE: limit=300 not 168 so the cache holds enough bars for the
+        # two-tier trend filter's slow-tier EMA(200) + lookback(20) = 221 required.
+        # GNN itself only needs the trailing 168 bars and slices internally.
         try:
             ohlcv_1h = {}
             def _fetch_1h(s):
-                df = self.feed.fetch_ohlcv(s, "1h", limit=168)
+                df = self.feed.fetch_ohlcv(s, "1h", limit=300)
                 return s, df
             with ThreadPoolExecutor(max_workers=min(10, len(symbols))) as executor:
                 for s, df in executor.map(_fetch_1h, symbols):
