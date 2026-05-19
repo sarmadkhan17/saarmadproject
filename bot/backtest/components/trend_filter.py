@@ -31,5 +31,7 @@ class TrendFilterReplayComponent:
         }
 
     def validators(self) -> List[Callable]:
-        # Wired up in Task 7.
-        return []
+        from backtest.validators import (
+            rally_window_admits_longs, monotonic_decline_vetoes_longs,
+        )
+        return [rally_window_admits_longs, monotonic_decline_vetoes_longs]
