@@ -1,0 +1,45 @@
+{
+  "captured_at": "2026-05-19T15:27:39.981491+00:00",
+  "components": [
+    "trend_filter"
+  ],
+  "coverage": {
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "BNBUSDT",
+      "XRPUSDT",
+      "SOLUSDT",
+      "DOGEUSDT",
+      "ADAUSDT",
+      "LINKUSDT"
+    ],
+    "start": "2023-05-18T23:00:00+00:00",
+    "end": "2026-05-19T15:00:00+00:00",
+    "cadence": "1h",
+    "n_evaluations": 210480
+  },
+  "summary": {
+    "trend_filter": {
+      "count": 210480
+    }
+  },
+  "validators": {
+    "rally_window_admits_longs": {
+      "name": "rally_window_admits_longs",
+      "passed": true,
+      "details": {
+        "max_admits_in_24h_window": 194,
+        "window_start": "2025-05-08T02:00:00+00:00",
+        "min_required": 4
+      }
+    },
+    "monotonic_decline_vetoes_longs": {
+      "name": "monotonic_decline_vetoes_longs",
+      "passed": true,
+      "details": {
+        "offending": []
+      }
+    }
+  }
+}
