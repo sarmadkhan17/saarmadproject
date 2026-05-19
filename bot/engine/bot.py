@@ -1170,7 +1170,6 @@ class BaseBot:
 
             df_tf = dfs[tf]
             df_1h = dfs.get("1h", df_tf)
-            self.ai.ingest_new_data(symbol, df_tf)
 
             # ── Layer 1: Ensemble (SMC + Technical + Macro/Flow) ─────────
             hmm_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
@@ -1974,14 +1973,6 @@ class BaseBot:
                 )
         except Exception as e:
             self.log.warning(f"GNN update failed: {e}")
-
-        # Online learning: retrain with decay weights when enough new bars buffered
-        try:
-            ol_result = self.ai.incremental_update()
-            if ol_result.get("status") == "updated":
-                self.log.info(f"Online learning update: {ol_result.get('results', {})}")
-        except Exception as e:
-            self.log.warning(f"Online learning update failed: {e}")
 
         # Process symbols — pre-fetch OHLCV data in parallel, then analyze sequentially
         # This avoids 4-8 sequential API fetches per symbol (the main cycle bottleneck)

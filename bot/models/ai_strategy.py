@@ -217,50 +217,6 @@ def _make_sample_weights(y_arr: np.ndarray, class_weights: dict) -> "Optional[np
     return np.vectorize(lambda c: class_weights.get(int(c), 1.0))(y_arr).astype(np.float32)
 
 
-class OnlineBuffer:
-    """
-    Rolling per-symbol OHLCV store.
-    Tracks new bars ingested; signals incremental update every UPDATE_EVERY bars.
-    """
-    MAX_BARS_PER_SYM = 500   # ~3 weeks of 1h
-    UPDATE_EVERY     = 24    # trigger incremental update after 24 new bars
-
-    def __init__(self):
-        self._store: Dict[str, pd.DataFrame] = {}
-        self._new_bar_count   = 0
-        self._last_update_count = 0
-
-    def ingest(self, symbol: str, df: pd.DataFrame):
-        if df is None or len(df) == 0:
-            return
-        if symbol not in self._store:
-            self._store[symbol] = df.tail(self.MAX_BARS_PER_SYM).copy()
-            return
-        existing = self._store[symbol]
-        new_rows = df[~df.index.isin(existing.index)]
-        if len(new_rows) > 0:
-            combined = pd.concat([existing, new_rows])
-            self._store[symbol] = combined.tail(self.MAX_BARS_PER_SYM)
-            self._new_bar_count += len(new_rows)
-
-    def should_update(self) -> bool:
-        return (self._new_bar_count - self._last_update_count) >= self.UPDATE_EVERY
-
-    def mark_updated(self):
-        self._last_update_count = self._new_bar_count
-
-    def get_combined(self) -> Optional[pd.DataFrame]:
-        if not self._store:
-            return None
-        parts = list(self._store.values())
-        combined = pd.concat(parts).sort_index().drop_duplicates()
-        return combined if len(combined) >= 300 else None
-
-    @property
-    def n_symbols(self) -> int:
-        return len(self._store)
-
-
 class RandomForestStrategy:
     def __init__(self, mode: str = None):
         data_dir = DATA_DIR / (mode or _current_bot_mode())
@@ -613,7 +569,6 @@ class AIStrategyEngine:
     def __init__(self):
         self.rf            = RandomForestStrategy()
         self.lgbm          = LightGBMStrategy()
-        self.online_buffer   = OnlineBuffer()
         self._unc_buffer: list = []   # uncertainty log write buffer (Step 7)
         self.performance_log = []
         p = DATA / "trade_results.json"
@@ -771,58 +726,6 @@ class AIStrategyEngine:
             self._unc_buffer = []
         except Exception as e:
             log.warning(f"Uncertainty log flush failed: {e}")
-
-    def ingest_new_data(self, symbol: str, df: pd.DataFrame):
-        """Feed latest OHLCV into rolling online buffer."""
-        self.online_buffer.ingest(symbol, df)
-
-    def incremental_update(self) -> dict:
-        """
-        v4: Lower gate — retrain every 30 trades unconditionally.
-        Champion/challenger already rejects worse models.
-        Only skip if catastrophically bad (<20% win rate, >20 trades).
-        """
-        if not self.online_buffer.should_update():
-            return {"status": "skipped"}
-
-        total_trades = len(self.performance_log)
-        if total_trades < 30:
-            log.debug(f"Online learning skipped: {total_trades}/30 trades")
-            return {"status": "skipped", "reason": f"only {total_trades}/30 trades"}
-        wins     = sum(1 for t in self.performance_log if t.get("pnl", 0) > 0)
-        win_rate = wins / total_trades if total_trades else 0
-        if total_trades >= 20 and win_rate < 0.20:
-            log.warning(f"Online learning blocked: catastrophic win rate {win_rate:.1%} (<20%)")
-            return {"status": "skipped", "reason": f"catastrophic win_rate {win_rate:.1%}"}
-
-        combined = self.online_buffer.get_combined()
-        if combined is None:
-            return {"status": "skipped", "reason": "insufficient data"}
-
-        self.online_buffer.mark_updated()
-        log.info(
-            f"Online learning triggered: {self.online_buffer.n_symbols} symbols, "
-            f"{len(combined)} combined bars"
-        )
-        results: Dict = {}
-
-        try:
-            results["rf"] = self.rf.train(combined, use_decay_weights=True)
-        except Exception as e:
-            results["rf"] = {"error": str(e)}
-            log.warning(f"Online RF failed: {e}")
-
-        try:
-            results["lgbm"] = self.lgbm.train(combined, use_decay_weights=True)
-        except Exception as e:
-            results["lgbm"] = {"error": str(e)}
-            log.warning(f"Online LGBM failed: {e}")
-
-        log.info(
-            f"Online update done — RF={results.get('rf',{}).get('accuracy','?')} "
-            f"LGBM={results.get('lgbm',{}).get('accuracy','?')}"
-        )
-        return {"status": "updated", "results": results}
 
     def record_trade_result(self, symbol, pnl):
         self.performance_log.append({
