@@ -35,8 +35,12 @@ def test_pipeline_eval_cli_help():
     assert result.returncode == 0
 
 
-def test_pipeline_eval_run_without_components_exits_nonzero():
-    # Phase 2: harness is implemented; --run fails only because
-    # components.trend_filter (Task 6) is not yet present.
-    result = _run("bot.backtest.pipeline_eval", "--run")
-    assert result.returncode != 0
+def test_pipeline_eval_run_gracefully_handles_no_symbols(tmp_path):
+    # Phase 2: harness is implemented; --run with nonexistent parquet dir
+    # exits cleanly with 0 since no symbols match → loop is empty → JSON
+    # written with n_evaluations=0. This avoids writing to data/baselines/.
+    out_path = tmp_path / "out.json"
+    result = _run("bot.backtest.pipeline_eval", "--run",
+                  "--parquet", "/tmp/nonexistent_cryptobot_parquet_xyz",
+                  "--out", str(out_path))
+    assert result.returncode == 0

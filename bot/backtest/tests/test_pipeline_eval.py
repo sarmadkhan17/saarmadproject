@@ -75,3 +75,26 @@ def test_run_components_calls_each_point(tmp_path):
     assert "summary" in data
     assert "validators" in data
     assert data["coverage"]["n_evaluations"] == 25
+
+
+def test_trend_filter_replay_component_records_verdicts(tmp_path):
+    from backtest.components.trend_filter import TrendFilterReplayComponent
+    import numpy as np
+    # 80 bars climbing at fast tf, 250 flat at slow tf → admits long
+    _make_parquet(tmp_path, "BTC", "15m", 80, slope=0.5)
+    _make_parquet(tmp_path, "BTC", "1h",  250, slope=0.0)
+    cfg = {
+        "fast": {"tf": "15m", "ema_fast": 20, "ema_slow": 50, "slope_lookback": 10},
+        "slow": {"tf": "1h",  "ema_fast": 50, "ema_slow": 200, "slope_lookback": 20},
+        "strong_slope_pct": 0.002,
+    }
+    c = TrendFilterReplayComponent(cfg)
+    out_path = tmp_path / "out.json"
+    summary = run_components(parquet_dir=tmp_path, symbols=["BTCUSDT"],
+                              tfs=["15m", "1h"], cadence="1h", base_tf="1h",
+                              components=[c], out_path=out_path)
+    sumc = summary["summary"]["trend_filter"]
+    assert sumc["count"] >= 1
+    # At least one record should have long_allowed=True near the end of the climb
+    data = json.loads(out_path.read_text())
+    assert data["components"] == ["trend_filter"]
