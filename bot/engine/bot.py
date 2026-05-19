@@ -1199,7 +1199,7 @@ class BaseBot:
                     self.feed.mark_invalid(symbol)  # mark_invalid() logs its own warning
 
             self._current_regime = (regime_ctx or {}).get("hmm_regime", "RANGING")
-            ensemble = self.ensemble.run(symbol, df_1h, self.profile, market_ctx=regime_ctx)
+            ensemble = self.ensemble.run(symbol, dfs, self.profile, market_ctx=regime_ctx)
 
             # Log per-agent detail at DEBUG only
             for s in ensemble.signals:

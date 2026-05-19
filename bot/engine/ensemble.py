@@ -35,7 +35,12 @@ class EnsembleEngine:
         self.macro   = macro_agent
         # trend_filter: dict from config.trend_filter — vetoes counter-trend signals
         # using a per-symbol higher-TF EMA(fast)/EMA(slow) cross check.
+        # When `use_two_tier=True`, route through bot/engine/trend_filter.TrendFilter.
         self.trend_filter = trend_filter or {}
+        self._tf2 = None
+        if self.trend_filter.get("use_two_tier"):
+            from .trend_filter import TrendFilter
+            self._tf2 = TrendFilter(self.trend_filter)
 
     def _regime_weights(self, regime: str) -> dict:
         w = dict(self.BASE_AGENT_WEIGHTS)
@@ -48,8 +53,9 @@ class EnsembleEngine:
             w.update({"macro_flow": 0.40, "technical": 0.35, "smc": 0.25})
         return w
 
-    def run(self, symbol: str, df: pd.DataFrame, profile,
+    def run(self, symbol: str, dfs: dict, profile,
             market_ctx: dict = None) -> EnsembleResult:
+        df = dfs.get("1h") if isinstance(dfs, dict) else dfs  # back-compat shim
         agents = {"smc": self.smc, "technical": self.tech}
         if self.macro is not None:
             agents["macro_flow"] = self.macro
@@ -95,12 +101,22 @@ class EnsembleEngine:
         # already receive (the bot passes df_1h here). Convert to HOLD only —
         # never flip direction.
         if self.trend_filter.get("enabled") and result.action in ("BUY", "SELL"):
-            veto_reason = self._check_trend_veto(df, result.action)
+            veto_reason = self._apply_trend_filter(result.action, dfs)
             if veto_reason:
                 log.info(f"TREND VETO {symbol} → HOLD (was {result.action}): {veto_reason}")
                 result.action = "HOLD"
                 result.source = f"trend_veto:{veto_reason}"
         return result
+
+    def _apply_trend_filter(self, action: str, dfs: dict) -> Optional[str]:
+        """Dispatch to two-tier or legacy filter. Returns veto reason string or None."""
+        if self._tf2 is not None:
+            v = self._tf2.check(dfs)
+            if action == "BUY"  and not v["long_allowed"]:  return f"2tier:{v['reasoning']}"
+            if action == "SELL" and not v["short_allowed"]: return f"2tier:{v['reasoning']}"
+            return None
+        # Legacy path: existing _check_trend_veto on the 1h df.
+        return self._check_trend_veto(dfs.get("1h"), action)
 
     def _check_trend_veto(self, df: pd.DataFrame, action: str) -> Optional[str]:
         """Return a reason string if `action` should be vetoed, else None."""
