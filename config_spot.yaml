@@ -69,7 +69,7 @@ training:
   use_real_api: true
 trend_filter:
   enabled: true
-  use_two_tier: false       # P3 flag; flip in a separate commit after replay
+  use_two_tier: true        # P3 flag (flipped 2026-05-19 after replay evidence)
   # legacy single-tier (unchanged; used when use_two_tier=false)
   tf: 1h
   ema_fast: 50
