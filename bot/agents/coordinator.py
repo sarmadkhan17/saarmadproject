@@ -18,6 +18,15 @@ log  = logging.getLogger("Agents")
 DATA = DATA_DIR
 
 
+def macro_decay_weight(staleness_seconds: float) -> float:
+    """Linear decay of macro signal weight: full < 1800s, zero > 3600s."""
+    if staleness_seconds <= 1800.0:
+        return 1.0
+    if staleness_seconds >= 3600.0:
+        return 0.0
+    return 1.0 - (staleness_seconds - 1800.0) / 1800.0
+
+
 class AgentPerformanceTracker:
     def __init__(self):
         self.path = DATA / "agent_performance.json"
@@ -344,8 +353,7 @@ class AgentCoordinator:
     Uses deterministic ensemble (no LLM) to combine signals.
     """
 
-    GROQ_CACHE_SECS = 1800
-    SLOW_CACHE_SECS = 7200
+    SLOW_CACHE_SECS = 1800
 
     def __init__(self):
         self.technical  = TechnicalAgent()
@@ -359,8 +367,6 @@ class AgentCoordinator:
         self._fg_cache         = None
         self._macro_cache      = None
         self._slow_time        = None
-        self._decision_cache   = {}
-        self._decision_time    = {}
         self._decision_actions = {}
 
     def _refresh_slow(self):
@@ -377,17 +383,7 @@ class AgentCoordinator:
 
     def analyze(self, symbol, df, ml_signal):
         self._refresh_slow()
-        now     = datetime.now(timezone.utc)
-        last_dt = self._decision_time.get(symbol)
-        cached  = self._decision_cache.get(symbol)
-
-        if (cached and last_dt and
-                (now - last_dt).total_seconds() < self.GROQ_CACHE_SECS):
-            remaining          = int(self.GROQ_CACHE_SECS - (now - last_dt).total_seconds())
-            cached["strategy"] = f"AGENTS+{ml_signal.get('strategy','')}"
-            cached["timestamp"]= now.isoformat()
-            log.info(f"CACHED {symbol}: {cached['action']} | conf={cached['confidence']:.2f} | refresh in {remaining}s")
-            return cached
+        now = datetime.now(timezone.utc)
 
         ml_action  = ml_signal.get("action", "HOLD")
         ml_conf    = ml_signal.get("confidence", 0.5)
@@ -419,8 +415,6 @@ class AgentCoordinator:
                 },
                 "timestamp": now.isoformat(),
             }
-            self._decision_cache[symbol]   = signal
-            self._decision_time[symbol]    = now
             self._decision_actions[symbol] = ml_action
             return signal
 
@@ -459,8 +453,6 @@ class AgentCoordinator:
             },
             "timestamp": now.isoformat(),
         }
-        self._decision_cache[symbol]   = signal
-        self._decision_time[symbol]    = now
         self._decision_actions[symbol] = decision["action"]
         return signal
 
@@ -469,10 +461,8 @@ class AgentCoordinator:
         self.tracker.record_prediction("master", action, pnl)
 
     def invalidate_cache(self):
-        """Clear decision cache after model retrain so stale predictions are not reused."""
-        self._decision_cache.clear()
-        self._decision_time.clear()
-        log.info("Agent decision cache invalidated (models retrained)")
+        """No-op: per-symbol decision cache removed (every scan recomputes)."""
+        pass
 
     def get_performance_report(self):
         return {
