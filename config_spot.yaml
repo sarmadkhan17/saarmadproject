@@ -1,0 +1,72 @@
+bot:
+  scan_interval_seconds: 30
+dashboard:
+  host: 0.0.0.0
+  port: 5002
+logging:
+  backup_count: 5
+  max_bytes: 10485760
+ml:
+  # Only `timeframe` is read by v5 (trading timeframe). The ML retrain stack was removed.
+  timeframe: 15m
+  forward_bars: 8        # dashboard display only
+risk:
+  max_consecutive_losses: 10
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.1
+  max_open_trades: 5
+  max_portfolio_heat: 0.5
+  stop_loss_atr_multiplier: 4.0
+  stop_loss_min_pct: 0.01
+  take_profit_atr_multiplier: 3.0
+scanner:
+  blacklist:
+  - USDC/USDT
+  - BUSD/USDT
+  - TUSD/USDT
+  - FDUSD/USDT
+  - DAI/USDT
+  - USDD/USDT
+  max_daily_volatility_pct: 15
+  min_price: 0.5
+  min_volume_usdt: 30000000
+  rescan_hours: 2
+  top_n: 40
+strategy:
+  # NOTE: min_confidence / min_votes / htf_filter_mode here are display/legacy only.
+  # The live entry gates use the TradingProfile preset (see bot/engine/profiles.py).
+  # To change behaviour, edit the profile or `trading_profile` below.
+  htf_filter_mode: soft
+  min_confidence: 0.4
+  min_votes: 2
+  trading_profile: AGGRESSIVE
+training:
+  # Used by v5: timeframes (data feed) + min_bars_per_coin/min_coins (dashboard data-quality panel).
+  min_bars_per_coin: 500
+  min_coins: 4
+  timeframes:
+  - 15m
+  - 1h
+  - 4h
+  - 1d
+trend_filter:
+  enabled: true
+  use_two_tier: true        # P3 flag (flipped 2026-05-19 after replay evidence)
+  # legacy single-tier (unchanged; used when use_two_tier=false)
+  tf: 1h
+  ema_fast: 50
+  ema_slow: 200
+  veto_longs: true
+  veto_shorts: true
+  # two-tier (used when use_two_tier=true)
+  fast:
+    tf: 15m
+    ema_fast: 20
+    ema_slow: 50
+    slope_lookback: 10
+  slow:
+    tf: 1h
+    ema_fast: 50
+    ema_slow: 200
+    slope_lookback: 20
+  strong_slope_pct: 0.002   # 0.2 %/bar = "strongly opposed"

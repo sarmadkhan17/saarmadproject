@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Runtime data & logs
+logs/
+data/
+data_backup_*/
+
+# Backups
+.backup_*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

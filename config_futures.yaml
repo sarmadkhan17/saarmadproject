@@ -1,0 +1,90 @@
+bot:
+  scan_interval_seconds: 60
+actor:
+  # DeepSeek Actor (Gate 5) controls.
+  # cache_ttl_seconds: reuse a verdict for an unchanged setup signature instead
+  #   of re-calling the LLM every scan (0 disables the cache).
+  # winrate_half_life_hours: age at which a past trade's weight halves in the
+  #   recency-decayed win-rate fed to the Actor (smaller = forgets losses faster).
+  # winrate_prior_strength: Beta(prior,prior) smoothing toward 50% so a tiny
+  #   recent losing cluster can't read as 0% and freeze trading.
+  cache_ttl_seconds: 180
+  winrate_half_life_hours: 48
+  winrate_prior_strength: 1.0
+dashboard:
+  host: 0.0.0.0
+  port: 5002
+exchange:
+  margin_type: ISOLATED
+logging:
+  backup_count: 5
+  max_bytes: 10485760
+ml:
+  # Only `timeframe` is read by v5 (trading timeframe). The ML retrain stack was removed.
+  timeframe: 15m
+  forward_bars: 8        # dashboard display only
+risk:
+  leverage: 5
+  max_consecutive_losses: 6
+  max_daily_loss_pct: 0.03
+  max_drawdown_pct: 0.1
+  max_open_trades: 10
+  max_portfolio_heat: 0.5
+  stop_loss_atr_multiplier: 3.0
+  stop_loss_min_pct: 0.01
+  take_profit_atr_multiplier: 6.5
+scanner:
+  blacklist:
+  - USDC/USDT
+  - BUSD/USDT
+  - TUSD/USDT
+  - FDUSD/USDT
+  max_daily_volatility_pct: 15
+  min_price: 0.5
+  min_volume_usdt: 100000000
+  rescan_hours: 4
+  top_n: 20
+strategy:
+  # NOTE: min_confidence / min_votes / htf_filter_mode here are display/legacy only.
+  # The live entry gates use the TradingProfile preset (see bot/engine/profiles.py).
+  # To change behaviour, edit the profile or `trading_profile` below.
+  htf_filter_mode: hard
+  min_confidence: 0.45
+  min_votes: 2
+  trading_profile: AGGRESSIVE
+training:
+  # Used by v5: timeframes (data feed) + min_bars_per_coin/min_coins (dashboard data-quality panel).
+  min_bars_per_coin: 500
+  min_coins: 4
+  timeframes:
+  - 15m
+  - 1h
+  - 4h
+  - 1d
+trend_filter:
+  enabled: true
+  use_two_tier: true        # P3 flag (flipped 2026-05-19 after replay evidence)
+  # legacy single-tier (unchanged; used when use_two_tier=false)
+  tf: 1h
+  ema_fast: 50
+  ema_slow: 200
+  veto_longs: true
+  veto_shorts: true
+  # two-tier (used when use_two_tier=true)
+  fast:
+    tf: 15m
+    ema_fast: 20
+    ema_slow: 50
+    slope_lookback: 10
+  slow:
+    tf: 1h
+    ema_fast: 50
+    ema_slow: 200
+    slope_lookback: 20
+  # "Strongly trending" = relative EMA_fast change over the slow tier's
+  # slope_lookback window (20 bars on 1h ≈ 20h), NOT per-bar. Old value 0.002
+  # (0.2% over ~20h) was tripped by almost any drift, so EVERY counter-trend
+  # short was vetoed in mild uptrends. 0.02 = 2% over the window only blocks
+  # shorts against a genuinely strong uptrend (and longs against a strong
+  # downtrend); mild grinds let the actor/risk gates decide.
+  strong_slope_pct: 0.02
