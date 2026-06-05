@@ -1044,9 +1044,14 @@ class BaseBot:
     def _save_entry_contexts(self):
         """Atomically persist entry contexts to disk."""
         try:
+            def _coerce(obj):
+                # numpy bools/ints/floats are not JSON-native
+                if hasattr(obj, "item"):
+                    return obj.item()
+                raise TypeError(f"Not serializable: {type(obj)}")
             tmp = self._entry_contexts_file.with_suffix(".tmp.json")
             with open(tmp, "w") as f:
-                json.dump(self._entry_contexts, f)
+                json.dump(self._entry_contexts, f, default=_coerce)
             tmp.replace(self._entry_contexts_file)
         except Exception as e:
             self.log.warning(f"Entry contexts save failed: {e}")
