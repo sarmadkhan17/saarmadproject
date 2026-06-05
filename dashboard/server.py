@@ -167,18 +167,25 @@ def _risk_metrics(trades: list) -> dict:
 
 def calculate_stats(trades):
     closed = [t for t in trades if t.get("status") == "closed"]
+    open_trades = [t for t in trades if t.get("status") == "open"]
     wins   = sum(1 for t in closed if t.get("pnl", 0) > 0)
     losses = sum(1 for t in closed if t.get("pnl", 0) < 0)  # break-even not a loss
     total  = wins + losses
-    pnl    = sum(t.get("pnl", 0) for t in closed)
-    open_t = sum(1 for t in trades if t.get("status") == "open")
+
+    # Realized PnL = closed trade PnL + partial TP1 PnL already locked in on open trades
+    closed_pnl       = sum(t.get("pnl", 0) for t in closed)
+    open_realized    = sum(t.get("pnl", 0) for t in open_trades if t.get("pnl", 0) != 0)
+    total_realized   = closed_pnl + open_realized
+
     result = {
-        "total_trades": len(trades),
-        "open_trades":  open_t,
-        "wins":         wins,
-        "losses":       losses,
-        "win_rate":     round(wins / total * 100, 1) if total else 0.0,
-        "total_pnl":    round(pnl, 4),
+        "total_trades":   len(trades),
+        "open_trades":    len(open_trades),
+        "wins":           wins,
+        "losses":         losses,
+        "win_rate":       round(wins / total * 100, 1) if total else 0.0,
+        "total_pnl":      round(total_realized, 4),
+        "closed_pnl":     round(closed_pnl, 4),
+        "open_realized":  round(open_realized, 4),
     }
     result.update(_risk_metrics(trades))
     return result
@@ -208,6 +215,9 @@ def stats():
     result["today_pnl"]    = round(sum(t.get("pnl", 0) for t in today_trades), 4)
     result["today_trades"] = len(today_trades)
     result["today_wins"]   = sum(1 for t in today_trades if t.get("pnl", 0) > 0)
+    result["start_balance"] = round(float(d["futures"].get("stats", {}).get("balance", 0)
+                                          - result["total_pnl"]
+                                          - float(live_pnl or 0)), 2)
 
     p = DATA / "trading_paused.json"
     if p.exists():
