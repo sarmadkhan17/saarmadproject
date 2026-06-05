@@ -173,35 +173,6 @@ class StateManager:
 
     def _do_save_locked(self):
         """Write state to disk. Caller must hold self._lock."""
-        archive_path = self.path.with_name(self.path.stem + "_archive.json")
-        cutoff = datetime.now(LOCAL_TZ) - timedelta(days=3)
-        to_archive = []
-        to_keep = []
-        for t in self.state.get("trades", []):
-            if t.get("status") == "closed" and t.get("close_timestamp"):
-                try:
-                    ct = datetime.fromisoformat(t["close_timestamp"])
-                    if ct.tzinfo is None:
-                        ct = ct.replace(tzinfo=LOCAL_TZ)
-                    if ct < cutoff:
-                        to_archive.append(t)
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            to_keep.append(t)
-        if to_archive:
-            existing = []
-            if archive_path.exists():
-                try:
-                    with open(archive_path) as f:
-                        existing = json.load(f)
-                except Exception:
-                    pass
-            arc_tmp = archive_path.with_suffix(".tmp.json")
-            with open(arc_tmp, "w") as f:
-                json.dump(existing + to_archive, f, indent=2, default=str)
-            arc_tmp.replace(archive_path)
-            self.state["trades"] = to_keep
         self.state["last_update"] = datetime.now(LOCAL_TZ).isoformat()
         tmp_path = self.path.with_suffix(".tmp.json")
         with open(tmp_path, "w") as f:
@@ -346,6 +317,7 @@ class BaseBot:
         self._sl_failure_cooldown: dict = {}
         self._symbol_locks: dict = {}
         self._symbol_locks_guard = threading.Lock()
+        self._entry_contexts_file = DATA / f"entry_contexts_{self.MODE}.json"
 
         # ── v5: rule-based agents + DeepSeek reasoning ──────────────────────
         self.profile = TradingProfile.from_config(self.config)
@@ -386,8 +358,8 @@ class BaseBot:
         self.execution.sl_atr_mult = self.profile.stop_loss_atr_mult
 
         # Entry-context store for the Judge (trade_id -> context dict)
-        self._entry_contexts: dict = {}
-        self._trades_since_meta = 0
+        # Persisted to disk so restarts don't wipe contexts for open trades.
+        self._entry_contexts: dict = self._load_entry_contexts()
 
         self.log.info(f"CryptoBot v5 initialized [{self.MODE.upper()}] — "
                       f"DeepSeek reasoning active, ML stack removed")
@@ -706,6 +678,7 @@ class BaseBot:
             df_tf = dfs[tf]
             df_1h = dfs.get("1h", df_tf)
             regime = (regime_ctx or {}).get("regime", "RANGING")
+            trend_direction = (regime_ctx or {}).get("trend_direction", "NEUTRAL")
 
             # ── Layer 1: Ensemble (SMC + Technical + MacroFlow) ─────────
             ensemble = self.ensemble.run(symbol, dfs, self.profile, market_ctx=regime_ctx)
@@ -832,6 +805,7 @@ class BaseBot:
                     approve_threshold=self.profile.min_confidence,
                     winrate_half_life_h=float(actor_cfg.get("winrate_half_life_hours", 48.0)),
                     winrate_prior=float(actor_cfg.get("winrate_prior_strength", 1.0)),
+                    trend_direction=trend_direction,
                 )
                 self._actor_cache[symbol] = {"sig": actor_sig, "ts": now_mono, "decision": actor}
                 self.log.info(f"ACTOR {symbol} | approved={actor.approved} conf={actor.confidence:.2f} | {actor.reasoning}")
@@ -931,9 +905,11 @@ class BaseBot:
                 self._sl_failure_cooldown[symbol] = datetime.now(LOCAL_TZ)
                 self.log.warning(f"[{symbol}] SL failure cooldown set — skipping for 2h")
             elif trade and hasattr(trade, "id"):
-                # Store entry context for the Judge when this trade later closes
+                # Store entry context for the Judge when this trade later closes.
+                # Persisted to disk immediately so restarts don't lose the context.
                 self._entry_contexts[trade.id] = {
                     "regime": regime,
+                    "trend_direction": trend_direction,
                     "btc_d": macro["btc_d"], "usdt_d": macro["usdt_d"],
                     "btc_d_roc": macro["btc_d_roc"], "usdt_d_roc": macro["usdt_d_roc"],
                     "ensemble_score": ensemble.net_score,
@@ -945,6 +921,7 @@ class BaseBot:
                     "actor_approved": actor.approved,
                     "entry_price": price,
                 }
+                self._save_entry_contexts()
 
         except Exception as e:
             self.log.error(f"Error analyzing {symbol}: {e}", exc_info=True)
@@ -997,6 +974,7 @@ class BaseBot:
         try:
             trade_id = trade.get("id", "")
             entry_ctx = self._entry_contexts.pop(trade_id, {})
+            self._save_entry_contexts()  # persist the removal
 
             # Compute R-multiple (pnl relative to risked amount)
             entry = float(trade.get("price", 0))
@@ -1021,10 +999,10 @@ class BaseBot:
                         self.trade_memory.add_judge_critique(trade_id, critique)
                         self.log.info(f"JUDGE {trade.get('symbol')} | {critique.get('decision_quality')} | {critique.get('lesson','')[:80]}")
 
-                    # Meta-Judge every 20 trades
-                    self._trades_since_meta += 1
-                    if self._trades_since_meta >= 20:
-                        self._trades_since_meta = 0
+                    # Meta-Judge every 20 new critiques since the last run.
+                    # Uses the DB count so bot restarts don't break the cadence.
+                    new_since_last = self.trade_memory.critiques_since_last_meta()
+                    if new_since_last >= 20:
                         critiques = self.trade_memory.get_recent_critiques(20)
                         meta = llm_reasoning.meta_judge_synthesize(critiques)
                         if meta:
@@ -1050,6 +1028,28 @@ class BaseBot:
     def _get_leverage(self) -> int:
         """Override in futures bot."""
         return 1
+
+    def _load_entry_contexts(self) -> dict:
+        """Load persisted entry contexts so they survive restarts."""
+        try:
+            if self._entry_contexts_file.exists():
+                with open(self._entry_contexts_file) as f:
+                    data = json.load(f)
+                self.log.info(f"Loaded {len(data)} entry contexts from disk")
+                return data
+        except Exception as e:
+            self.log.warning(f"Entry contexts load failed: {e}")
+        return {}
+
+    def _save_entry_contexts(self):
+        """Atomically persist entry contexts to disk."""
+        try:
+            tmp = self._entry_contexts_file.with_suffix(".tmp.json")
+            with open(tmp, "w") as f:
+                json.dump(self._entry_contexts, f)
+            tmp.replace(self._entry_contexts_file)
+        except Exception as e:
+            self.log.warning(f"Entry contexts save failed: {e}")
 
     def _place_exchange_stop_loss(self, symbol, side, amount, entry_price, atr):
         """Override in futures bot to place exchange-side SL."""

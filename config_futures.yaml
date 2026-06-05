@@ -9,8 +9,8 @@ actor:
   # winrate_prior_strength: Beta(prior,prior) smoothing toward 50% so a tiny
   #   recent losing cluster can't read as 0% and freeze trading.
   cache_ttl_seconds: 180
-  winrate_half_life_hours: 48
-  winrate_prior_strength: 1.0
+  winrate_half_life_hours: 24
+  winrate_prior_strength: 3.0
 dashboard:
   host: 0.0.0.0
   port: 5002

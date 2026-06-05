@@ -122,6 +122,49 @@ def _write_config_safe(cfg_path: Path, cfg: dict):
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
+def _risk_metrics(trades: list) -> dict:
+    """Compute Sharpe, Sortino, and Profit Factor from closed trades.
+
+    Uses daily-bucketed PnL so the result is comparable to standard
+    annualized metrics (×√252). Requires ≥5 trading days to be meaningful;
+    returns None for each metric when there is insufficient data.
+    """
+    import numpy as np
+    closed = [t for t in trades if t.get("status") == "closed"
+              and t.get("close_timestamp")]
+    daily: dict = {}
+    for t in closed:
+        day = str(t.get("close_timestamp", ""))[:10]
+        if day and day != "None":
+            daily[day] = daily.get(day, 0.0) + float(t.get("pnl", 0))
+
+    n_days = len(daily)
+    if n_days < 5:
+        return {"sharpe": None, "sortino": None, "profit_factor": None,
+                "trading_days": n_days}
+
+    arr     = np.array(list(daily.values()), dtype=float)
+    mean_r  = float(np.mean(arr))
+    std_r   = float(np.std(arr, ddof=1)) if n_days > 1 else 0.0
+    neg     = arr[arr < 0]
+    down_std = float(np.std(neg, ddof=1)) if len(neg) > 1 else (float(abs(neg[0])) if len(neg) == 1 else 1e-9)
+
+    sharpe  = round(mean_r / (std_r + 1e-9) * (252 ** 0.5), 2) if std_r > 0 else None
+    sortino = round(mean_r / (down_std + 1e-9) * (252 ** 0.5), 2) if down_std > 0 else None
+
+    gross_win  = sum(t.get("pnl", 0) for t in closed if t.get("pnl", 0) > 0)
+    gross_loss = sum(abs(t.get("pnl", 0)) for t in closed if t.get("pnl", 0) < 0)
+    pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+    return {
+        "sharpe":        sharpe,
+        "sortino":       sortino,
+        "profit_factor": pf,
+        "trading_days":  n_days,
+        "sharpe_note":   f"Based on {n_days}d; need ≥30d for reliable annualization",
+    }
+
+
 def calculate_stats(trades):
     closed = [t for t in trades if t.get("status") == "closed"]
     wins   = sum(1 for t in closed if t.get("pnl", 0) > 0)
@@ -129,7 +172,7 @@ def calculate_stats(trades):
     total  = wins + losses
     pnl    = sum(t.get("pnl", 0) for t in closed)
     open_t = sum(1 for t in trades if t.get("status") == "open")
-    return {
+    result = {
         "total_trades": len(trades),
         "open_trades":  open_t,
         "wins":         wins,
@@ -137,6 +180,8 @@ def calculate_stats(trades):
         "win_rate":     round(wins / total * 100, 1) if total else 0.0,
         "total_pnl":    round(pnl, 4),
     }
+    result.update(_risk_metrics(trades))
+    return result
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

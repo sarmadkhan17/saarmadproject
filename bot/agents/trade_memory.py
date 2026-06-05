@@ -437,3 +437,22 @@ class TradeMemory:
                 return c.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         except Exception:
             return 0
+
+    def critiques_since_last_meta(self) -> int:
+        """Count judge_critiques added since the last meta_rules synthesis.
+        Returns the total critique count when no meta_rules exist yet.
+        Restart-safe: uses DB timestamps, not an in-memory counter."""
+        try:
+            with self._conn() as c:
+                row = c.execute(
+                    "SELECT synthesized_at FROM meta_rules ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return c.execute("SELECT COUNT(*) FROM judge_critiques").fetchone()[0]
+                return c.execute(
+                    "SELECT COUNT(*) FROM judge_critiques WHERE reviewed_at > ?",
+                    (row[0],)
+                ).fetchone()[0]
+        except Exception as e:
+            log.warning(f"critiques_since_last_meta error: {e}")
+            return 0

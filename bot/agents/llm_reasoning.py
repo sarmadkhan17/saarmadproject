@@ -172,6 +172,7 @@ def actor_evaluate(
     approve_threshold: float = 0.50,
     winrate_half_life_h: float = 48.0,
     winrate_prior: float = 1.0,
+    trend_direction: str = "NEUTRAL",
 ) -> ActorDecision:
     """Call DeepSeek V3 to evaluate a trading setup.
 
@@ -195,7 +196,7 @@ def actor_evaluate(
             trade_summary += f"[{t.get('symbol','?')} {t.get('side','?')} {outcome} R={t.get('r_multiple',0):.1f}] "
 
     user_msg = f"""Symbol: {symbol} | Action: {action}
-Regime: {regime}
+Regime: {regime} | Trend direction: {trend_direction}
 Macro: BTC.D={macro.get('btc_d',50):.1f}% ({macro.get('btc_d_roc',0):+.2f}%/hr) | USDT.D={macro.get('usdt_d',5):.1f}% ({macro.get('usdt_d_roc',0):+.2f}%/hr) | kill={macro.get('kill',False)}
 Ensemble: net_score={ensemble_score:+.3f} confidence={ensemble_confidence:.2f}
 Microstructure: ob_ratio={micro_signal.ob_imbalance:.2f} cvd={micro_signal.cvd_direction} divergence={micro_signal.cvd_divergence} kill={micro_signal.kill}
@@ -279,7 +280,7 @@ PnL: ${pnl:+.4f} | R-multiple: {r_mult:+.2f}
 Duration: {trade.get('duration_hours',0):.1f}h
 
 AT ENTRY — context:
-Regime: {entry_context.get('regime','?')}
+Regime: {entry_context.get('regime','?')} | Trend direction: {entry_context.get('trend_direction','?')}
 BTC.D: {entry_context.get('btc_d',50):.1f}% roc={entry_context.get('btc_d_roc',0):+.2f}%/hr
 USDT.D: {entry_context.get('usdt_d',5):.1f}%
 Ensemble score: {entry_context.get('ensemble_score',0):+.3f}

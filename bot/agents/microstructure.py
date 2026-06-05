@@ -74,8 +74,13 @@ class MicrostructureAgent:
                     reasons.append(f"OB: neutral {ob_ratio:.2f}x")
             elif action == "SELL":
                 if ob_ratio > self.IMBALANCE_STRONG:
-                    kill = True
-                    reasons.append(f"OB: heavy bid pressure {ob_ratio:.2f}x")
+                    if cvd_dir != "bearish":
+                        # OB heavy bids + CVD not confirming SELL → kill
+                        kill = True
+                        reasons.append(f"OB: heavy bid pressure {ob_ratio:.2f}x")
+                    else:
+                        # CVD confirms bearish direction — OB wall alone not enough
+                        reasons.append(f"OB: heavy bid pressure {ob_ratio:.2f}x | CVD confirms ✓")
                 elif ob_ratio < (1.0 / self.IMBALANCE_MILD):
                     reasons.append(f"OB: ask support {ob_ratio:.2f}x ✓")
                 else:
