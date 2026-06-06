@@ -399,6 +399,7 @@ def circuit_breaker_status():
 
 @app.route("/api/circuit_breaker/reset", methods=["POST"])
 def circuit_breaker_reset():
+    from datetime import datetime, timedelta
     p = DATA / "circuit_breaker.json"
     try:
         with open(p) as f:
@@ -406,7 +407,7 @@ def circuit_breaker_reset():
     except Exception:
         cb = {}
     cb["consec_losses"] = 0
-    cb.pop("disabled_until", None)
+    cb["disabled_until"] = (datetime.now(LOCAL_TZ) + timedelta(hours=24)).isoformat()
     try:
         with open(p, "w") as f:
             json.dump(cb, f)
