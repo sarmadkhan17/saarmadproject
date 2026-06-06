@@ -2141,7 +2141,7 @@ function updateLogs() {
 
 /* ─── CIRCUIT BREAKER BANNER ─── */
 function resetCircuitBreaker() {
-  if (!confirm('Reset circuit breaker? This clears consecutive loss count and daily PnL history.')) return;
+  if (!confirm('Reset circuit breaker? This clears the consecutive loss count so trading can resume.')) return;
   fetch('/api/circuit_breaker/reset', {method: 'POST'})
     .then(function(r) { return r.json(); })
     .then(function(d) {

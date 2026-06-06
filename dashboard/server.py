@@ -406,7 +406,6 @@ def circuit_breaker_reset():
     except Exception:
         cb = {}
     cb["consec_losses"] = 0
-    cb["pnl_history"] = {}
     cb.pop("disabled_until", None)
     try:
         with open(p, "w") as f:
