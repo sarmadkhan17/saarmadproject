@@ -2141,11 +2141,11 @@ function updateLogs() {
 
 /* ─── CIRCUIT BREAKER BANNER ─── */
 function resetCircuitBreaker() {
-  if (!confirm('Reset circuit breaker? This clears the consecutive loss count so trading can resume.')) return;
+  if (!confirm('Disable circuit breaker for 24 hours? Trading will resume immediately.')) return;
   fetch('/api/circuit_breaker/reset', {method: 'POST'})
     .then(function(r) { return r.json(); })
     .then(function(d) {
-      showNotif(d.ok ? 'Circuit breaker reset.' : ('Reset failed: ' + d.error), d.ok ? 'ok' : 'err');
+      showNotif(d.ok ? 'Circuit breaker disabled for 24h.' : ('Failed: ' + d.error), d.ok ? 'ok' : 'err');
       updateCircuitBreaker();
     });
 }
@@ -2156,7 +2156,7 @@ function updateCircuitBreaker() {
     if (d.tripped) {
       el.innerHTML = '<div class="cb-banner-inner">' +
         '<span>⚠ CIRCUIT BREAKER ACTIVE — ' + d.reason + '</span>' +
-        '<button class="cb-reset-btn" onclick="resetCircuitBreaker()">RESET</button>' +
+        '<button class="cb-reset-btn" onclick="resetCircuitBreaker()">DISABLE 24H</button>' +
         '</div>';
       el.classList.add('show');
     } else {
