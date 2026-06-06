@@ -757,15 +757,25 @@ class CircuitBreaker:
             self._disabled_until = None
 
     def _save(self):
-        from datetime import timedelta
+        from datetime import timedelta, datetime
         cutoff = (date.today() - timedelta(days=self.WINDOW_DAYS)).isoformat()
         self.pnl_history = {k: v for k, v in self.pnl_history.items() if k >= cutoff}
+        disabled_until = self._disabled_until
+        if disabled_until is None:
+            try:
+                with open(DATA / "circuit_breaker.json") as f:
+                    existing = json.load(f)
+                ext = existing.get("disabled_until")
+                if ext and datetime.fromisoformat(ext) > datetime.now(LOCAL_TZ):
+                    disabled_until = ext
+            except Exception:
+                pass
         with open(DATA / "circuit_breaker.json", "w") as f:
             json.dump({"pnl_history": self.pnl_history,
                        "consec_losses": self.consec_losses,
                        "initial_balance": self._initial_balance,
                        "peak_balance": self._peak_balance,
-                       "disabled_until": self._disabled_until}, f)
+                       "disabled_until": disabled_until}, f)
 
     def _get_rolling_loss(self):
         from datetime import timedelta
