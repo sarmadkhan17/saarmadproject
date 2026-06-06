@@ -307,6 +307,26 @@ nav.tabs {
   letter-spacing: 1px;
   text-align: center;
 }
+.cb-banner-inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.cb-reset-btn {
+  background: rgba(239,68,68,0.18);
+  border: 1px solid rgba(239,68,68,0.55);
+  color: #ef4444;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.cb-reset-btn:hover { background: rgba(239,68,68,0.32); }
 .cb-banner.show { display: block; animation: notif-in 0.3s ease; }
 
 /* ─── HOLD STATUS BANNER ─── */
@@ -2120,11 +2140,24 @@ function updateLogs() {
 }
 
 /* ─── CIRCUIT BREAKER BANNER ─── */
+function resetCircuitBreaker() {
+  if (!confirm('Reset circuit breaker? This clears consecutive loss count and daily PnL history.')) return;
+  fetch('/api/circuit_breaker/reset', {method: 'POST'})
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      showNotif(d.ok ? 'Circuit breaker reset.' : ('Reset failed: ' + d.error), d.ok ? 'ok' : 'err');
+      updateCircuitBreaker();
+    });
+}
+
 function updateCircuitBreaker() {
   get('/api/circuit_breaker', function(d) {
     var el = document.getElementById('cb-banner');
     if (d.tripped) {
-      el.textContent = '⚠ CIRCUIT BREAKER ACTIVE — ' + d.reason;
+      el.innerHTML = '<div class="cb-banner-inner">' +
+        '<span>⚠ CIRCUIT BREAKER ACTIVE — ' + d.reason + '</span>' +
+        '<button class="cb-reset-btn" onclick="resetCircuitBreaker()">RESET</button>' +
+        '</div>';
       el.classList.add('show');
     } else {
       el.classList.remove('show');

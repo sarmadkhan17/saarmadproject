@@ -397,6 +397,25 @@ def circuit_breaker_status():
     return jsonify({"tripped": False, "reason": ""})
 
 
+@app.route("/api/circuit_breaker/reset", methods=["POST"])
+def circuit_breaker_reset():
+    p = DATA / "circuit_breaker.json"
+    try:
+        with open(p) as f:
+            cb = json.load(f)
+    except Exception:
+        cb = {}
+    cb["consec_losses"] = 0
+    cb["pnl_history"] = {}
+    cb.pop("disabled_until", None)
+    try:
+        with open(p, "w") as f:
+            json.dump(cb, f)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/health")
 def health():
     d    = load_combined()
