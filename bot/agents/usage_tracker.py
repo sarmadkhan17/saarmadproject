@@ -64,6 +64,15 @@ class DeepSeekUsageTracker:
             day["input_tokens"]  += input_tokens
             day["output_tokens"] += output_tokens
             day["cost_usd"]      = round(day["cost_usd"] + cost, 6)
+            # Per-model breakdown so the dashboard can show DeepSeek (Actor/
+            # Judge) and Groq (Skeptic) as separate components.
+            m = day.setdefault("models", {}).setdefault(model, {
+                "calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0
+            })
+            m["calls"]         += 1
+            m["input_tokens"]  += input_tokens
+            m["output_tokens"] += output_tokens
+            m["cost_usd"]      = round(m["cost_usd"] + cost, 6)
             self._data["total_cost_usd"] = round(
                 self._data.get("total_cost_usd", 0) + cost, 6
             )

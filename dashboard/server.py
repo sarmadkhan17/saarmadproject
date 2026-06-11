@@ -478,19 +478,27 @@ def model_health():
         "usage": "Regime: CHOPPY / RANGING / WEAK_TREND / STRONG_TREND / CRASH",
     }
 
-    # DeepSeek Actor (V3)
+    # DeepSeek Actor (V3) + Groq Skeptic (Gate 5.5) — shared usage file,
+    # split by the per-model breakdown usage_tracker writes since Jun 2026.
     usage_p = DATA / "deepseek_usage.json"
     deepseek_ok = False
     calls_today = 0
     cost_today = 0.0
+    groq_calls_today = 0
+    groq_cost_today = 0.0
     if usage_p.exists():
         try:
             with open(usage_p) as f:
                 u = json.load(f)
             from datetime import date
             today = u.get("daily", {}).get(str(date.today()), {})
-            calls_today = today.get("calls", 0)
-            cost_today  = round(today.get("cost_usd", 0.0), 4)
+            for model, m in (today.get("models") or {}).items():
+                if "llama" in model.lower() or "groq" in model.lower():
+                    groq_calls_today += m.get("calls", 0)
+                    groq_cost_today  += m.get("cost_usd", 0.0)
+            calls_today = today.get("calls", 0) - groq_calls_today
+            cost_today  = round(today.get("cost_usd", 0.0) - groq_cost_today, 4)
+            groq_cost_today = round(groq_cost_today, 4)
             deepseek_ok = calls_today > 0
         except (json.JSONDecodeError, OSError):
             pass
@@ -500,6 +508,14 @@ def model_health():
         "trained_at": f"{calls_today} calls today",
         "status": "active" if deepseek_ok else "idle",
         "usage": f"DeepSeek V3 reasoning · ${cost_today:.3f} today",
+    }
+
+    result["groq_skeptic"] = {
+        "loaded": True, "accuracy": 0, "wf_accuracy": 0,
+        "trained_at": f"{groq_calls_today} calls today",
+        "status": "active" if groq_calls_today > 0 else "idle",
+        "usage": (f"Llama 3.3 70B adversarial gate (argues vs approved setups) "
+                  f"· ${groq_cost_today:.3f} today"),
     }
 
     # Judge / Meta-Judge feedback loop
@@ -716,15 +732,20 @@ def detailed_health():
     closed = sum(1 for t in trades if t.get("status") == "closed")
     pnl    = sum(t.get("pnl", 0) for t in trades if t.get("status") == "closed")
 
-    # DeepSeek Actor call count from usage tracker
+    # DeepSeek Actor + Groq Skeptic call counts from usage tracker
     deepseek_calls_today = 0
+    groq_calls_today = 0
     p_usage = DATA / "deepseek_usage.json"
     if p_usage.exists():
         try:
             with open(p_usage) as f:
                 usage = json.load(f)
             today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-            deepseek_calls_today = usage.get("daily", {}).get(today, {}).get("calls", 0)
+            day = usage.get("daily", {}).get(today, {})
+            for model, m in (day.get("models") or {}).items():
+                if "llama" in model.lower() or "groq" in model.lower():
+                    groq_calls_today += m.get("calls", 0)
+            deepseek_calls_today = day.get("calls", 0) - groq_calls_today
         except (json.JSONDecodeError, OSError, KeyError):
             pass
 
@@ -791,6 +812,8 @@ def detailed_health():
         "exchange_mode":          exec_mode,
         "deepseek_actor_active":  True,
         "deepseek_calls_today":   deepseek_calls_today,
+        "groq_skeptic_active":    True,
+        "groq_calls_today":       groq_calls_today,
         "profile":                profile_name,
         "live_regime":            live_regime,
         "smc_agent":              True,

@@ -2124,6 +2124,7 @@ function updateHealth() {
       { l: 'Exchange',       ok: (r.exchange_mode || 'demo') === 'demo' || r.exchange_mode === 'live',
                                v: (r.exchange_mode || 'demo').toUpperCase() },
       { l: 'DeepSeek Actor', ok: r.deepseek_actor_active,       v: r.deepseek_actor_active ? (r.deepseek_calls_today || 0) + ' calls today' : 'Inactive' },
+      { l: 'Groq Skeptic',   ok: r.groq_skeptic_active,         v: r.groq_skeptic_active ? (r.groq_calls_today || 0) + ' calls today' : 'Inactive' },
       { l: 'Signal Age',     ok: (r.signal_age || 9999) < 120,  v: (r.signal_age || 0) + 's' },
       { l: 'Spot Open',      ok: true,                           v: r.spot_open     || 0 },
       { l: 'Futures Open',   ok: true,                           v: r.futures_open  || 0 },
