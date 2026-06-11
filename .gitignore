@@ -14,8 +14,12 @@ build/
 
 # Runtime data & logs
 logs/
-data/
+/data/
 data_backup_*/
+
+# Bot runtime data directory (not source code)
+bot/data/*.json
+bot/data/*.db
 
 # Backups
 .backup_*/

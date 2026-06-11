@@ -767,27 +767,29 @@ td {
 .page-btn.pg-active { background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
 
 /* ─── MODEL HEALTH ─── */
-.model-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 0;
+/* ─── SHADOW TRACKER ─── */
+.shadow-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.shadow-table th {
+  font-size: 10px; font-weight: 700; color: var(--text2); letter-spacing: 1px;
+  text-transform: uppercase; padding: 8px 10px; border-bottom: 1px solid var(--border);
+  text-align: left;
 }
-.model-grid .empty {
-  grid-column: 1 / -1;
-}
-
-.model-cell {
-  padding: 20px 22px;
-  border-right: 1px solid var(--border);
-}
-
-.model-cell:last-child { border-right: none; }
-
-.model-name     { font-size: 10px; font-weight: 700; color: var(--text2); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 12px; }
-.model-accuracy { font-family: var(--mono); font-size: 30px; font-weight: 700; line-height: 1; }
-.model-accuracy.good { color: var(--green); }
-.model-accuracy.warn { color: var(--gold); }
-.model-date     { font-size: 10px; color: var(--text2); margin-top: 8px; font-family: var(--mono); }
+.shadow-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); font-family: var(--mono); }
+.shadow-table tr:last-child td { border-bottom: none; }
+.shadow-table tr:hover td { background: rgba(255,255,255,0.03); }
+.shadow-gate-name { font-size: 11px; font-weight: 600; color: var(--text1); font-family: var(--sans); }
+.shadow-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.shadow-chip { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-family: var(--mono); }
+.shadow-chip.tp  { background: rgba(16,185,129,0.15); color: var(--green); }
+.shadow-chip.sl  { background: rgba(239,68,68,0.15);  color: var(--red); }
+.shadow-chip.exp { background: rgba(148,163,184,0.12); color: var(--text2); }
+.shadow-chip.open{ background: rgba(96,165,250,0.12); color: #60a5fa; }
+.shadow-netr.good { color: var(--green); }
+.shadow-netr.bad  { color: var(--red); }
+.shadow-netr.neu  { color: var(--text2); }
+.shadow-winrate.good { color: var(--green); }
+.shadow-winrate.warn { color: var(--gold); }
+.shadow-winrate.bad  { color: var(--red); }
 
 /* ─── HEALTH GRID ─── */
 .health-grid {
@@ -1002,7 +1004,7 @@ td {
   .row-7030 { grid-template-columns: 1fr; }
   .row-7030 .panel:last-child { max-height: 320px; }
   .strategy-config-grid { grid-template-columns: repeat(2, 1fr); }
-  .model-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .shadow-table th, .shadow-table td { padding: 7px 8px; }
   .health-grid { grid-template-columns: repeat(2, 1fr); }
   header { flex-wrap: wrap; height: auto; padding: 8px 16px; }
   .hright { gap: 6px; flex-wrap: wrap; }
@@ -1021,9 +1023,8 @@ td {
   .trading-side:first-child { border-right: none; border-bottom: 1px solid var(--border); }
 
   .strategy-config-grid { grid-template-columns: 1fr; }
-  .model-grid { grid-template-columns: 1fr !important; }
-  .model-cell { border-right: none; border-bottom: 1px solid var(--border); }
-  .model-cell:last-child { border-bottom: none; }
+  .shadow-table th, .shadow-table td { padding: 6px 6px; font-size: 11px; }
+  .shadow-chips { gap: 3px; }
   .health-grid { grid-template-columns: 1fr; }
   .health-item { border-right: none; }
   .health-item:nth-last-child(-n+6) { border-bottom: 1px solid var(--border); }
@@ -1070,9 +1071,7 @@ td {
   .table-wrap { max-height: 260px; }
   .signals-body { max-height: 220px; }
   .chart-body { height: 200px; padding: 12px; }
-  .model-accuracy { font-size: 22px; }
-  .model-name { font-size: 9px; }
-  .model-date { font-size: 9px; }
+  .shadow-table { font-size: 11px; }
 }
 
 /* Small phone (≤480px) */
@@ -1382,14 +1381,19 @@ td {
 
   <div class="row row-5050 mb-18">
     <div>
-      <div class="section-label">AI Model Health</div>
+      <div class="section-label">Shadow Outcome Tracker</div>
       <div class="panel">
         <div class="panel-header">
-          <span class="panel-title">Model Performance</span>
-          <span class="panel-badge">Walk-Forward Validated</span>
+          <span class="panel-title">Rejected Signal Hypotheticals</span>
+          <span class="panel-badge" id="shadowBadge">Last 30 days</span>
         </div>
-        <div class="model-grid" id="modelGrid">
-          <div class="empty" style="grid-column:span 2">Loading...</div>
+        <div class="table-wrap" style="max-height:220px">
+          <table class="shadow-table">
+            <thead><tr>
+              <th>Gate</th><th>Shadows</th><th>Outcomes</th><th>Open</th><th>Win%</th><th>Hyp. Net R</th><th>Gate Saved</th>
+            </tr></thead>
+            <tbody id="shadowBody"><tr><td colspan="7" class="empty">Loading...</td></tr></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -2053,28 +2057,60 @@ function updateStatus() {
   });
 }
 
-/* ─── MODEL HEALTH ─── */
-function updateModelHealth() {
-  get('/api/model_health', function(models) {
-    var el    = document.getElementById('modelGrid');
-    var names = { rf: 'Random Forest', lgbm: 'LightGBM', hmm: 'HMM Regime', rl_agent: 'RL Agent' };
-    var activeModels = ['rf', 'lgbm', 'hmm', 'rl_agent'];
-    var h     = '';
-    for (var i = 0; i < activeModels.length; i++) {
-      var key = activeModels[i];
-      var m   = models[key];
-      if (!m) continue;
-      var acc = m.loaded ? (m.accuracy ? (m.accuracy * 100).toFixed(1) + '%' : '—') : '—';
-      var cls = (m.loaded && (m.accuracy >= 0.40 || m.status === 'active')) ? 'good' : 'warn';
-      var trainedAt = m.trained_at ? escapeHtml(m.trained_at.slice(0, 10)) : '—';
-      var badge = (m.usage || m.status).substring(0, 28);
-      h += "<div class='model-cell'>" +
-        "<div class='model-name'>" + escapeHtml(names[key] || key) + "</div>" +
-        "<div class='model-accuracy " + cls + "'>" + acc + "</div>" +
-        "<div class='model-date'>" + escapeHtml(badge) + "</div>" +
-        "</div>";
+/* ─── SHADOW TRACKER ─── */
+function updateShadowStats() {
+  get('/api/shadow_stats', function(r) {
+    var tbody = document.getElementById('shadowBody');
+    var badge = document.getElementById('shadowBadge');
+    if (!tbody) return;
+    var gates = r && r.gates ? r.gates : {};
+    var gateLabels = {
+      microstructure:  'Microstructure',
+      actor_prefilter: 'Actor Pre-filter',
+      actor:           'Actor (LLM)',
+      risk:            'Risk'
+    };
+    var gateOrder = ['microstructure', 'actor_prefilter', 'actor', 'risk'];
+    var keys = gateOrder.filter(function(k) { return gates[k]; });
+    // Also include any unexpected gate names
+    Object.keys(gates).forEach(function(k) { if (keys.indexOf(k) === -1) keys.push(k); });
+    if (!keys.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No shadow data yet — waiting for rejected signals</td></tr>';
+      return;
     }
-    el.innerHTML = h || "<div class='empty' style='grid-column:span 2'>No data</div>";
+    var totalOpen = 0, totalN = 0;
+    keys.forEach(function(k) { totalOpen += (gates[k].open || 0); totalN += (gates[k].n || 0); });
+    if (badge) badge.textContent = totalN + ' total · ' + totalOpen + ' open';
+    var h = '';
+    keys.forEach(function(gate) {
+      var s = gates[gate];
+      var label = gateLabels[gate] || gate;
+      var decided = (s.tp || 0) + (s.sl || 0);
+      var wr = decided > 0 ? (s.tp / decided) : null;
+      var wrText = wr !== null ? (wr * 100).toFixed(0) + '%' : '—';
+      var wrCls = wr === null ? 'neu' : (wr < 0.40 ? 'good' : (wr < 0.55 ? 'warn' : 'bad'));
+      var netR = (s.net_r || 0);
+      var netRText = (netR >= 0 ? '+' : '') + netR.toFixed(1) + 'R';
+      // Positive net_r = rejected trades would have won = gate over-filtering
+      var netRCls = netR <= -0.5 ? 'good' : (netR >= 0.5 ? 'bad' : 'neu');
+      var saved = -netR;
+      var savedText = (saved >= 0 ? '+' : '') + saved.toFixed(1) + 'R';
+      var savedCls = saved >= 0.5 ? 'good' : (saved <= -0.5 ? 'bad' : 'neu');
+      h += '<tr>' +
+        '<td><span class="shadow-gate-name">' + escapeHtml(label) + '</span></td>' +
+        '<td>' + (s.n || 0) + '</td>' +
+        '<td><div class="shadow-chips">' +
+          (s.tp  ? '<span class="shadow-chip tp">'  + s.tp  + ' TP</span>'  : '') +
+          (s.sl  ? '<span class="shadow-chip sl">'  + s.sl  + ' SL</span>'  : '') +
+          (s.expired ? '<span class="shadow-chip exp">' + s.expired + ' exp</span>' : '') +
+        '</div></td>' +
+        '<td><span class="shadow-chip open">' + (s.open || 0) + '</span></td>' +
+        '<td><span class="shadow-winrate ' + wrCls + '">' + wrText + '</span></td>' +
+        '<td><span class="shadow-netr ' + netRCls + '">' + netRText + '</span></td>' +
+        '<td><span class="shadow-netr ' + savedCls + '">' + savedText + '</span></td>' +
+        '</tr>';
+    });
+    tbody.innerHTML = h;
   });
 }
 
@@ -2297,7 +2333,7 @@ function refresh() {
   updateTrades();
   updateLogs();
   updateStatus();
-  updateModelHealth();
+  updateShadowStats();
   updateHealth();
   updateExchangeMode();
   updateBotUI();

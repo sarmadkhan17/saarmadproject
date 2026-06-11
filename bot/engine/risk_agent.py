@@ -172,6 +172,16 @@ class RiskDecisionAgent:
                     f"shorts blocked: STRONG_TREND breadth={breadth:.0%}"
                 )
                 return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+            # Symmetric capitulation guard: a washed-out, very-bearish-breadth
+            # market is squeeze territory — don't keep shorting the exhausted
+            # side (mirror of the bull-breadth block above). Catches the zone
+            # just outside the regime gate's EXHAUSTION reclassification.
+            if action == "SELL" and bear_breadth >= 0.85:
+                reasons.append(f"shorts blocked: capitulation bear_breadth={bear_breadth:.0%}")
+                return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+            if action == "BUY" and breadth >= 0.85:
+                reasons.append(f"longs blocked: blow-off breadth={breadth:.0%}")
+                return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
             if action == "SELL" and breadth > 0.50:
                 penalty = min(0.15, (breadth - 0.50) * 1.5)
                 penalised_floor = round(min(
@@ -266,6 +276,7 @@ class RiskDecisionAgent:
         ok, reason = self.risk.can_open_trade(
             symbol=symbol, open_trades=open_trades,
             balance=balance, new_usdt=est_usdt, get_price_fn=get_price_fn,
+            side=("short" if action == "SELL" else "long"),
         )
         if not ok:
             reasons.append(reason)

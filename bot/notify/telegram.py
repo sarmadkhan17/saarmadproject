@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import dataclasses
 import yaml
 from core.config import get_telegram_config, DATA_DIR, BOT_ROOT
+from notify.nl_ops import NLOpsHandler
 
 log      = logging.getLogger("Notifier")
 DATA     = DATA_DIR
@@ -62,6 +63,10 @@ class TelegramNotifier:
 
         chat_type = "GROUP" if str(self.chat_id).startswith("-") else "PRIVATE"
         log.info(f"Telegram chat type: {chat_type} | ID: {self.chat_id}")
+
+        # Natural-language ops layer — interprets free-form messages into the
+        # existing command surface (read-only Q&A + confirmed actions).
+        self.nl = NLOpsHandler(self)
 
         if self.token:
             t = threading.Thread(target=self._poll_commands, daemon=True)
@@ -250,7 +255,10 @@ class TelegramNotifier:
                     if update_id >= max_offset:
                         max_offset = update_id + 1
                     msg  = update.get("message", {})
-                    text = msg.get("text", "").strip().lower()
+                    # Keep the raw, original-case text for the NL interpreter;
+                    # slash-command matching uses the lowercased form.
+                    raw_text = msg.get("text", "").strip()
+                    text = raw_text.lower()
                     chat = str(msg.get("chat", {}).get("id", ""))
 
                     # Only respond to authorized chat (group or private)
@@ -263,25 +271,36 @@ class TelegramNotifier:
 
                     if text.startswith("/htf"):
                         self.send("ℹ️ <b>HTF panel removed.</b> Use dashboard for settings.")
-                    else:
-                        {
-                            "/help":            self._cmd_help,
-                            "/start":           self._cmd_status,
-                            "/status":          self._cmd_status,
-                            "/agents":          self._cmd_agents,
-                            "/pnl":             self._cmd_pnl,
-                            "/trades":          self._cmd_trades,
-                            "/health":          self._cmd_health,
-                            "/switch_spot":     self._cmd_switch_spot,
-                            "/switch_futures":  self._cmd_switch_futures,
-                            "/restart":         self._cmd_restart,
-                            "/stop":            self._cmd_stop,
-                            "/mode":            self._cmd_current_mode,
-                            "/profile":         self._cmd_profile,
-                            "/profile_strict":  lambda: self._cmd_profile_set("STRICT"),
-                            "/profile_balanced": lambda: self._cmd_profile_set("BALANCED"),
-                            "/profile_aggressive": lambda: self._cmd_profile_set("AGGRESSIVE"),
-                        }.get(text, lambda: None)()
+                        continue
+
+                    handler = {
+                        "/help":            self._cmd_help,
+                        "/start":           self._cmd_status,
+                        "/status":          self._cmd_status,
+                        "/agents":          self._cmd_agents,
+                        "/pnl":             self._cmd_pnl,
+                        "/trades":          self._cmd_trades,
+                        "/health":          self._cmd_health,
+                        "/shadows":         self._cmd_shadows,
+                        "/switch_spot":     self._cmd_switch_spot,
+                        "/switch_futures":  self._cmd_switch_futures,
+                        "/restart":         self._cmd_restart,
+                        "/stop":            self._cmd_stop,
+                        "/mode":            self._cmd_current_mode,
+                        "/profile":         self._cmd_profile,
+                        "/profile_strict":  lambda: self._cmd_profile_set("STRICT"),
+                        "/profile_balanced": lambda: self._cmd_profile_set("BALANCED"),
+                        "/profile_aggressive": lambda: self._cmd_profile_set("AGGRESSIVE"),
+                    }.get(text)
+
+                    if handler is not None:
+                        handler()
+                    elif text.startswith("/"):
+                        pass  # unknown slash command — stay silent (unchanged)
+                    elif raw_text:
+                        # Free-form message → confirmation reply or NL interpreter.
+                        if not self.nl.maybe_confirm(raw_text, chat):
+                            self.nl.handle(raw_text, chat)
 
                 self.offset = max_offset
             except Exception as e:
@@ -297,13 +316,39 @@ class TelegramNotifier:
             "/agents  — Agent performance + tokens\n"
             "/pnl     — Current PnL\n"
             "/trades  — Open positions\n"
-            "/health  — Full system health\n\n"
+            "/health  — Full system health\n"
+            "/shadows — Hypothetical outcomes of rejected signals\n\n"
             "<b>⚙️ Control:</b>\n"
             "/switch_spot     — Switch to SPOT mode\n"
             "/switch_futures  — Switch to FUTURES mode\n"
             "/restart         — Restart bot\n"
             "/stop            — Stop bot\n"
         )
+
+    def _cmd_shadows(self):
+        """Per-gate hypothetical outcomes of rejected signals (ShadowTracker)."""
+        try:
+            from agents.shadow_tracker import load_stats
+            mode = self._get_mode_from_env()
+            stats = load_stats(DATA / "trade_memory.db", mode, days=30)
+            if not stats:
+                self.send("👻 <b>Shadow trades</b>\nNo shadow data yet — "
+                          "stats appear once rejected signals resolve.")
+                return
+            lines = [f"👻 <b>Shadow trades</b> ({mode.upper()}, last 30d)\n",
+                     "<i>What rejected signals would have done:</i>\n"]
+            for gate, s in sorted(stats.items()):
+                verdict = "⚠️ may be too strict" if (s["tp"] + s["sl"]) >= 5 and s["win_rate"] >= 0.55 \
+                    else ("✅ protective" if (s["tp"] + s["sl"]) >= 5 and s["win_rate"] <= 0.40 else "⏳ gathering data")
+                lines.append(
+                    f"<b>{gate}</b> — {s['n']} tracked, {s['open']} open\n"
+                    f"  TP {s['tp']} / SL {s['sl']} / expired {s['expired']} · "
+                    f"hyp. WR {s['win_rate']:.0%}\n"
+                    f"  net {s['net_r']:+.1f}R (gate avoided {-s['net_r']:+.1f}R) {verdict}\n"
+                )
+            self.send("\n".join(lines))
+        except Exception as e:
+            self.send(f"⚠️ Shadow stats unavailable: {e}")
 
     def _get_mode_from_env(self):
         """Read BOT_MODE from .env file."""

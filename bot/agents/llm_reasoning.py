@@ -326,6 +326,10 @@ Exit reason: {trade.get('close_reason','')}"""
 META_JUDGE_SYSTEM = """You are a quantitative trading strategist reviewing a series of trade critiques.
 Identify consistent patterns in what went wrong and what went right.
 Produce updated rules that should be injected into the trading agent's reasoning.
+You may also receive shadow-trade statistics: hypothetical outcomes of signals the
+gates REJECTED. A high hypothetical win rate on a gate suggests it is too strict
+(blocking winners); a low one means it is protective. Use this as evidence in your
+rules, but do not propose changing numeric gate thresholds — describe the pattern.
 
 Output ONLY valid JSON:
 {
@@ -340,8 +344,10 @@ Output ONLY valid JSON:
 }"""
 
 
-def meta_judge_synthesize(critiques: list) -> Optional[dict]:
-    """Call DeepSeek R1 to synthesize lessons from multiple Judge critiques."""
+def meta_judge_synthesize(critiques: list, shadow_stats: Optional[dict] = None) -> Optional[dict]:
+    """Call DeepSeek R1 to synthesize lessons from multiple Judge critiques.
+    `shadow_stats` (optional) = per-gate hypothetical outcomes of rejected
+    signals from ShadowTracker.gate_stats() — appended as extra evidence."""
     if len(critiques) < 5:
         log.info("Meta-Judge: fewer than 5 critiques — skipping")
         return None
@@ -356,6 +362,16 @@ def meta_judge_synthesize(critiques: list) -> Optional[dict]:
         )
 
     user_msg = f"Review these {len(critiques)} trade critiques and synthesize updated rules:\n{critique_text}"
+
+    if shadow_stats:
+        lines = ["\nShadow outcomes of REJECTED signals (last 30d, hypothetical):"]
+        for gate, s in sorted(shadow_stats.items()):
+            lines.append(
+                f"- {gate} gate: {s['n']} rejections tracked, {s['resolved']} resolved — "
+                f"hyp. win rate {s['win_rate']:.0%}, net {s['net_r']:+.1f}R "
+                f"(gate avoided {-s['net_r']:+.1f}R)"
+            )
+        user_msg += "\n".join(lines)
 
     try:
         client = _get_client()
@@ -381,4 +397,69 @@ def meta_judge_synthesize(critiques: list) -> Optional[dict]:
         return parsed
     except Exception as e:
         log.warning(f"Meta-Judge LLM error: {e}")
+        return None
+
+
+# ── Natural-language ops intent ───────────────────────────────────────────────
+
+def nl_intent(text: str, tools: list[dict]) -> Optional[dict]:
+    """Map a free-form Telegram message to one tool from a fixed allow-list.
+
+    Used by the natural-language ops layer (bot/notify/nl_ops.py). The model may
+    ONLY pick a tool name present in `tools`; the caller validates the result
+    against the allow-list and never executes free-form output. Returns
+    ``{"tool": str, "args": dict, "reply": str}`` or None on failure (the caller
+    then shows a graceful fallback).
+
+    `tools` is a list of ``{"name", "description", "args"}`` dicts describing the
+    available read/action intents.
+    """
+    if not (text or "").strip():
+        return None
+    tool_lines = "\n".join(
+        f"- {t['name']}: {t['description']}"
+        + (f" (args: {', '.join(t['args'])})" if t.get("args") else "")
+        for t in tools
+    )
+    allowed = [t["name"] for t in tools]
+    system_content = (
+        "You are the command interpreter for a crypto trading bot's Telegram. "
+        "Map the user's message to exactly ONE tool from the list below. "
+        "You may ONLY use a tool name from this list:\n"
+        f"{tool_lines}\n\n"
+        "If the message asks about a specific coin (e.g. ETH, BTC), put its "
+        "base symbol uppercase in args.symbol. If nothing fits, use tool "
+        "\"unknown\". Respond ONLY with compact JSON: "
+        '{"tool": "<name>", "args": {...}, "reply": "<one short friendly '
+        'sentence acknowledging the request>"}. No markdown, no extra text.'
+    )
+    try:
+        client = _get_client()
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user",   "content": text[:500]},
+            ],
+            temperature=0.0,
+            max_tokens=120,
+        )
+        try:
+            usage_tracker.record("deepseek-chat",
+                                 resp.usage.prompt_tokens,
+                                 resp.usage.completion_tokens)
+        except Exception:
+            pass
+        parsed = _parse_json_response(resp.choices[0].message.content, "NL-intent")
+        if parsed is None:
+            return None
+        tool = str(parsed.get("tool", "")).strip()
+        if tool not in allowed:
+            tool = "unknown"
+        args = parsed.get("args") or {}
+        if not isinstance(args, dict):
+            args = {}
+        return {"tool": tool, "args": args, "reply": str(parsed.get("reply", ""))[:200]}
+    except Exception as e:
+        log.warning(f"NL-intent LLM error: {e}")
         return None

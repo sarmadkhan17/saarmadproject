@@ -557,6 +557,44 @@ def agent_performance():
     return jsonify({})
 
 
+@app.route("/api/shadow_stats")
+def shadow_stats():
+    """Per-gate hypothetical outcomes of rejected signals (ShadowTracker)."""
+    import sqlite3
+    db = DATA / "trade_memory.db"
+    mode = _detect_active_mode() or "futures"
+    if not db.exists():
+        return jsonify({"mode": mode, "gates": {}})
+    try:
+        cutoff = (datetime.now(LOCAL_TZ) - timedelta(days=30)).isoformat()
+        with sqlite3.connect(str(db), timeout=10) as c:
+            rows = c.execute(
+                """SELECT gate,
+                          COUNT(*),
+                          SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status='sl' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END),
+                          COALESCE(SUM(CASE WHEN status!='open' THEN outcome_r END), 0)
+                   FROM shadow_trades
+                   WHERE mode=? AND created_at>=?
+                   GROUP BY gate""",
+                (mode, cutoff),
+            ).fetchall()
+        gates = {}
+        for gate, n, tp, sl, expired, net_r in rows:
+            tp, sl, expired = int(tp or 0), int(sl or 0), int(expired or 0)
+            decided = tp + sl
+            gates[gate] = {
+                "n": int(n), "tp": tp, "sl": sl, "expired": expired,
+                "open": int(n) - (tp + sl + expired),
+                "win_rate": round(tp / decided, 3) if decided else 0.0,
+                "net_r": round(float(net_r or 0.0), 2),
+            }
+        return jsonify({"mode": mode, "gates": gates})
+    except sqlite3.Error:
+        return jsonify({"mode": mode, "gates": {}})
+
+
 @app.route("/api/token_budget")
 def token_budget():
     # v5: reads deepseek_usage.json (was Groq's token_budget.json)

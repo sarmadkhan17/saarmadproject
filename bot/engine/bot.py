@@ -49,6 +49,7 @@ from engine.correlation_check import CorrelationCheck
 from agents.macro_context    import MacroContextAgent
 from agents.microstructure   import MicrostructureAgent
 from agents.trade_memory     import TradeMemory
+from agents.shadow_tracker   import ShadowTracker
 from agents import trade_memory as trade_memory_mod
 from agents import vector_store
 from agents import llm_reasoning
@@ -336,6 +337,19 @@ class BaseBot:
         except Exception as e:
             self.log.warning(f"Embedding backfill skipped: {e}")
 
+        # Shadow tracker: rejected signals tracked forward as hypothetical
+        # trades so Meta-Judge/operator learn whether gates block winners
+        # or save losses. Observational only — never auto-tunes thresholds.
+        try:
+            self.shadow_tracker = ShadowTracker(
+                DATA_DIR / "trade_memory.db", self.MODE,
+                self.config.get("shadow_tracker") or {},
+            )
+        except Exception as e:
+            self.log.warning(f"ShadowTracker disabled: {e}")
+            self.shadow_tracker = None
+        self._shadow_cycle_count = 0
+
         # New agents
         self.macro_context = MacroContextAgent(get_coingecko_key())
         self.microstructure = MicrostructureAgent()
@@ -487,6 +501,49 @@ class BaseBot:
         tf = self.config.get("scanner", {}).get("timeframe", "15m")
         return self.feed.get_atr(symbol, tf, 14)
 
+    def _record_shadow(self, symbol, gate, reason, ensemble, micro, regime, macro):
+        """Record a rejected directional signal as a shadow trade.
+        Must never break the scan loop — swallow everything."""
+        if not self.shadow_tracker:
+            return
+        try:
+            self.shadow_tracker.record_rejection(
+                symbol=symbol,
+                side="long" if ensemble.action == "BUY" else "short",
+                gate=gate, reason=reason,
+                entry_price=self.get_price(symbol),
+                atr=self.get_atr(symbol),
+                profile=self.profile,
+                ctx={
+                    "regime": regime,
+                    "ensemble_score": ensemble.net_score,
+                    "confidence": ensemble.confidence,
+                    "ob_imbalance": getattr(micro, "ob_imbalance", 0.0),
+                    "cvd_direction": getattr(micro, "cvd_direction", None),
+                    "cvd_divergence": getattr(micro, "cvd_divergence", False),
+                    "btc_d": (macro or {}).get("btc_d", 0.0),
+                    "usdt_d": (macro or {}).get("usdt_d", 0.0),
+                },
+            )
+        except Exception as e:
+            self.log.debug(f"shadow record failed {symbol}: {e}")
+
+    def _resolve_shadows(self):
+        """Resolve open shadow trades against candles every N cycles."""
+        if not self.shadow_tracker:
+            return
+        try:
+            every = int((self.config.get("shadow_tracker") or {})
+                        .get("resolve_every_n_cycles", 10))
+            self._shadow_cycle_count += 1
+            if self._shadow_cycle_count % max(1, every) != 0:
+                return
+            resolved = self.shadow_tracker.resolve_open(self.feed.fetch_ohlcv)
+            if resolved:
+                self.log.info(f"SHADOW resolved {len(resolved)} hypothetical trades")
+        except Exception as e:
+            self.log.debug(f"shadow resolve failed: {e}")
+
     def get_usdt_balance(self) -> float:
         try:
             bal = self.exchange.fetch_balance()
@@ -566,8 +623,12 @@ class BaseBot:
         def _get_ohlcv_cached(symbol):
             return ohlcv_cache.get(symbol)
 
+        # Reversal exit uses the latest regime context. check_exits runs before
+        # this cycle's regime detection, so we read the previous cycle's context
+        # (stored on self._regime_ctx) — fine since reversal is 4h/15-min based.
         exits = self.risk.check_exits(
-            trades, self.get_price, _get_atr_cached, _get_ohlcv_cached, self.profile
+            trades, self.get_price, _get_atr_cached, _get_ohlcv_cached, self.profile,
+            reversal=getattr(self, "_regime_ctx", None),
         )
         for trade, price, reason, fraction in exits:
             close_amount = trade["amount"] * fraction
@@ -719,6 +780,8 @@ class BaseBot:
                     "strategy": f"ensemble:{ensemble.net_score:+.3f}", "timeframe": "AUTO",
                     "timestamp": datetime.now(LOCAL_TZ).isoformat(),
                 })
+                self._record_shadow(symbol, "microstructure", micro.reasoning,
+                                    ensemble, micro, regime, macro)
                 return
 
             # ── Gate 5: DeepSeek Actor reasoning ────────────────────────
@@ -737,6 +800,10 @@ class BaseBot:
                     "strategy": f"ensemble:{ensemble.net_score:+.3f}", "timeframe": "AUTO",
                     "timestamp": datetime.now(LOCAL_TZ).isoformat(),
                 })
+                self._record_shadow(
+                    symbol, "actor_prefilter",
+                    f"conf={ensemble.confidence:.2f} < {self.profile.min_confidence:.2f}",
+                    ensemble, micro, regime, macro)
                 return
 
             # Short-TTL verdict cache (Fix #5): an identical, quantized setup
@@ -816,6 +883,8 @@ class BaseBot:
                     "strategy": f"ensemble:{ensemble.net_score:+.3f}", "timeframe": "AUTO",
                     "timestamp": datetime.now(LOCAL_TZ).isoformat(),
                 })
+                self._record_shadow(symbol, "actor", actor.reasoning,
+                                    ensemble, micro, regime, macro)
                 return
 
             # Blend Actor confidence into the ensemble result for sizing.
@@ -851,6 +920,8 @@ class BaseBot:
                                    "regime": regime},
                     "timestamp": datetime.now(LOCAL_TZ).isoformat(),
                 })
+                self._record_shadow(symbol, "risk", " | ".join(decision.reasons),
+                                    ensemble, micro, regime, macro)
                 return
 
             self.state.add_signal({
@@ -1004,7 +1075,14 @@ class BaseBot:
                     new_since_last = self.trade_memory.critiques_since_last_meta()
                     if new_since_last >= 20:
                         critiques = self.trade_memory.get_recent_critiques(20)
-                        meta = llm_reasoning.meta_judge_synthesize(critiques)
+                        shadow_stats = None
+                        if self.shadow_tracker:
+                            try:
+                                shadow_stats = self.shadow_tracker.gate_stats()
+                            except Exception:
+                                pass
+                        meta = llm_reasoning.meta_judge_synthesize(
+                            critiques, shadow_stats=shadow_stats)
                         if meta:
                             self.trade_memory.save_meta_rules(meta)
                             self.log.info(f"META-JUDGE: {meta.get('summary','')[:120]}")
@@ -1500,6 +1578,7 @@ class BaseBot:
         self._maybe_swap_profile()
         self.sync_with_exchange()
         self.check_exits()
+        self._resolve_shadows()
 
         balance     = self.get_usdt_balance()
         open_trades = self.state.get_open_trades()
@@ -1553,6 +1632,8 @@ class BaseBot:
             regime_ctx["hmm_regime"] = gate_regime   # alias for downstream code
             regime_ctx["macro_universe"]  = macro["universe"]
             regime_ctx["macro_sentiment"] = macro["sentiment"]
+        # Persist for next cycle's check_exits (two-stage reversal exit).
+        self._regime_ctx = regime_ctx
         try:
             self.state.state["live_strategy"] = {
                 "eff_min_conf":    regime_ctx.get("min_conf", self.min_conf) if regime_ctx else self.min_conf,

@@ -62,6 +62,8 @@ class MarketRegimeGate:
     def __init__(self):
         self._cache      = None
         self._cache_time = None
+        self._prev_breadth = None      # breadth at the previous (cache-miss) compute
+        self._reversal     = {}        # reversal signal computed alongside _compute
 
     def detect(self, feed, watchlist: list) -> dict:
         now = datetime.now(LOCAL_TZ)
@@ -69,6 +71,9 @@ class MarketRegimeGate:
                 (now - self._cache_time).total_seconds() < self.CACHE_SECS):
             return self._cache
         result = self._compute(feed, watchlist)
+        # Merge the reversal signal (_compute stashes it on self._reversal so we
+        # don't have to thread **reversal through every classification branch).
+        result = {**result, **getattr(self, "_reversal", {})}
         self._cache      = result
         self._cache_time = now
         log.info(
@@ -128,6 +133,32 @@ class MarketRegimeGate:
         trend_direction = "BULLISH" if btc_bullish else ("BEARISH" if btc_bearish else "NEUTRAL")
         trend_strength  = "STRONG" if adx_val > 30 else ("MODERATE" if adx_val > 22 else "WEAK")
 
+        # Reversal signal for the open book (two-stage exit). Stashed on self so
+        # detect() can merge it without threading **reversal through every branch.
+        self._reversal = self._reversal_signal(breadth, bear_breadth, chg_4h)
+
+        # ── Exhaustion guard ─────────────────────────────────────────────────
+        # A fully one-sided, washed-out market is where violent mean-reversion
+        # squeezes happen. Stop ADDING to the exhausted side (symmetric to the
+        # bull-breadth short block in risk_agent Gate 4b). Placed after CRASH /
+        # HIGH_VOLATILITY so a genuine ongoing crash still allows shorts; this
+        # fires once price stops falling but breadth stays pinned at the extreme.
+        if not (chg_4h < -0.05 or chg_24h < -0.10) and vol_ratio <= 2.0:
+            if breadth <= 0.10:   # capitulation bottom — no new shorts
+                return dict(regime="EXHAUSTION_BOTTOM", gate=True,
+                            allow_longs=True, allow_shorts=False,
+                            trend_direction="BEARISH", trend_strength=trend_strength,
+                            min_conf=0.65, size_mult=0.30,
+                            breadth=breadth, bear_breadth=bear_breadth,
+                            vol_ratio=vol_ratio, adx=adx_val)
+            if breadth >= 0.90:   # blow-off top — no new longs
+                return dict(regime="EXHAUSTION_TOP", gate=True,
+                            allow_longs=False, allow_shorts=True,
+                            trend_direction="BULLISH", trend_strength=trend_strength,
+                            min_conf=0.65, size_mult=0.30,
+                            breadth=breadth, bear_breadth=bear_breadth,
+                            vol_ratio=vol_ratio, adx=adx_val)
+
         if chg_4h < -0.05 or chg_24h < -0.10:
             # gate=True: allow short entries; allow_longs=False blocks the other side
             return dict(regime="CRASH", gate=True,
@@ -184,12 +215,64 @@ class MarketRegimeGate:
                     breadth=breadth, bear_breadth=bear_breadth,
                     vol_ratio=vol_ratio, adx=adx_val)
 
+    def _reversal_signal(self, breadth: float, bear_breadth: float,
+                         chg_4h: float) -> dict:
+        """Two-stage reversal detector for the open book.
+
+        Stage 1 (reversal_risk): the market is parked at a one-sided extreme, so
+        positions on the exhausted side face squeeze risk → tighten their trail.
+        Stage 2 (reversal_confirmed): a breadth thrust off the extreme (or a clear
+        BTC 4h momentum flip out of it) confirms the turn → hard-cut that side.
+
+        Direction "up" = market reverting upward (bad for shorts);
+        "down" = reverting downward (bad for longs).
+        """
+        prev = self._prev_breadth
+        self._prev_breadth = breadth
+
+        risk = None
+        if bear_breadth >= 0.85:
+            risk = "up"
+        elif breadth >= 0.85:
+            risk = "down"
+
+        confirmed = None
+        if prev is not None:
+            if prev <= 0.20 and (breadth - prev) >= 0.25:
+                confirmed = "up"
+            elif prev >= 0.80 and (prev - breadth) >= 0.25:
+                confirmed = "down"
+        if confirmed is None:
+            from_bottom = (prev is not None and prev <= 0.20) or risk == "up"
+            from_top    = (prev is not None and prev >= 0.80) or risk == "down"
+            if from_bottom and chg_4h > 0.02:
+                confirmed = "up"
+            elif from_top and chg_4h < -0.02:
+                confirmed = "down"
+
+        return {"reversal_risk": risk, "reversal_confirmed": confirmed}
+
     def _compute_from_values(self, adx: float, vol_ratio: float, breadth: float,
                              bear_breadth: float, chg_4h: float, chg_24h: float,
                              btc_bullish: bool = False, btc_bearish: bool = False) -> dict:
         """Test helper: run classification logic without fetching live data."""
         trend_direction = "BULLISH" if btc_bullish else ("BEARISH" if btc_bearish else "NEUTRAL")
         trend_strength  = "STRONG" if adx > 30 else ("MODERATE" if adx > 22 else "WEAK")
+        if not (chg_4h < -0.05 or chg_24h < -0.10) and vol_ratio <= 2.0:
+            if breadth <= 0.10:
+                return dict(regime="EXHAUSTION_BOTTOM", gate=True,
+                            allow_longs=True, allow_shorts=False,
+                            trend_direction="BEARISH", trend_strength=trend_strength,
+                            min_conf=0.65, size_mult=0.30,
+                            breadth=breadth, bear_breadth=bear_breadth,
+                            vol_ratio=vol_ratio, adx=adx)
+            if breadth >= 0.90:
+                return dict(regime="EXHAUSTION_TOP", gate=True,
+                            allow_longs=False, allow_shorts=True,
+                            trend_direction="BULLISH", trend_strength=trend_strength,
+                            min_conf=0.65, size_mult=0.30,
+                            breadth=breadth, bear_breadth=bear_breadth,
+                            vol_ratio=vol_ratio, adx=adx)
         if chg_4h < -0.05 or chg_24h < -0.10:
             return dict(regime="CRASH", gate=True, allow_longs=False, allow_shorts=True,
                         trend_direction="BEARISH", trend_strength="STRONG",
@@ -232,6 +315,11 @@ class MarketRegimeGate:
                     breadth=0.5, bear_breadth=0.5, vol_ratio=1.0, adx=25.0)
 
     def _calc_adx(self, high, low, close, period=14):
+        # Wilder smoothing (alpha=1/period). The previous ewm(span=period) form
+        # was far too reactive and produced impossible ADX values (80-91) on
+        # sustained one-way moves, which mis-classified washed-out markets as
+        # "STRONG_TREND" and triggered the +0.10 ADX size bonus. Real Wilder ADX
+        # almost never exceeds ~60, so we also clamp as a hard guard.
         try:
             up       = high.diff()
             down     = -low.diff()
@@ -242,11 +330,12 @@ class MarketRegimeGate:
                 (high - close.shift()).abs(),
                 (low  - close.shift()).abs(),
             ], axis=1).max(axis=1)
-            atr      = tr.ewm(span=period).mean()
-            plus_di  = 100 * plus_dm.ewm(span=period).mean() / (atr + 1e-9)
-            minus_di = 100 * minus_dm.ewm(span=period).mean() / (atr + 1e-9)
+            wilder   = dict(alpha=1.0 / period, adjust=False)
+            atr      = tr.ewm(**wilder).mean()
+            plus_di  = 100 * plus_dm.ewm(**wilder).mean() / (atr + 1e-9)
+            minus_di = 100 * minus_dm.ewm(**wilder).mean() / (atr + 1e-9)
             dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
-            return dx.ewm(span=period).mean()
+            return dx.ewm(**wilder).mean().clip(upper=60.0)
         except Exception:
             return pd.Series([25.0] * len(close), index=close.index)
 
@@ -352,6 +441,8 @@ class ExitEngine:
         profile=None,
         candle_df=None,
         strategy_type: str = "momentum",
+        reversal_risk: str = None,
+        reversal_confirmed: str = None,
     ) -> tuple:
         """Returns (fraction_to_close, reason).  fraction=0.0 → hold.
 
@@ -360,6 +451,11 @@ class ExitEngine:
         trend reversal) is skipped — an MR trade *expects* to be underwater
         as price stretches toward the extreme; cutting it there destroys the
         edge. The ATR trailing stop still caps the downside.
+
+        reversal_risk / reversal_confirmed: portfolio-level reversal signal
+        ("up" = market reverting upward, bad for shorts; "down" = bad for longs).
+        Stage 1 (risk) tightens the ATR trail on the wrong-side trade; Stage 2
+        (confirmed) hard-cuts it. See MarketRegimeGate._reversal_signal.
         """
         is_short = side in ("short", "sell")
 
@@ -369,6 +465,18 @@ class ExitEngine:
 
         entry_atr = self._entry_atrs.get(trade_id, max(atr, 1e-9))
         self._update_peak(trade_id, price, atr, is_short)
+
+        # ── Two-stage reversal handling (regime turned against the open book) ─
+        wrong_side_confirmed = (
+            (reversal_confirmed == "up" and is_short) or
+            (reversal_confirmed == "down" and not is_short)
+        )
+        if wrong_side_confirmed:
+            return 1.0, f"REVERSAL_CUT (regime flipped {reversal_confirmed})"
+        reversal_tighten = (
+            (reversal_risk == "up" and is_short) or
+            (reversal_risk == "down" and not is_short)
+        )
 
         # No-ATR fallback — hard 2.5% stop to keep trades safe without data
         if atr <= 0:
@@ -383,6 +491,10 @@ class ExitEngine:
         tp1_fraction       = getattr(profile, "tp1_fraction",       0.40)
         tp1_r_mult         = getattr(profile, "tp1_r_mult",         1.0)
         trail_mult         = getattr(profile, "trail_atr_mult",      self._default_trail)
+        if reversal_tighten:
+            # Stage 1: squeeze risk against this side — halve the trail so the
+            # position exits on the first real adverse move instead of riding it.
+            trail_mult *= 0.5
         early_exit_enabled = getattr(profile, "early_exit_enabled",  True)
         dynamic_tp_enabled = getattr(profile, "dynamic_tp_enabled",  True)
         tp_backstop_mult   = getattr(profile, "take_profit_atr_mult", 2.5)
@@ -835,14 +947,19 @@ class RiskManager:
         self.sl_min_pct   = risk.get("stop_loss_min_pct", 0.015)
 
     def check_exits(self, open_trades, get_price_fn, get_atr_fn,
-                    get_ohlcv_fn=None, profile=None):
+                    get_ohlcv_fn=None, profile=None, reversal=None):
         """
         Evaluate all open trades for exit conditions via ExitEngine.
         get_ohlcv_fn(symbol) → pd.DataFrame | None  (trading-timeframe candles, limit≈30)
         profile → TradingProfile (controls TP1, trail multiplier, early-exit flags)
+        reversal → dict | None with reversal_risk / reversal_confirmed (two-stage
+                   reversal exit; sourced from the latest regime context).
         """
         exits = []
         now   = datetime.now(LOCAL_TZ)
+        rev = reversal or {}
+        rev_risk      = rev.get("reversal_risk")
+        rev_confirmed = rev.get("reversal_confirmed")
         for trade in open_trades:
             price = get_price_fn(trade["symbol"])
             if price is None or price <= 0:
@@ -869,7 +986,8 @@ class RiskManager:
             candle_df = get_ohlcv_fn(trade["symbol"]) if get_ohlcv_fn else None
 
             fraction, reason = self.exit_engine.should_exit(
-                trade_id, entry, price, atr, side, profile, candle_df
+                trade_id, entry, price, atr, side, profile, candle_df,
+                reversal_risk=rev_risk, reversal_confirmed=rev_confirmed,
             )
             if fraction > 0:
                 exits.append((trade, price, reason, fraction))
@@ -877,11 +995,27 @@ class RiskManager:
         self.exit_engine.flush()
         return exits
 
-    def can_open_trade(self, symbol, open_trades, balance, new_usdt, get_price_fn):
+    # Max concurrent positions on a single side. Caps net directional exposure
+    # so the whole book can't become one correlated bet (the Jun-6/7 failure was
+    # 8 simultaneous shorts that all lost together on a bounce).
+    MAX_PER_SIDE = 5
+
+    def can_open_trade(self, symbol, open_trades, balance, new_usdt, get_price_fn,
+                       side: str = None):
         ok, r = self.breaker.can_trade(balance)
         if not ok: return False, r
         if any(t["symbol"] == symbol for t in open_trades):
             return False, f"Already holding {symbol}"
+        if side is not None:
+            shorts = ("short", "sell")
+            want_short = side in shorts
+            same_side = sum(
+                1 for t in open_trades
+                if (t.get("side") in shorts) == want_short
+            )
+            if same_side >= self.MAX_PER_SIDE:
+                label = "short" if want_short else "long"
+                return False, f"Max {self.MAX_PER_SIDE} {label} positions open (net-direction cap)"
         ok, r = self.correlation.is_allowed(symbol, open_trades)
         if not ok: return False, f"Correlation: {r}"
         ok, r = self.heat.can_add_position(open_trades, balance, new_usdt, get_price_fn)

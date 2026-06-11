@@ -44,6 +44,15 @@ scanner:
   min_volume_usdt: 100000000
   rescan_hours: 4
   top_n: 20
+shadow_tracker:
+  # Forward-tracks REJECTED signals as hypothetical trades (same ATR SL/TP a
+  # real trade would have used) so Meta-Judge/operator learn whether gates
+  # block winners or save losses. Observational only — never auto-tunes.
+  enabled: true
+  max_open: 60                 # cap on concurrent open shadows
+  max_age_hours: 48            # unresolved after this → expired (mark-to-market)
+  per_symbol_cooldown_min: 60  # dedup re-fired rejections per (symbol, side)
+  resolve_every_n_cycles: 10   # check outcomes every ~10 min at 60s scans
 strategy:
   # NOTE: min_confidence / min_votes / htf_filter_mode here are display/legacy only.
   # The live entry gates use the TradingProfile preset (see bot/engine/profiles.py).

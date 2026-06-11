@@ -1,0 +1,333 @@
+"""
+ShadowTracker — forward outcome tracking for REJECTED signals.
+
+When a directional signal (ensemble said BUY/SELL) is rejected at a gate
+(microstructure kill, Actor pre-filter, Actor rejection, risk gates), the
+bot records a hypothetical "shadow trade": entry = price at rejection,
+SL/TP = the exact ATR math a real trade would have used. Open shadows are
+resolved forward against live candles — did the hypothetical trade hit TP
+or SL first? — closing the survivorship-bias hole where the learning loop
+(Judge/Meta-Judge) only ever sees trades that were taken.
+
+Strictly observational: per-gate stats are surfaced to the Meta-Judge
+prompt and to the operator (/shadows). Nothing here auto-tunes thresholds.
+Forward paper data only — no historical replay, no LLM calls, no embeddings.
+
+Shares data/trade_memory.db with TradeMemory (same connection-per-op +
+mode-column conventions); shadows are learning data, not hot bot state.
+"""
+
+import logging
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, Optional
+
+try:
+    from core.tz import LOCAL_TZ          # bot runtime (sys.path = bot/)
+except ImportError:
+    from bot.core.tz import LOCAL_TZ      # tests import via the bot. package
+
+log = logging.getLogger("ShadowTracker")
+
+# SL geometry must mirror ExecutionEngine._place_sl so shadow outcomes are
+# comparable to real trades.
+SL_MIN_PCT = 0.015   # SL never closer than 1.5% of entry
+SL_MAX_PCT = 0.25    # SL never further than 25% of entry
+
+
+def _to_utc_naive(dt: datetime) -> datetime:
+    """Normalize any datetime to naive UTC (DataFeed candle index convention)."""
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+class ShadowTracker:
+    def __init__(self, db_path: Path, mode: str, cfg: Optional[dict] = None):
+        cfg = cfg or {}
+        db_path = Path(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path = str(db_path)
+        self.mode = mode
+        self.enabled = bool(cfg.get("enabled", True))
+        self.max_open = int(cfg.get("max_open", 60))
+        self.max_age_hours = float(cfg.get("max_age_hours", 48))
+        self.cooldown_min = float(cfg.get("per_symbol_cooldown_min", 60))
+        self._init_db()
+
+    def _conn(self):
+        return sqlite3.connect(self.db_path, timeout=10)
+
+    def _init_db(self):
+        with self._conn() as c:
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_trades (
+                id TEXT PRIMARY KEY,
+                mode TEXT, symbol TEXT, side TEXT,
+                gate TEXT, reason TEXT,
+                entry_price REAL, atr REAL,
+                sl_price REAL, tp_price REAL, r_target REAL,
+                regime TEXT, ensemble_score REAL, confidence REAL,
+                ob_imbalance REAL, cvd_direction TEXT, cvd_divergence INTEGER,
+                btc_d REAL, usdt_d REAL,
+                created_at TEXT,
+                status TEXT DEFAULT 'open',
+                resolved_at TEXT, resolve_price REAL,
+                outcome_r REAL
+            )""")
+            c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_shadow_open
+            ON shadow_trades(mode, status)""")
+
+    # ── capture ──────────────────────────────────────────────────────────
+
+    def record_rejection(self, symbol: str, side: str, gate: str, reason: str,
+                         entry_price: float, atr: float, profile,
+                         ctx: dict) -> Optional[str]:
+        """Record a rejected signal as an open shadow. Returns the shadow id,
+        or None when skipped (disabled / bad inputs / cooldown / cap)."""
+        if not self.enabled:
+            return None
+        if entry_price is None or atr is None or entry_price <= 0 or atr <= 0:
+            return None
+
+        now = datetime.now(LOCAL_TZ)
+        try:
+            with self._conn() as c:
+                n_open = c.execute(
+                    "SELECT COUNT(*) FROM shadow_trades WHERE mode=? AND status='open'",
+                    (self.mode,),
+                ).fetchone()[0]
+                if n_open >= self.max_open:
+                    return None
+
+                if self.cooldown_min > 0:
+                    # The 30-60s scan + Actor verdict cache re-fires the same
+                    # rejection every cycle — dedup per (symbol, side),
+                    # counting resolved shadows too.
+                    cutoff = (now - timedelta(minutes=self.cooldown_min)).isoformat()
+                    recent = c.execute(
+                        "SELECT 1 FROM shadow_trades "
+                        "WHERE mode=? AND symbol=? AND side=? AND created_at>=? LIMIT 1",
+                        (self.mode, symbol, side, cutoff),
+                    ).fetchone()
+                    if recent:
+                        return None
+
+                sl_price, tp_price = self._sl_tp(side, entry_price, atr, profile)
+                sl_dist = abs(entry_price - sl_price)
+                tp_dist = abs(tp_price - entry_price)
+                r_target = tp_dist / sl_dist if sl_dist > 0 else 0.0
+
+                sid = uuid.uuid4().hex
+                c.execute(
+                    """INSERT INTO shadow_trades
+                       (id, mode, symbol, side, gate, reason,
+                        entry_price, atr, sl_price, tp_price, r_target,
+                        regime, ensemble_score, confidence,
+                        ob_imbalance, cvd_direction, cvd_divergence,
+                        btc_d, usdt_d, created_at, status)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')""",
+                    (
+                        sid, self.mode, symbol, side, gate, str(reason)[:300],
+                        float(entry_price), float(atr),
+                        float(sl_price), float(tp_price), float(r_target),
+                        ctx.get("regime"),
+                        float(ctx.get("ensemble_score", 0) or 0),
+                        float(ctx.get("confidence", 0) or 0),
+                        float(ctx.get("ob_imbalance", 0) or 0),
+                        ctx.get("cvd_direction"),
+                        int(bool(ctx.get("cvd_divergence"))),
+                        float(ctx.get("btc_d", 0) or 0),
+                        float(ctx.get("usdt_d", 0) or 0),
+                        now.isoformat(),
+                    ),
+                )
+                log.debug(f"shadow {symbol} {side} gate={gate} sl={sl_price:.4f} tp={tp_price:.4f}")
+                return sid
+        except Exception as e:
+            log.debug(f"record_rejection failed {symbol}: {e}")
+            return None
+
+    @staticmethod
+    def _sl_tp(side: str, entry: float, atr: float, profile) -> tuple:
+        """Same geometry as ExecutionEngine._place_sl + the profile TP."""
+        sl_mult = getattr(profile, "stop_loss_atr_mult", 3.0)
+        tp_mult = getattr(profile, "take_profit_atr_mult", 6.0)
+        min_dist = entry * SL_MIN_PCT
+        if side == "long":
+            sl = entry - sl_mult * atr
+            sl = min(sl, entry - min_dist)
+            sl = max(sl, entry * (1 - SL_MAX_PCT))
+            tp = entry + tp_mult * atr
+        else:
+            sl = entry + sl_mult * atr
+            sl = max(sl, entry + min_dist)
+            sl = min(sl, entry * (1 + SL_MAX_PCT))
+            tp = entry - tp_mult * atr
+        return sl, tp
+
+    # ── resolution ───────────────────────────────────────────────────────
+
+    def resolve_open(self, fetch_ohlcv_fn: Callable, now: Optional[datetime] = None) -> list:
+        """Resolve open shadows against candles. `fetch_ohlcv_fn(symbol, tf, limit)`
+        must return a DataFrame with a DatetimeIndex (naive UTC, per DataFeed)
+        and high/low/close columns. Returns the list of resolved shadow dicts.
+        Never raises — a feed failure just leaves shadows open."""
+        now = now or datetime.now(LOCAL_TZ)
+        resolved = []
+        try:
+            with self._conn() as c:
+                c.row_factory = sqlite3.Row
+                rows = [dict(r) for r in c.execute(
+                    "SELECT * FROM shadow_trades WHERE mode=? AND status='open'",
+                    (self.mode,),
+                ).fetchall()]
+        except Exception as e:
+            log.debug(f"resolve_open query failed: {e}")
+            return []
+
+        by_symbol = {}
+        for r in rows:
+            by_symbol.setdefault(r["symbol"], []).append(r)
+
+        for symbol, shadows in by_symbol.items():
+            try:
+                df = fetch_ohlcv_fn(symbol, "15m", 200)
+            except Exception as e:
+                log.debug(f"resolve_open fetch failed {symbol}: {e}")
+                continue
+            if df is None or len(df) == 0:
+                continue
+            for shadow in shadows:
+                try:
+                    outcome = self._resolve_one(shadow, df, now)
+                    if outcome:
+                        resolved.append(outcome)
+                except Exception as e:
+                    log.debug(f"resolve failed {shadow.get('id')}: {e}")
+        return resolved
+
+    def _resolve_one(self, shadow: dict, df, now: datetime) -> Optional[dict]:
+        created = datetime.fromisoformat(shadow["created_at"])
+        created_utc = _to_utc_naive(created)
+
+        # Only candles opening at/after creation count — no lookahead into
+        # history that predates the rejection.
+        idx = df.index
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert("UTC").tz_localize(None)
+        mask = idx >= created_utc
+        window = df.loc[mask]
+
+        sl, tp = shadow["sl_price"], shadow["tp_price"]
+        is_long = shadow["side"] == "long"
+
+        status = None
+        resolve_price = None
+        outcome_r = None
+        for _, candle in window.iterrows():
+            hi, lo = float(candle["high"]), float(candle["low"])
+            hit_sl = (lo <= sl) if is_long else (hi >= sl)
+            hit_tp = (hi >= tp) if is_long else (lo <= tp)
+            if hit_sl:  # both in one candle → SL (conservative)
+                status, resolve_price, outcome_r = "sl", sl, -1.0
+                break
+            if hit_tp:
+                status, resolve_price, outcome_r = "tp", tp, float(shadow["r_target"])
+                break
+
+        if status is None:
+            age_h = (now - created).total_seconds() / 3600.0
+            if age_h <= self.max_age_hours or len(window) == 0:
+                return None
+            # Expire with signed mark-to-market R from the last close.
+            last_close = float(window["close"].iloc[-1])
+            risk = abs(shadow["entry_price"] - sl)
+            if risk <= 0:
+                return None
+            move = (last_close - shadow["entry_price"]) if is_long \
+                else (shadow["entry_price"] - last_close)
+            status, resolve_price, outcome_r = "expired", last_close, move / risk
+
+        try:
+            with self._conn() as c:
+                c.execute(
+                    "UPDATE shadow_trades SET status=?, resolved_at=?, "
+                    "resolve_price=?, outcome_r=? WHERE id=? AND status='open'",
+                    (status, now.isoformat(), resolve_price, outcome_r, shadow["id"]),
+                )
+        except Exception as e:
+            log.debug(f"resolve update failed {shadow['id']}: {e}")
+            return None
+
+        shadow.update(status=status, resolve_price=resolve_price, outcome_r=outcome_r)
+        log.info(
+            f"SHADOW {shadow['symbol']} {shadow['side']} gate={shadow['gate']} "
+            f"→ {status.upper()} ({outcome_r:+.2f}R)"
+        )
+        return shadow
+
+    # ── stats ────────────────────────────────────────────────────────────
+
+    def gate_stats(self, days: int = 30) -> dict:
+        return load_stats(self.db_path, self.mode, days)
+
+
+def load_stats(db_path, mode: str, days: int = 30) -> dict:
+    """Per-gate shadow stats — pure read, usable without a bot instance
+    (Telegram handler, dashboard). Returns {} when the DB/table is absent."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {}
+    cutoff = (datetime.now(LOCAL_TZ) - timedelta(days=days)).isoformat()
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as c:
+            rows = c.execute(
+                """SELECT gate,
+                          COUNT(*),
+                          SUM(CASE WHEN status='tp' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status='sl' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END),
+                          COALESCE(SUM(CASE WHEN status!='open' THEN outcome_r END), 0)
+                   FROM shadow_trades
+                   WHERE mode=? AND created_at>=?
+                   GROUP BY gate""",
+                (mode, cutoff),
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    stats = {}
+    for gate, n, tp, sl, expired, net_r in rows:
+        tp, sl, expired = int(tp or 0), int(sl or 0), int(expired or 0)
+        resolved = tp + sl + expired
+        decided = tp + sl
+        stats[gate] = {
+            "n": int(n),
+            "open": int(n) - resolved,
+            "resolved": resolved,
+            "tp": tp,
+            "sl": sl,
+            "expired": expired,
+            "win_rate": (tp / decided) if decided else 0.0,
+            "net_r": float(net_r or 0.0),
+            "mean_r": (float(net_r) / resolved) if resolved else 0.0,
+        }
+    return stats
+
+
+def format_stats_block(stats: dict, days: int = 30) -> str:
+    """Compact plain-text rendering shared by the Meta-Judge prompt."""
+    if not stats:
+        return "No shadow data yet."
+    lines = [f"Shadow outcomes of REJECTED signals (last {days}d, hypothetical):"]
+    for gate, s in sorted(stats.items()):
+        lines.append(
+            f"- {gate}: {s['n']} shadows, {s['resolved']} resolved "
+            f"(hyp. win rate {s['win_rate']:.0%}, net {s['net_r']:+.1f}R "
+            f"→ gate avoided {-s['net_r']:+.1f}R)"
+        )
+    return "\n".join(lines)

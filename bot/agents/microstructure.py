@@ -30,12 +30,13 @@ log = logging.getLogger("Microstructure")
 
 @dataclass
 class MicrostructureSignal:
-    confirmed: bool         # True = confirms direction, False = kills it
-    kill: bool              # Hard kill — strong counter-signal
-    ob_imbalance: float     # bid/ask ratio (>1 = buy pressure)
-    cvd_direction: str      # "bullish" | "bearish" | "neutral"
-    cvd_divergence: bool    # True = CVD diverges from price
-    funding_extreme: bool   # True = funding rate > 0.1% (extreme longs)
+    confirmed: bool              # True = confirms direction, False = kills it
+    kill: bool                   # Hard kill — strong counter-signal
+    ob_imbalance: float          # bid/ask ratio (>1 = buy pressure)
+    cvd_direction: str           # "bullish" | "bearish" | "neutral"
+    cvd_divergence: bool         # True = CVD diverges from price
+    funding_extreme: bool        # True = funding rate > 0.1% (extreme longs)
+    absorption_confirmed: bool   # True = limit orders absorbing aggressive flow
     reasoning: str
 
 
@@ -44,6 +45,7 @@ class MicrostructureAgent:
     CVD_WINDOW = 50         # candles for CVD calculation
     IMBALANCE_STRONG = 2.0  # ratio for strong imbalance
     IMBALANCE_MILD   = 1.4  # ratio for mild imbalance
+    IMBALANCE_VETO   = 2.5  # overwhelming contra wall — hard veto regardless of CVD
 
     def analyze(
         self,
@@ -52,10 +54,14 @@ class MicrostructureAgent:
         df,                  # OHLCV dataframe (trading timeframe)
         action: str,         # "BUY" or "SELL" — the structural bias to validate
         funding_rate: float = 0.0,
+        df_5m=None,          # 5-minute OHLCV dataframe for absorption check
     ) -> MicrostructureSignal:
         ob_ratio   = self._order_book_imbalance(exchange, symbol)
         cvd_dir, cvd_div = self._cvd_analysis(df, action)
         funding_extreme = abs(funding_rate) > 0.001  # 0.1% per 8h threshold
+
+        side = "LONG" if action == "BUY" else "SHORT"
+        absorption = self.check_cvd_absorption(df_5m if df_5m is not None else df, side)
 
         reasons = []
         kill = False
@@ -73,7 +79,13 @@ class MicrostructureAgent:
                 else:
                     reasons.append(f"OB: neutral {ob_ratio:.2f}x")
             elif action == "SELL":
-                if ob_ratio > self.IMBALANCE_STRONG:
+                if ob_ratio > self.IMBALANCE_VETO:
+                    # Overwhelming bid wall — squeeze risk overrides any CVD
+                    # confirmation. (Shorts were approved at ob 2.0-3.4 during
+                    # the Jun-6/7 squeeze; a stacked book must veto the side.)
+                    kill = True
+                    reasons.append(f"OB: overwhelming bid pressure {ob_ratio:.2f}x (veto)")
+                elif ob_ratio > self.IMBALANCE_STRONG:
                     if cvd_dir != "bearish":
                         # OB heavy bids + CVD not confirming SELL → kill
                         kill = True
@@ -100,6 +112,15 @@ class MicrostructureAgent:
             else:
                 reasons.append(f"CVD: neutral ({cvd_dir})")
 
+        # ── Order flow absorption check (5m) ──────────────────────────
+        if not absorption:
+            kill = True
+            reasons.append(
+                f"Absorption: no absorption on 5m — aggressive {'selling' if action == 'BUY' else 'buying'} ongoing (veto)"
+            )
+        else:
+            reasons.append("Absorption: limit orders absorbing flow ✓")
+
         # ── Funding rate check (futures) ──────────────────────────────
         if funding_extreme:
             if action == "BUY" and funding_rate > 0.001:
@@ -120,8 +141,86 @@ class MicrostructureAgent:
             cvd_direction=cvd_dir,
             cvd_divergence=cvd_div,
             funding_extreme=funding_extreme,
+            absorption_confirmed=absorption,
             reasoning=" | ".join(reasons),
         )
+
+    # ── Order Flow Absorption ─────────────────────────────────────────────────
+
+    ABSORPTION_WINDOW  = 5    # candles to inspect for absorption signal
+    ABSORPTION_MIN_LEN = 5    # minimum rows required in df_5m
+
+    def check_cvd_absorption(self, df_5m, side: str) -> bool:
+        """
+        Detect whether passive limit orders are absorbing aggressive market flow.
+
+        For LONG at support:
+          - Absorption confirmed when price is falling but CVD is NOT falling
+            aggressively (CVD higher low vs price lower low, or CVD flattening).
+          - No absorption when price AND CVD both fall — genuine dump.
+
+        For SHORT at resistance:
+          - Absorption confirmed when price is rising but CVD is NOT rising
+            aggressively (CVD lower high vs price higher high, or CVD flattening).
+          - No absorption when price AND CVD both rise — genuine pump.
+
+        Returns True if absorption is detected, False otherwise (safe default).
+        """
+        if df_5m is None or len(df_5m) < self.ABSORPTION_MIN_LEN:
+            return False
+
+        try:
+            w = self.ABSORPTION_WINDOW
+            close  = df_5m["close"].values[-w:]
+            open_  = df_5m["open"].values[-w:]
+            volume = df_5m["volume"].values[-w:]
+
+            # Taker-side CVD: green=+vol, red=-vol, doji=0
+            delta = np.where(close > open_, volume,
+                             np.where(close < open_, -volume, 0.0))
+            cvd   = np.cumsum(delta)
+
+            price_falling = close[-1] < close[0]
+            price_rising  = close[-1] > close[0]
+
+            cvd_start, cvd_end = cvd[0], cvd[-1]
+            cvd_falling = cvd_end < cvd_start
+            cvd_rising  = cvd_end > cvd_start
+
+            # Full-window slope: net delta relative to total volume
+            total_volume   = volume.sum() or 1.0
+            cvd_slope_norm = abs(cvd_end - cvd_start) / total_volume
+
+            # Recent slope: last 3 bars only (captures late flattening)
+            recent_net_delta  = abs(delta[-3:].sum())
+            recent_volume     = volume[-3:].sum() or 1.0
+            recent_slope_norm = recent_net_delta / recent_volume
+
+            CVD_FLAT_THRESHOLD = 0.15  # ≤15 % net delta/volume = flat
+
+            if side == "LONG":
+                if not price_falling:
+                    return True
+                # Genuine dump requires: CVD falling AND recent slope still aggressive
+                if cvd_falling and cvd_slope_norm > CVD_FLAT_THRESHOLD \
+                        and recent_slope_norm > CVD_FLAT_THRESHOLD:
+                    return False
+                # CVD flat/rising OR recently flattened → absorption detected
+                return True
+
+            elif side == "SHORT":
+                if not price_rising:
+                    return True
+                if cvd_rising and cvd_slope_norm > CVD_FLAT_THRESHOLD \
+                        and recent_slope_norm > CVD_FLAT_THRESHOLD:
+                    return False
+                return True
+
+            return True  # unknown side — don't veto
+
+        except Exception as e:
+            log.debug(f"Absorption check error: {e}")
+            return False
 
     def _order_book_imbalance(self, exchange, symbol: str) -> Optional[float]:
         """Fetch order book and return bid_volume / ask_volume ratio."""
