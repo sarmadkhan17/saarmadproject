@@ -53,6 +53,7 @@ from agents.shadow_tracker   import ShadowTracker
 from agents import trade_memory as trade_memory_mod
 from agents import vector_store
 from agents import llm_reasoning
+from agents import skeptic as skeptic_agent
 from agents import usage_tracker
 
 # v5: New 4-layer architecture
@@ -740,6 +741,7 @@ class BaseBot:
             df_1h = dfs.get("1h", df_tf)
             regime = (regime_ctx or {}).get("regime", "RANGING")
             trend_direction = (regime_ctx or {}).get("trend_direction", "NEUTRAL")
+            trend_change = (regime_ctx or {}).get("trend_change")
 
             # ── Layer 1: Ensemble (SMC + Technical + MacroFlow) ─────────
             ensemble = self.ensemble.run(symbol, dfs, self.profile, market_ctx=regime_ctx)
@@ -810,6 +812,7 @@ class BaseBot:
             # signature within cache_ttl_seconds reuses the prior Actor decision
             # instead of re-running RAG + a serial DeepSeek call every 30s scan.
             actor_cfg = self.config.get("actor", {}) or {}
+            adv_cfg   = self.config.get("adversary", {}) or {}
             cache_ttl = float(actor_cfg.get("cache_ttl_seconds", 180))
             # Coarse quantization so an unchanged setup keeps a stable signature
             # across 30-60s scans. Fine rounding (net_score/conf to 0.01,
@@ -823,12 +826,14 @@ class BaseBot:
                 round(micro.ob_imbalance * 2) / 2,       # 0.5 buckets
                 micro.cvd_direction,
                 bool(micro.cvd_divergence),
+                trend_change,                            # turn flip invalidates cache
             )
             now_mono = time.monotonic()
             cached = self._actor_cache.get(symbol)
             if (cache_ttl > 0 and cached and cached["sig"] == actor_sig
                     and (now_mono - cached["ts"]) < cache_ttl):
-                actor = cached["decision"]
+                actor   = cached["decision"]
+                skeptic = cached.get("skeptic")
                 self.log.info(f"ACTOR {symbol} | cached approved={actor.approved} conf={actor.confidence:.2f}")
             else:
                 # Vector RAG: retrieve similar past setups (hybrid semantic +
@@ -861,6 +866,13 @@ class BaseBot:
                         f"- [{l.get('outcome','?')}] {l.get('lesson','')}".strip()
                         for l in lessons if l.get("lesson")
                     )
+                if trend_change:
+                    extra_context += (
+                        ("\n" if extra_context else "")
+                        + f"TREND CHANGE: 1h momentum has turned {trend_change} against "
+                          f"the standing 4h trend — early reversal window; do not "
+                          f"penalise with-turn signals for opposing the old trend."
+                    )
                 # Fix #3: approval floor = profile.min_confidence (not a hidden
                 # hardcoded 0.50). Fix #1: recency-decayed, smoothed win-rate.
                 actor = llm_reasoning.actor_evaluate(
@@ -874,7 +886,22 @@ class BaseBot:
                     winrate_prior=float(actor_cfg.get("winrate_prior_strength", 1.0)),
                     trend_direction=trend_direction,
                 )
-                self._actor_cache[symbol] = {"sig": actor_sig, "ts": now_mono, "decision": actor}
+                # Gate 5.5: skeptic argues against approved setups only — a
+                # rejection is already the conservative outcome. Different
+                # model family (Llama on Groq) so it doesn't share the Actor's
+                # blind spots; it sees the thesis but never the confidence.
+                skeptic = None
+                if actor.approved and adv_cfg.get("enabled", True) and skeptic_agent.available():
+                    skeptic = skeptic_agent.skeptic_evaluate(
+                        symbol=symbol, action=ensemble.action,
+                        thesis=actor.reasoning, regime=regime,
+                        trend_direction=trend_direction, macro=macro,
+                        micro_signal=micro, ensemble_score=ensemble.net_score,
+                        trend_change=trend_change,
+                        model=adv_cfg.get("model", skeptic_agent.DEFAULT_MODEL),
+                    )
+                self._actor_cache[symbol] = {"sig": actor_sig, "ts": now_mono,
+                                             "decision": actor, "skeptic": skeptic}
                 self.log.info(f"ACTOR {symbol} | approved={actor.approved} conf={actor.confidence:.2f} | {actor.reasoning}")
             if not actor.approved:
                 self.state.add_signal({
@@ -886,6 +913,35 @@ class BaseBot:
                 self._record_shadow(symbol, "actor", actor.reasoning,
                                     ensemble, micro, regime, macro)
                 return
+
+            # ── Gate 5.5: Adversarial resolution (deterministic, no LLM) ──
+            # effective = actor_conf − k × rebuttal_strength → veto/haircut/pass.
+            # One-way authority: the skeptic can block or shrink, never enlarge.
+            # mode "shadow" logs the verdict without enforcing it.
+            skeptic_size_mult = 1.0
+            if skeptic is not None:
+                verdict, eff_conf, size_mult = skeptic_agent.combine(
+                    actor.confidence, skeptic.rebuttal_strength,
+                    self.profile.min_confidence,
+                    k=float(adv_cfg.get("k", 0.4)),
+                    haircut_band=float(adv_cfg.get("haircut_band", 0.10)),
+                )
+                self.log.info(
+                    f"SKEPTIC {symbol} | strength={skeptic.rebuttal_strength:.2f} "
+                    f"[{skeptic.objection}] → {verdict} eff={eff_conf:.2f} | {skeptic.statement}")
+                if adv_cfg.get("mode", "enforce") == "enforce":
+                    if verdict == "veto":
+                        self.state.add_signal({
+                            "symbol": symbol, "action": ensemble.action, "confidence": eff_conf,
+                            "status": "rejected", "reason": f"skeptic: {skeptic.statement}",
+                            "strategy": f"ensemble:{ensemble.net_score:+.3f}", "timeframe": "AUTO",
+                            "timestamp": datetime.now(LOCAL_TZ).isoformat(),
+                        })
+                        self._record_shadow(symbol, "adversary",
+                                            f"[{skeptic.objection}] {skeptic.statement}",
+                                            ensemble, micro, regime, macro)
+                        return
+                    skeptic_size_mult = size_mult
 
             # Blend Actor confidence into the ensemble result for sizing.
             # Fix #3: ensemble-weighted (0.6/0.4) rather than a flat mean — the
@@ -923,6 +979,14 @@ class BaseBot:
                 self._record_shadow(symbol, "risk", " | ".join(decision.reasons),
                                     ensemble, micro, regime, macro)
                 return
+
+            # Skeptic haircut: applied to the final size AFTER all risk gates so
+            # it can only shrink what Kelly approved, never alter gate outcomes.
+            if skeptic_size_mult < 1.0:
+                decision.position_size *= skeptic_size_mult
+                decision.est_usdt      *= skeptic_size_mult
+                self.log.info(f"SKEPTIC {symbol} | position haircut ×{skeptic_size_mult:.1f} "
+                              f"→ {decision.position_size:.6f} (${decision.est_usdt:.2f})")
 
             self.state.add_signal({
                 "symbol": symbol, "action": ensemble.action, "confidence": decision.adjusted_conf,
@@ -990,6 +1054,10 @@ class BaseBot:
                     "cvd_divergence": micro.cvd_divergence,
                     "actor_reasoning": actor.reasoning,
                     "actor_approved": actor.approved,
+                    "trend_change": trend_change,
+                    "skeptic_strength": (skeptic.rebuttal_strength if skeptic else None),
+                    "skeptic_objection": (skeptic.objection if skeptic else None),
+                    "skeptic_size_mult": skeptic_size_mult,
                     "entry_price": price,
                 }
                 self._save_entry_contexts()

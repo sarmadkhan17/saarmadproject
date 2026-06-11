@@ -24,6 +24,8 @@ class DeepSeekUsageTracker:
     PRICES = {
         "deepseek-chat":     {"input": 0.27 / 1e6, "output": 1.10 / 1e6},
         "deepseek-reasoner": {"input": 0.55 / 1e6, "output": 2.19 / 1e6},
+        # Groq-hosted skeptic (Gate 5.5)
+        "llama-3.3-70b-versatile": {"input": 0.59 / 1e6, "output": 0.79 / 1e6},
     }
 
     def __init__(self, data_dir: Path):

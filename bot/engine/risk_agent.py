@@ -166,10 +166,24 @@ class RiskDecisionAgent:
             breadth      = regime_ctx.get("breadth",      0.5)
             bear_breadth = regime_ctx.get("bear_breadth", 0.5)
             _gate_regime = regime_ctx.get("regime", "")
+            # "up"/"down"/None — MarketRegimeGate's early trend-change signal.
+            # A detected turn lifts the counter-trend walls below so the bot
+            # can lean into the new trend instead of waiting for the 4h EMAs.
+            trend_change = regime_ctx.get("trend_change")
             # Hard-block shorts in confirmed bull STRONG_TREND (breadth > 70%)
-            if action == "SELL" and _gate_regime == "STRONG_TREND" and breadth > 0.70:
+            if action == "SELL" and _gate_regime == "STRONG_TREND" and breadth > 0.70 \
+                    and trend_change != "down":
                 reasons.append(
                     f"shorts blocked: STRONG_TREND breadth={breadth:.0%}"
+                )
+                return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
+            # Symmetric wall for longs: counter-trend longs in bearish
+            # STRONG_TREND ran 29% WR / -0.44R over the first 100 pipeline
+            # trades — block them outright unless the trend is turning up.
+            if action == "BUY" and _gate_regime == "STRONG_TREND" and bear_breadth > 0.70 \
+                    and trend_change != "up":
+                reasons.append(
+                    f"longs blocked: STRONG_TREND bear_breadth={bear_breadth:.0%}"
                 )
                 return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
             # Symmetric capitulation guard: a washed-out, very-bearish-breadth
@@ -182,7 +196,7 @@ class RiskDecisionAgent:
             if action == "BUY" and breadth >= 0.85:
                 reasons.append(f"longs blocked: blow-off breadth={breadth:.0%}")
                 return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
-            if action == "SELL" and breadth > 0.50:
+            if action == "SELL" and breadth > 0.50 and trend_change != "down":
                 penalty = min(0.15, (breadth - 0.50) * 1.5)
                 penalised_floor = round(min(
                     getattr(profile, 'min_confidence', 0.45) + penalty,
@@ -193,7 +207,7 @@ class RiskDecisionAgent:
                         f"short penalised: bullish breadth={breadth:.0%} → need conf>={penalised_floor:.2f}"
                     )
                     return RiskDecision(False, reasons, conf, profile=profile.name, hmm_regime=hmm_regime)
-            elif action == "BUY" and bear_breadth > 0.50:
+            elif action == "BUY" and bear_breadth > 0.50 and trend_change != "up":
                 penalty = min(0.15, (bear_breadth - 0.50) * 1.5)
                 penalised_floor = round(min(
                     getattr(profile, 'min_confidence', 0.45) + penalty,

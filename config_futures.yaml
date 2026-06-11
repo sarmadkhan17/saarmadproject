@@ -11,6 +11,19 @@ actor:
   cache_ttl_seconds: 180
   winrate_half_life_hours: 24
   winrate_prior_strength: 3.0
+adversary:
+  # Skeptic / adversarial deliberation (Gate 5.5) — Llama on Groq argues
+  # AGAINST every Actor-approved setup. Deterministic resolution:
+  #   effective = actor_conf − k × rebuttal_strength
+  #   effective < profile.min_conf            → trade vetoed (shadow-logged)
+  #   effective < profile.min_conf + haircut_band → position size × 0.5
+  # mode: enforce = vetoes/haircuts are applied; shadow = log + record only.
+  # Fails OPEN: if Groq is down or GROQ_API_KEY missing, trades proceed as before.
+  enabled: true
+  mode: enforce
+  model: llama-3.3-70b-versatile
+  k: 0.4
+  haircut_band: 0.10
 dashboard:
   host: 0.0.0.0
   port: 5002

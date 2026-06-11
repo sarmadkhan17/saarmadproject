@@ -138,19 +138,30 @@ class EnsembleEngine:
         # on the trend_filter.use_two_tier flag. Convert to HOLD only —
         # never flip direction.
         if self.trend_filter.get("enabled") and result.action in ("BUY", "SELL"):
-            veto_reason = self._apply_trend_filter(result.action, dfs)
+            veto_reason = self._apply_trend_filter(result.action, dfs,
+                                                   ctx.get("trend_change"))
             if veto_reason:
                 log.info(f"TREND VETO {symbol} → HOLD (was {result.action}): {veto_reason}")
                 result.action = "HOLD"
                 result.source = f"trend_veto:{veto_reason}"
         return result
 
-    def _apply_trend_filter(self, action: str, dfs: dict) -> Optional[str]:
-        """Dispatch to two-tier or legacy filter. Returns veto reason string or None."""
+    def _apply_trend_filter(self, action: str, dfs: dict,
+                            trend_change: str = None) -> Optional[str]:
+        """Dispatch to two-tier or legacy filter. Returns veto reason string or None.
+
+        A detected market-wide trend change (MarketRegimeGate) overrides the
+        slow-tier veto when the fast tier already points the new way — the
+        slow 1h EMAs lag exactly when catching the turn matters most.
+        """
         if self._tf2 is not None:
             v = self._tf2.check(dfs)
-            if action == "BUY"  and not v["long_allowed"]:  return f"2tier:{v['reasoning']}"
-            if action == "SELL" and not v["short_allowed"]: return f"2tier:{v['reasoning']}"
+            if action == "BUY" and not v["long_allowed"]:
+                if not (trend_change == "up" and v["fast"]["direction"] == "up"):
+                    return f"2tier:{v['reasoning']}"
+            if action == "SELL" and not v["short_allowed"]:
+                if not (trend_change == "down" and v["fast"]["direction"] == "down"):
+                    return f"2tier:{v['reasoning']}"
             return None
         # Legacy path: existing _check_trend_veto on the 1h df.
         return self._check_trend_veto(dfs.get("1h"), action)
@@ -206,13 +217,16 @@ class EnsembleEngine:
         # Previous code applied *0.05 then *0.7 = *0.035 — near-permanent HOLD.
         # Now single 30% reduction on counter-trend signals only.
         trend_dir = (market_ctx or {}).get("trend_direction", "NEUTRAL") if market_ctx else "NEUTRAL"
-        log.debug(f"ENSEMBLE DEBUG: trend_dir={trend_dir} net_before_trend={net:.4f}")
-        if trend_dir == "BULLISH" and net < 0:
+        # Detected trend change suspends the counter-trend damp for the new
+        # direction — those "counter-trend" signals are the early turn entries.
+        trend_change = (market_ctx or {}).get("trend_change") if market_ctx else None
+        log.debug(f"ENSEMBLE DEBUG: trend_dir={trend_dir} trend_change={trend_change} net_before_trend={net:.4f}")
+        if trend_dir == "BULLISH" and net < 0 and trend_change != "down":
             net = net * 0.7
             buy_score = buy_score * 0.7
             sell_score = sell_score * 0.7
             log.debug(f"Ensemble: bullish trend → SELL reduced to {net:.3f}")
-        elif trend_dir == "BEARISH" and net > 0:
+        elif trend_dir == "BEARISH" and net > 0 and trend_change != "up":
             net = net * 0.7
             buy_score = buy_score * 0.7
             sell_score = sell_score * 0.7

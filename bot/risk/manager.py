@@ -58,12 +58,15 @@ class CorrelationFilter:
 
 class MarketRegimeGate:
     CACHE_SECS = 900  # 15-minute cache — 4h bars move slowly
+    H1_SLOPE_LOOKBACK = 10   # bars of 1h EMA20 slope for the trend-change check
+    TC_MIN_BREADTH = 0.35    # breadth confirmation required to call a turn
 
     def __init__(self):
         self._cache      = None
         self._cache_time = None
         self._prev_breadth = None      # breadth at the previous (cache-miss) compute
         self._reversal     = {}        # reversal signal computed alongside _compute
+        self._trend_change = None      # "up"/"down"/None — 1h turned against 4h trend
 
     def detect(self, feed, watchlist: list) -> dict:
         now = datetime.now(LOCAL_TZ)
@@ -74,22 +77,31 @@ class MarketRegimeGate:
         # Merge the reversal signal (_compute stashes it on self._reversal so we
         # don't have to thread **reversal through every classification branch).
         result = {**result, **getattr(self, "_reversal", {})}
+        # Early trend-change signal for ENTRIES: 1h crossed against the standing
+        # 4h trend (computed in _compute), or a confirmed breadth-thrust reversal.
+        # Consumed by Gate 4b / ensemble to lift counter-trend walls early.
+        result["trend_change"] = self._trend_change or result.get("reversal_confirmed")
         self._cache      = result
         self._cache_time = now
         log.info(
             f"[MarketRegimeGate] {result['regime']} | gate={result['gate']} | "
             f"breadth={result['breadth']:.0%} | vol_ratio={result['vol_ratio']:.2f}x | "
-            f"ADX={result['adx']:.1f}"
+            f"ADX={result['adx']:.1f} | turn={result['trend_change']}"
         )
         return result
 
     def _compute(self, feed, watchlist: list) -> dict:
+        self._trend_change = None
         try:
             btc_4h = feed.fetch_ohlcv("BTC/USDT", "4h", limit=100)
         except Exception:
             btc_4h = None
         if btc_4h is None or len(btc_4h) < 50:
             return self._neutral()
+        try:
+            btc_1h = feed.fetch_ohlcv("BTC/USDT", "1h", limit=120)
+        except Exception:
+            btc_1h = None
 
         close = btc_4h["close"]
         high  = btc_4h["high"]
@@ -136,6 +148,12 @@ class MarketRegimeGate:
         # Reversal signal for the open book (two-stage exit). Stashed on self so
         # detect() can merge it without threading **reversal through every branch.
         self._reversal = self._reversal_signal(breadth, bear_breadth, chg_4h)
+
+        # Early trend-change detector for entries: the 4h EMA20/50 state takes
+        # days to flip, so flag the window where the 1h has already crossed
+        # against the standing 4h trend and breadth agrees.
+        self._trend_change = self._trend_change_signal(
+            btc_bullish, btc_bearish, self._h1_state(btc_1h), breadth, bear_breadth)
 
         # ── Exhaustion guard ─────────────────────────────────────────────────
         # A fully one-sided, washed-out market is where violent mean-reversion
@@ -251,6 +269,33 @@ class MarketRegimeGate:
                 confirmed = "down"
 
         return {"reversal_risk": risk, "reversal_confirmed": confirmed}
+
+    def _h1_state(self, btc_1h) -> str:
+        """BTC 1h trend state: EMA20 vs EMA50 cross plus EMA20 slope direction."""
+        if btc_1h is None or len(btc_1h) < 50 + self.H1_SLOPE_LOOKBACK + 1:
+            return "flat"
+        close = btc_1h["close"]
+        e20 = close.ewm(span=20, adjust=False).mean()
+        e50 = close.ewm(span=50, adjust=False).mean()
+        slope = float(e20.iloc[-1]) - float(e20.iloc[-1 - self.H1_SLOPE_LOOKBACK])
+        if float(e20.iloc[-1]) > float(e50.iloc[-1]) and slope > 0:
+            return "up"
+        if float(e20.iloc[-1]) < float(e50.iloc[-1]) and slope < 0:
+            return "down"
+        return "flat"
+
+    def _trend_change_signal(self, btc_bullish: bool, btc_bearish: bool,
+                             h1_dir: str, breadth: float,
+                             bear_breadth: float) -> Optional[str]:
+        """Flag a trend transition: 1h state disagrees with the standing 4h
+        trend AND breadth confirms the new side is gathering participation.
+        "up" = bear trend cracking upward; "down" = bull trend rolling over.
+        """
+        if btc_bearish and h1_dir == "up" and breadth >= self.TC_MIN_BREADTH:
+            return "up"
+        if btc_bullish and h1_dir == "down" and bear_breadth >= self.TC_MIN_BREADTH:
+            return "down"
+        return None
 
     def _compute_from_values(self, adx: float, vol_ratio: float, breadth: float,
                              bear_breadth: float, chg_4h: float, chg_24h: float,

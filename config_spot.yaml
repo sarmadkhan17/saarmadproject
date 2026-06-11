@@ -1,5 +1,12 @@
 bot:
   scan_interval_seconds: 30
+adversary:
+  # Skeptic / adversarial deliberation (Gate 5.5) — see config_futures.yaml.
+  enabled: true
+  mode: enforce
+  model: llama-3.3-70b-versatile
+  k: 0.4
+  haircut_band: 0.10
 dashboard:
   host: 0.0.0.0
   port: 5002

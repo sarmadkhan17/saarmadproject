@@ -47,6 +47,11 @@ def get_deepseek_key():
     return get_secret("DEEPSEEK_API_KEY")
 
 
+def get_groq_key():
+    load_env()
+    return get_secret("GROQ_API_KEY")
+
+
 def get_coingecko_key():
     load_env()
     return get_secret("COINGECKO_API_KEY")
