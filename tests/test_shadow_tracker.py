@@ -158,12 +158,18 @@ class TestGuards:
         assert sid is None
 
     def test_per_symbol_cooldown(self, tmp_path):
-        """Same (symbol, side) within cooldown → deduped (kills 30s-rescan spam)."""
+        """Same (symbol, side, gate) within cooldown → deduped (kills 30s-rescan spam).
+        Different gates for the same symbol/side are NOT blocked by each other
+        so a microstructure shadow doesn't suppress an adversary shadow."""
         tracker = make_tracker(tmp_path)
         p = TradingProfile.load("BALANCED")
+        # Same gate → deduped
         first = tracker.record_rejection("ETH/USDT", "long", "micro", "r", 100.0, 2.0, p, CTX)
-        dup = tracker.record_rejection("ETH/USDT", "long", "actor", "r2", 101.0, 2.0, p, CTX)
+        dup   = tracker.record_rejection("ETH/USDT", "long", "micro", "r2", 101.0, 2.0, p, CTX)
         assert first is not None and dup is None
+        # Different gate for same symbol/side → allowed (adversary must not be blocked by micro)
+        adv = tracker.record_rejection("ETH/USDT", "long", "adversary", "r3", 101.0, 2.0, p, CTX)
+        assert adv is not None
         # Opposite side is NOT deduped
         other = tracker.record_rejection("ETH/USDT", "short", "actor", "r", 100.0, 2.0, p, CTX)
         assert other is not None

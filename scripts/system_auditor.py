@@ -31,6 +31,14 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import yaml
 
+# Pure-read gate/shadow stats from the bot package (no bot instance needed)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    from bot.agents.shadow_tracker import load_stats as _shadow_stats, \
+        load_taken_stats as _taken_stats, format_stats_block as _shadow_block
+except Exception:                                    # pragma: no cover
+    _shadow_stats = _taken_stats = _shadow_block = None
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 ROOT           = Path(__file__).resolve().parent.parent
 CONFIG_PATH    = ROOT / "config_futures.yaml"
@@ -401,6 +409,11 @@ def collect_metrics() -> dict:
         "cb_disabled":       bool(cb.get("disabled_until")),
         # Watchlist
         "watchlist":         watchlist,
+        # Gate complementarity (shadow tracker, pure read)
+        "gate_shadow_stats": (_shadow_stats(DB_PATH, "futures", days=30)
+                              if _shadow_stats else {}),
+        "gate_taken_stats":  (_taken_stats(DB_PATH, "futures", days=30)
+                              if _taken_stats else {}),
     }
 
 
@@ -443,6 +456,23 @@ def detect_anomalies(m: dict) -> List[Anomaly]:
             f"({m['longs']/total:.0%} long) — short side suppressed",
             {"longs": m["longs"], "shorts": m["shorts"],
              "long_wr": m["long_wr"], "short_wr": m["short_wr"]}))
+
+    # Gate precision — a gate whose blocked signals would have WON well above
+    # the taken-trade baseline is filtering winners, not protecting capital.
+    gt = m.get("gate_taken_stats") or {}
+    base_wr = gt.get("win_rate", 0.0)
+    for gate, s in (m.get("gate_shadow_stats") or {}).items():
+        decided = s["tp"] + s["sl"]
+        if decided >= 20 and gt.get("n", 0) >= 20 \
+                and s["win_rate"] > base_wr + 0.15:
+            found.append(Anomaly("GATE_PRECISION",
+                "ERROR" if s["win_rate"] > base_wr + 0.30 else "WARN",
+                f"Gate '{gate}' blocks winners: blocked-signal WR "
+                f"{s['win_rate']:.0%} vs taken baseline {base_wr:.0%} "
+                f"({decided} decided shadows, {s['net_r']:+.1f}R foregone)",
+                {"gate": gate, "blocked_wr": s["win_rate"], "baseline_wr": base_wr,
+                 "decided": decided, "net_r": s["net_r"],
+                 "redundant_with": s.get("redundant_with", {})}))
 
     # RAG monopoly
     if m["rag_dominant_pct"] >= 0.60 and m["rag_total"] >= 20:
@@ -547,6 +577,20 @@ def _build_brain_prompt(metrics: dict, anomalies: List[Anomaly],
         f"Exit reasons: {m['exit_reasons']}",
         f"Config: winrate_half_life_hours={hl} | winrate_prior_strength={prior} | "
         f"profile={m['profile']} | min_conf={m['min_conf']}",
+    ]
+
+    # Gate complementarity: per-gate blocked-trade precision vs the taken
+    # baseline + redundancy overlap. A gate whose blocks beat the baseline is
+    # filtering winners; high overlap means two gates duplicate each other.
+    gs, gt = m.get("gate_shadow_stats") or {}, m.get("gate_taken_stats") or {}
+    if gs and _shadow_block:
+        lines += ["", "=== GATE COMPLEMENTARITY (forward shadow data) ==="]
+        if gt:
+            lines.append(f"Baseline taken trades: n={gt['n']} "
+                         f"WR={gt['win_rate']:.0%} avg_R={gt['mean_r']:+.2f}")
+        lines.append(_shadow_block(gs, days=30))
+
+    lines += [
         "",
         "=== ANOMALIES ===",
     ]

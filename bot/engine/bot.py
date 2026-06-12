@@ -508,6 +508,17 @@ class BaseBot:
         if not self.shadow_tracker:
             return
         try:
+            # Redundancy matrix input: which OTHER cheap gates would also have
+            # blocked this signal? (LLM gates excluded — no extra API calls.)
+            # High overlap between two gates = duplication, not complementarity.
+            redundant = []
+            if gate != "actor_prefilter" \
+                    and ensemble.confidence < self.profile.min_confidence:
+                redundant.append("actor_prefilter")
+            if gate != "microstructure" and getattr(micro, "kill", False):
+                redundant.append("microstructure")
+            if gate != "microstructure" and getattr(micro, "size_mult", 1.0) < 1.0:
+                redundant.append("microstructure_soft")
             self.shadow_tracker.record_rejection(
                 symbol=symbol,
                 side="long" if ensemble.action == "BUY" else "short",
@@ -524,6 +535,7 @@ class BaseBot:
                     "cvd_divergence": getattr(micro, "cvd_divergence", False),
                     "btc_d": (macro or {}).get("btc_d", 0.0),
                     "usdt_d": (macro or {}).get("usdt_d", 0.0),
+                    "redundant_gates": ",".join(redundant),
                 },
             )
         except Exception as e:
@@ -925,6 +937,9 @@ class BaseBot:
                     self.profile.min_confidence,
                     k=float(adv_cfg.get("k", 0.4)),
                     haircut_band=float(adv_cfg.get("haircut_band", 0.10)),
+                    objection=skeptic.objection,
+                    category_k=adv_cfg.get("category_k"),
+                    veto_categories=adv_cfg.get("veto_categories"),
                 )
                 self.log.info(
                     f"SKEPTIC {symbol} | strength={skeptic.rebuttal_strength:.2f} "
@@ -980,12 +995,16 @@ class BaseBot:
                                     ensemble, micro, regime, macro)
                 return
 
-            # Skeptic haircut: applied to the final size AFTER all risk gates so
-            # it can only shrink what Kelly approved, never alter gate outcomes.
-            if skeptic_size_mult < 1.0:
-                decision.position_size *= skeptic_size_mult
-                decision.est_usdt      *= skeptic_size_mult
-                self.log.info(f"SKEPTIC {symbol} | position haircut ×{skeptic_size_mult:.1f} "
+            # Soft-evidence haircuts: applied to the final size AFTER all risk
+            # gates so they can only shrink what Kelly approved, never alter
+            # gate outcomes. Micro soft contra-flow and the skeptic stack
+            # multiplicatively.
+            soft_mult = skeptic_size_mult * getattr(micro, "size_mult", 1.0)
+            if soft_mult < 1.0:
+                decision.position_size *= soft_mult
+                decision.est_usdt      *= soft_mult
+                self.log.info(f"SOFT-HAIRCUT {symbol} | micro ×{getattr(micro, 'size_mult', 1.0):.2f} "
+                              f"skeptic ×{skeptic_size_mult:.1f} "
                               f"→ {decision.position_size:.6f} (${decision.est_usdt:.2f})")
 
             self.state.add_signal({

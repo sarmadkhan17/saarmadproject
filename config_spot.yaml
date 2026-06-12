@@ -7,6 +7,17 @@ adversary:
   model: llama-3.3-70b-versatile
   k: 0.4
   haircut_band: 0.10
+  # No-double-jeopardy: per-category multiplier on k. Regime/flow objections
+  # are already priced by the ensemble/microstructure gates, so they carry a
+  # discounted penalty and (via veto_categories) can shrink but never block.
+  category_k:
+    regime_mismatch: 0.15
+    micro_contradiction: 0.15
+    crowded_narrative: 1.0
+    stale_precedent: 1.0
+    event_risk: 1.0
+    other: 0.5
+  veto_categories: [crowded_narrative, stale_precedent, event_risk]
 dashboard:
   host: 0.0.0.0
   port: 5002

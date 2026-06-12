@@ -262,3 +262,105 @@ class TestAnalyzeAbsorptionVeto:
         assert result.kill is True, (
             "Expected kill=True when SHORT has no CVD absorption (aggressive buying)"
         )
+
+
+# ─── analyze() — soft-kill conversion (lone signal shrinks, combo kills) ─────
+
+class FakeBookExchange:
+    """Order book stub with a configurable bid/ask volume ratio."""
+    def __init__(self, ratio: float):
+        self.ratio = ratio
+
+    def fetch_order_book(self, symbol, limit=20):
+        return {
+            "bids": [[100.0, 100.0 * self.ratio]] * limit,
+            "asks": [[100.0, 100.0]] * limit,
+        }
+
+
+def rising_green_df():
+    """Price rising on green bodies → CVD bullish, no divergence (BUY-friendly)."""
+    closes = [100, 101, 102, 103, 104]
+    opens  = [99.5, 100.5, 101.5, 102.5, 103.5]
+    return make_df(closes, opens, [200] * 5, n=20)
+
+
+def falling_red_df():
+    """Price falling on red bodies → CVD bearish, no BUY divergence."""
+    closes = [104, 103, 102, 101, 100]
+    opens  = [104.5, 103.5, 102.5, 101.5, 100.5]
+    return make_df(closes, opens, [200] * 5, n=20)
+
+
+def rising_red_df():
+    """Price rising while bodies are red → CVD falling = BUY divergence."""
+    closes = [100, 101, 102, 103, 104]
+    opens  = [100.6, 101.6, 102.6, 103.6, 104.6]
+    return make_df(closes, opens, [200] * 5, n=20)
+
+
+def absorbing_long_df():
+    """Green bodies on falling price → absorption confirmed for LONG."""
+    closes = [100, 99.5, 99, 98.5, 98]
+    opens  = [99, 99, 98, 98, 97.5]
+    return make_df(closes, opens, [200] * 5, n=20)
+
+
+class TestSoftKillConversion:
+
+    def test_lone_ask_wall_with_cvd_confirming_soft_shrinks_long(self):
+        # ob 0.45: heavy ask pressure, but CVD bullish → ×0.7, no kill
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(0.45), symbol="X", df=rising_green_df(),
+            df_5m=rising_green_df(), action="BUY")
+        assert r.kill is False
+        assert r.size_mult == pytest.approx(0.7)
+
+    def test_overwhelming_ask_wall_still_hard_kills_long(self):
+        # ob 0.30 < 1/2.5 → squeeze-grade wall vetoes regardless of CVD
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(0.30), symbol="X", df=rising_green_df(),
+            df_5m=rising_green_df(), action="BUY")
+        assert r.kill is True and r.size_mult == 0.0
+
+    def test_ask_wall_plus_cvd_not_confirming_hard_kills_long(self):
+        # combo: heavy ask AND CVD bearish (df bearish, absorption df keeps
+        # the 5m gate out of the way) → kill
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(0.45), symbol="X", df=falling_red_df(),
+            df_5m=absorbing_long_df(), action="BUY")
+        assert r.kill is True
+
+    def test_lone_bid_wall_with_cvd_confirming_soft_shrinks_short(self):
+        # Symmetry fix: SELL into a 2.2x bid wall with CVD bearish used to
+        # pass at full size — a standing contra wall is worth one reduction.
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(2.2), symbol="X", df=falling_red_df(),
+            df_5m=falling_red_df(), action="SELL")
+        assert r.kill is False
+        assert r.size_mult == pytest.approx(0.7)
+
+    def test_lone_divergence_soft_shrinks(self):
+        # BUY divergence with a neutral book → ×0.75, no kill
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(1.0), symbol="X", df=rising_red_df(),
+            df_5m=rising_red_df(), action="BUY")
+        assert r.cvd_divergence is True
+        assert r.kill is False
+        assert r.size_mult == pytest.approx(0.75)
+
+    def test_divergence_plus_ob_against_hard_kills(self):
+        # Two independent contra reads (divergence + book leaning against,
+        # 0.6 < 1/1.4) → kill
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(0.6), symbol="X", df=rising_red_df(),
+            df_5m=rising_red_df(), action="BUY")
+        assert r.cvd_divergence is True
+        assert r.kill is True
+
+    def test_clean_confirmation_full_size(self):
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(1.6), symbol="X", df=rising_green_df(),
+            df_5m=rising_green_df(), action="BUY")
+        assert r.kill is False
+        assert r.size_mult == 1.0

@@ -9,10 +9,15 @@ honest objection with a 0–1 strength.
 
 Resolution is deterministic code, never a third LLM:
 
-    effective_conf = actor_conf − k × rebuttal_strength
+    effective_conf = actor_conf − k × category_k[objection] × rebuttal_strength
       effective <  min_conf            → veto   (trade blocked, shadow-logged)
       effective <  min_conf + band     → haircut (position size × 0.5)
       otherwise                        → pass   (unchanged)
+
+No-double-jeopardy: objection categories owned by upstream gates
+(regime_mismatch, micro_contradiction) carry a discounted k and can at most
+haircut — never veto. Full veto power is reserved for the skeptic's exclusive
+domain: crowded_narrative, stale_precedent, event_risk.
 
 Authority is one-way: the skeptic can block or shrink a trade, never enlarge
 one — two LLMs agreeing must not compound into overconfidence. Any API
@@ -39,9 +44,32 @@ OBJECTION_CATEGORIES = (
     "stale_precedent", "event_risk", "other",
 )
 
+# No-double-jeopardy: regime/trend is owned by the ensemble and order flow by
+# the microstructure gate — both already priced the setup before the skeptic
+# sees it. Objections in those categories carry a discounted k (they can still
+# shrink a position) and may never fully veto; the skeptic's exclusive veto
+# domain is what no upstream gate can see.
+DEFAULT_CATEGORY_K = {
+    "regime_mismatch":    0.15,
+    "micro_contradiction": 0.15,
+    "crowded_narrative":  1.0,
+    "stale_precedent":    1.0,
+    "event_risk":         1.0,
+    "other":              0.5,
+}
+DEFAULT_VETO_CATEGORIES = ("crowded_narrative", "stale_precedent", "event_risk")
+
 SKEPTIC_SYSTEM = """You are the risk officer at a crypto trading desk. A trader
 proposes a trade; your ONLY job is to find the strongest honest case AGAINST it.
 You never approve trades and you never soften your objection to be agreeable.
+
+Division of labour: the desk's quantitative gates have ALREADY priced the
+regime, the trend, and the live order flow into this setup before it reached
+you — restating "the trend is weak/neutral" adds nothing. Your unique value is
+what those gates cannot see: a crowded narrative, precedent that no longer
+applies, scheduled event risk, or an internal contradiction in the trader's
+own thesis. Prefer those; only fall back to regime objections when the
+mismatch is truly egregious.
 
 Calibration rules:
 - rebuttal_strength reflects how damaging your SINGLE BEST objection is,
@@ -169,15 +197,29 @@ What is the strongest case against taking this trade right now?"""
 
 
 def combine(actor_conf: float, rebuttal_strength: float, min_conf: float,
-            k: float = 0.4, haircut_band: float = 0.10) -> tuple:
+            k: float = 0.4, haircut_band: float = 0.10,
+            objection: str = "other",
+            category_k: Optional[dict] = None,
+            veto_categories: Optional[tuple] = None) -> tuple:
     """Deterministic resolution of Actor vs Skeptic.
 
     Returns (verdict, effective_conf, size_mult) where verdict is
     "veto" | "haircut" | "pass". One-way: size_mult is never above 1.0.
+
+    k is scaled per objection category (no-double-jeopardy: upstream-owned
+    objections like regime_mismatch carry a discounted penalty), and only
+    categories in veto_categories may fully block — everything else bottoms
+    out at a haircut.
     """
-    effective = round(actor_conf - k * max(0.0, min(1.0, rebuttal_strength)), 4)
+    cat_k = {**DEFAULT_CATEGORY_K, **(category_k or {})}
+    vetoable = tuple(veto_categories) if veto_categories is not None \
+        else DEFAULT_VETO_CATEGORIES
+    k_eff = k * float(cat_k.get(objection, cat_k.get("other", 0.5)))
+    effective = round(actor_conf - k_eff * max(0.0, min(1.0, rebuttal_strength)), 4)
     if effective < min_conf:
-        return "veto", effective, 0.0
+        if objection in vetoable:
+            return "veto", effective, 0.0
+        return "haircut", effective, 0.5
     if effective < min_conf + haircut_band:
         return "haircut", effective, 0.5
     return "pass", effective, 1.0

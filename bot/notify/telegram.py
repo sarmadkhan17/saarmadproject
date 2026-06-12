@@ -282,6 +282,7 @@ class TelegramNotifier:
                         "/trades":          self._cmd_trades,
                         "/health":          self._cmd_health,
                         "/shadows":         self._cmd_shadows,
+                        "/gates":           self._cmd_gates,
                         "/switch_spot":     self._cmd_switch_spot,
                         "/switch_futures":  self._cmd_switch_futures,
                         "/restart":         self._cmd_restart,
@@ -317,7 +318,8 @@ class TelegramNotifier:
             "/pnl     — Current PnL\n"
             "/trades  — Open positions\n"
             "/health  — Full system health\n"
-            "/shadows — Hypothetical outcomes of rejected signals\n\n"
+            "/shadows — Hypothetical outcomes of rejected signals\n"
+            "/gates   — Gate precision vs taken trades + redundancy\n\n"
             "<b>⚙️ Control:</b>\n"
             "/switch_spot     — Switch to SPOT mode\n"
             "/switch_futures  — Switch to FUTURES mode\n"
@@ -349,6 +351,47 @@ class TelegramNotifier:
             self.send("\n".join(lines))
         except Exception as e:
             self.send(f"⚠️ Shadow stats unavailable: {e}")
+
+    def _cmd_gates(self):
+        """Gate complementarity report: per-gate blocked-trade precision vs
+        the taken-trade baseline, plus the cheap-gate redundancy matrix."""
+        try:
+            from agents.shadow_tracker import load_stats, load_taken_stats
+            mode = self._get_mode_from_env()
+            db = DATA / "trade_memory.db"
+            stats = load_stats(db, mode, days=30)
+            taken = load_taken_stats(db, mode, days=30)
+            if not stats and not taken:
+                self.send("🚪 <b>Gate report</b>\nNo data yet.")
+                return
+            lines = [f"🚪 <b>Gate report</b> ({mode.upper()}, last 30d)\n"]
+            if taken:
+                lines.append(
+                    f"<b>Baseline — taken trades</b>: {taken['n']} closed, "
+                    f"WR {taken['win_rate']:.0%}, avg {taken['mean_r']:+.2f}R\n")
+            lines.append("<i>A gate complements when its blocks would have "
+                         "done WORSE than the baseline:</i>\n")
+            base_wr = taken.get("win_rate", 0.0) if taken else 0.0
+            for gate, s in sorted(stats.items()):
+                decided = s["tp"] + s["sl"]
+                if decided >= 5:
+                    flag = "🔴 blocking winners" if s["win_rate"] > base_wr + 0.10 \
+                        else ("🟢 protective" if s["win_rate"] < base_wr - 0.10 else "🟡 ~neutral")
+                else:
+                    flag = "⏳ low sample"
+                lines.append(
+                    f"<b>{gate}</b> — blocked WR {s['win_rate']:.0%} "
+                    f"({decided} decided) · net {s['net_r']:+.1f}R {flag}")
+                red = s.get("redundant_with") or {}
+                if red:
+                    overlap = ", ".join(
+                        f"{o} {c}/{s['n']}" for o, c in sorted(red.items()))
+                    lines.append(f"  ↳ overlap: {overlap}")
+            lines.append("\n<i>High overlap = gates duplicate each other; "
+                         "decisions stay human-gated.</i>")
+            self.send("\n".join(lines))
+        except Exception as e:
+            self.send(f"⚠️ Gate report unavailable: {e}")
 
     def _get_mode_from_env(self):
         """Read BOT_MODE from .env file."""

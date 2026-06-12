@@ -9,10 +9,12 @@ Reads:
 Outputs a signal that CONFIRMS or KILLS the structural bias from SMCAgent.
 It does not generate direction — it validates it.
 
-CVD divergence rule:
-  Price making new highs + CVD making lower highs → KILL long signal
-  Price making new lows  + CVD making higher lows  → KILL short signal
-  CVD and price aligned  → CONFIRM signal
+Hard kill vs soft size reduction (no-double-jeopardy with itself):
+  KILL only when independent flow reads agree the trade is wrong —
+  overwhelming contra wall (≥2.5x), contra wall + CVD not confirming,
+  CVD divergence + order book against, or no absorption on 5m.
+  A LONE contra signal (wall with CVD confirming, or divergence with a
+  neutral book) emits size_mult 0.7/0.75 instead of blocking.
 
 Order book imbalance rule:
   bid_volume / ask_volume > 2.0 → bullish pressure
@@ -38,6 +40,7 @@ class MicrostructureSignal:
     funding_extreme: bool        # True = funding rate > 0.1% (extreme longs)
     absorption_confirmed: bool   # True = limit orders absorbing aggressive flow
     reasoning: str
+    size_mult: float = 1.0       # soft contra-flow → position size multiplier (≤1.0)
 
 
 class MicrostructureAgent:
@@ -46,6 +49,13 @@ class MicrostructureAgent:
     IMBALANCE_STRONG = 2.0  # ratio for strong imbalance
     IMBALANCE_MILD   = 1.4  # ratio for mild imbalance
     IMBALANCE_VETO   = 2.5  # overwhelming contra wall — hard veto regardless of CVD
+
+    # Soft-kill multipliers: a LONE contra-flow signal shrinks the position
+    # instead of blocking it (shadow data showed lone-signal kills blocking
+    # winners); hard kills are reserved for signal COMBOS where independent
+    # flow reads agree the trade is wrong, plus the overwhelming-wall veto.
+    SOFT_WALL_MULT = 0.7    # contra wall present but CVD confirms the trade
+    SOFT_DIV_MULT  = 0.75   # CVD divergence alone, order book not against
 
     def analyze(
         self,
@@ -66,14 +76,24 @@ class MicrostructureAgent:
         reasons = []
         kill = False
         confirmed = True
+        size_mult = 1.0
 
         # ── Order book check ──────────────────────────────────────────
+        # Hard kill only for an overwhelming wall (squeeze evidence) or a
+        # COMBO of contra wall + CVD not confirming the trade. A lone wall
+        # with CVD on the trade's side shrinks the position instead.
         if ob_ratio is not None:
             if action == "BUY":
-                if ob_ratio < (1.0 / self.IMBALANCE_STRONG):
-                    # Strong ask-side pressure against longs
+                if ob_ratio < (1.0 / self.IMBALANCE_VETO):
                     kill = True
-                    reasons.append(f"OB: heavy ask pressure {ob_ratio:.2f}x")
+                    reasons.append(f"OB: overwhelming ask pressure {ob_ratio:.2f}x (veto)")
+                elif ob_ratio < (1.0 / self.IMBALANCE_STRONG):
+                    if cvd_dir != "bullish":
+                        kill = True
+                        reasons.append(f"OB: heavy ask pressure {ob_ratio:.2f}x + CVD not confirming")
+                    else:
+                        size_mult *= self.SOFT_WALL_MULT
+                        reasons.append(f"OB: heavy ask pressure {ob_ratio:.2f}x | CVD confirms — size ×{self.SOFT_WALL_MULT}")
                 elif ob_ratio > self.IMBALANCE_MILD:
                     reasons.append(f"OB: bid support {ob_ratio:.2f}x ✓")
                 else:
@@ -91,8 +111,9 @@ class MicrostructureAgent:
                         kill = True
                         reasons.append(f"OB: heavy bid pressure {ob_ratio:.2f}x")
                     else:
-                        # CVD confirms bearish direction — OB wall alone not enough
-                        reasons.append(f"OB: heavy bid pressure {ob_ratio:.2f}x | CVD confirms ✓")
+                        # CVD confirms bearish — wall alone shrinks, not blocks
+                        size_mult *= self.SOFT_WALL_MULT
+                        reasons.append(f"OB: heavy bid pressure {ob_ratio:.2f}x | CVD confirms — size ×{self.SOFT_WALL_MULT}")
                 elif ob_ratio < (1.0 / self.IMBALANCE_MILD):
                     reasons.append(f"OB: ask support {ob_ratio:.2f}x ✓")
                 else:
@@ -102,9 +123,17 @@ class MicrostructureAgent:
             reasons.append("OB: unavailable")
 
         # ── CVD divergence check ──────────────────────────────────────
+        # Divergence + order book against the trade = two independent flow
+        # reads agreeing → hard kill. Lone divergence shrinks the position.
         if cvd_div:
-            kill = True
-            reasons.append(f"CVD: divergence vs price ({cvd_dir}) — signal weakening")
+            ob_against = (action == "BUY"  and ob_ratio < (1.0 / self.IMBALANCE_MILD)) or \
+                         (action == "SELL" and ob_ratio > self.IMBALANCE_MILD)
+            if ob_against:
+                kill = True
+                reasons.append(f"CVD: divergence vs price ({cvd_dir}) + OB against (veto)")
+            else:
+                size_mult *= self.SOFT_DIV_MULT
+                reasons.append(f"CVD: divergence vs price ({cvd_dir}) — size ×{self.SOFT_DIV_MULT}")
         else:
             if (action == "BUY"  and cvd_dir == "bullish") or \
                (action == "SELL" and cvd_dir == "bearish"):
@@ -133,6 +162,9 @@ class MicrostructureAgent:
 
         if kill:
             confirmed = False
+            size_mult = 0.0
+        else:
+            size_mult = max(0.5, round(size_mult, 3))  # stacked softs floor at 0.5
 
         return MicrostructureSignal(
             confirmed=confirmed,
@@ -143,6 +175,7 @@ class MicrostructureAgent:
             funding_extreme=funding_extreme,
             absorption_confirmed=absorption,
             reasoning=" | ".join(reasons),
+            size_mult=size_mult,
         )
 
     # ── Order Flow Absorption ─────────────────────────────────────────────────

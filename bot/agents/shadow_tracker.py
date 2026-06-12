@@ -80,6 +80,12 @@ class ShadowTracker:
             c.execute("""
             CREATE INDEX IF NOT EXISTS idx_shadow_open
             ON shadow_trades(mode, status)""")
+            # Redundancy instrumentation: which OTHER cheap gates would also
+            # have blocked this signal (comma-joined). Added post-launch, so
+            # migrate in place.
+            cols = [r[1] for r in c.execute("PRAGMA table_info(shadow_trades)")]
+            if "redundant_gates" not in cols:
+                c.execute("ALTER TABLE shadow_trades ADD COLUMN redundant_gates TEXT")
 
     # ── capture ──────────────────────────────────────────────────────────
 
@@ -105,13 +111,14 @@ class ShadowTracker:
 
                 if self.cooldown_min > 0:
                     # The 30-60s scan + Actor verdict cache re-fires the same
-                    # rejection every cycle — dedup per (symbol, side),
-                    # counting resolved shadows too.
+                    # rejection every cycle — dedup per (symbol, side, gate) so
+                    # a microstructure shadow doesn't block an adversary shadow
+                    # for the same symbol within the cooldown window.
                     cutoff = (now - timedelta(minutes=self.cooldown_min)).isoformat()
                     recent = c.execute(
                         "SELECT 1 FROM shadow_trades "
-                        "WHERE mode=? AND symbol=? AND side=? AND created_at>=? LIMIT 1",
-                        (self.mode, symbol, side, cutoff),
+                        "WHERE mode=? AND symbol=? AND side=? AND gate=? AND created_at>=? LIMIT 1",
+                        (self.mode, symbol, side, gate, cutoff),
                     ).fetchone()
                     if recent:
                         return None
@@ -128,8 +135,8 @@ class ShadowTracker:
                         entry_price, atr, sl_price, tp_price, r_target,
                         regime, ensemble_score, confidence,
                         ob_imbalance, cvd_direction, cvd_divergence,
-                        btc_d, usdt_d, created_at, status)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')""",
+                        btc_d, usdt_d, created_at, status, redundant_gates)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?)""",
                     (
                         sid, self.mode, symbol, side, gate, str(reason)[:300],
                         float(entry_price), float(atr),
@@ -143,6 +150,7 @@ class ShadowTracker:
                         float(ctx.get("btc_d", 0) or 0),
                         float(ctx.get("usdt_d", 0) or 0),
                         now.isoformat(),
+                        ctx.get("redundant_gates") or None,
                     ),
                 )
                 log.debug(f"shadow {symbol} {side} gate={gate} sl={sl_price:.4f} tp={tp_price:.4f}")
@@ -315,8 +323,59 @@ def load_stats(db_path, mode: str, days: int = 30) -> dict:
             "win_rate": (tp / decided) if decided else 0.0,
             "net_r": float(net_r or 0.0),
             "mean_r": (float(net_r) / resolved) if resolved else 0.0,
+            "redundant_with": {},
         }
+
+    # Redundancy matrix: of the signals gate X blocked, how many would another
+    # cheap gate also have blocked? High overlap = the gates duplicate each
+    # other rather than complement.
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as c:
+            rrows = c.execute(
+                """SELECT gate, redundant_gates, COUNT(*)
+                   FROM shadow_trades
+                   WHERE mode=? AND created_at>=? AND redundant_gates IS NOT NULL
+                   GROUP BY gate, redundant_gates""",
+                (mode, cutoff),
+            ).fetchall()
+        for gate, red, cnt in rrows:
+            if gate not in stats:
+                continue
+            for other in str(red).split(","):
+                other = other.strip()
+                if other:
+                    rw = stats[gate]["redundant_with"]
+                    rw[other] = rw.get(other, 0) + int(cnt)
+    except sqlite3.Error:
+        pass
     return stats
+
+
+def load_taken_stats(db_path, mode: str, days: int = 30) -> dict:
+    """Closed REAL trades over the same window — the baseline the per-gate
+    shadow precision is judged against. Pure read; {} when absent."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {}
+    cutoff = (datetime.now(LOCAL_TZ) - timedelta(days=days)).isoformat()
+    try:
+        with sqlite3.connect(str(db_path), timeout=10) as c:
+            n, wins, net_r = c.execute(
+                """SELECT COUNT(*),
+                          SUM(CASE WHEN r_multiple > 0 THEN 1 ELSE 0 END),
+                          COALESCE(SUM(r_multiple), 0)
+                   FROM trades WHERE mode=? AND closed_at>=?""",
+                (mode, cutoff),
+            ).fetchone()
+    except sqlite3.Error:
+        return {}
+    n = int(n or 0)
+    return {
+        "n": n,
+        "win_rate": (int(wins or 0) / n) if n else 0.0,
+        "net_r": float(net_r or 0.0),
+        "mean_r": (float(net_r or 0.0) / n) if n else 0.0,
+    }
 
 
 def format_stats_block(stats: dict, days: int = 30) -> str:
@@ -330,4 +389,8 @@ def format_stats_block(stats: dict, days: int = 30) -> str:
             f"(hyp. win rate {s['win_rate']:.0%}, net {s['net_r']:+.1f}R "
             f"→ gate avoided {-s['net_r']:+.1f}R)"
         )
+        red = s.get("redundant_with") or {}
+        if red:
+            overlap = ", ".join(f"{o}: {c}/{s['n']}" for o, c in sorted(red.items()))
+            lines.append(f"    also blockable by → {overlap}")
     return "\n".join(lines)
