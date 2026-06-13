@@ -24,6 +24,7 @@ class EnsembleResult:
     signals: list = field(default_factory=list)
     source: str = "ensemble"
     agents_ok: bool = True   # False when ≥1 configured agent errored during this run
+    vetoed_action: Optional[str] = None  # original BUY/SELL when the trend filter forced HOLD
 
 
 class EnsembleEngine:
@@ -142,6 +143,7 @@ class EnsembleEngine:
                                                    ctx.get("trend_change"))
             if veto_reason:
                 log.info(f"TREND VETO {symbol} → HOLD (was {result.action}): {veto_reason}")
+                result.vetoed_action = result.action
                 result.action = "HOLD"
                 result.source = f"trend_veto:{veto_reason}"
         return result

@@ -364,3 +364,62 @@ class TestSoftKillConversion:
             df_5m=rising_green_df(), action="BUY")
         assert r.kill is False
         assert r.size_mult == 1.0
+
+
+# ─── displacement gate — noise must NOT veto, genuine moves must ─────────────
+#
+# Root-cause regression guards: the old detector vetoed on any directional 5m
+# drift (slope > 0.15), so ordinary chop killed both sides and halted the bot.
+# The redesign vetoes only on a significant adverse move that CVD confirms.
+
+def noisy_down_long_df():
+    """Tiny net drift down on red bodies — chop, not a dump. Must NOT veto a LONG.
+
+    Net move is a fraction of the typical bar-to-bar move, so the displacement
+    gate keeps it below the veto floor even though CVD leans bearish.
+    """
+    closes = [100.0, 100.3, 99.8, 100.1, 99.95]   # net ≈ -0.05%, bars ≈ ±0.3%
+    opens  = [100.2, 100.5, 100.0, 100.3, 100.1]  # red bodies → CVD bearish
+    return make_df(closes, opens, [200] * 5, n=20)
+
+
+def noisy_up_short_df():
+    """Tiny net drift up on green bodies — chop, not a pump. Must NOT veto a SHORT."""
+    closes = [100.0, 99.7, 100.2, 99.9, 100.05]
+    opens  = [99.8, 99.5, 100.0, 99.7, 99.9]      # green bodies → CVD bullish
+    return make_df(closes, opens, [200] * 5, n=20)
+
+
+class TestAbsorptionDisplacementGate:
+
+    def test_noisy_down_does_not_veto_long(self):
+        agent = MicrostructureAgent()
+        assert agent.check_cvd_absorption(noisy_down_long_df(), "LONG") is True
+
+    def test_noisy_up_does_not_veto_short(self):
+        agent = MicrostructureAgent()
+        assert agent.check_cvd_absorption(noisy_up_short_df(), "SHORT") is True
+
+    def test_genuine_dump_still_vetoes_long(self):
+        """A real sustained dump (price down ~4%, CVD strongly down) still kills."""
+        agent = MicrostructureAgent()
+        closes = [100, 99, 98, 97, 96]
+        opens  = [100.5, 99.5, 98.5, 97.5, 96.5]   # red
+        assert agent.check_cvd_absorption(make_df(closes, opens, [300]*5), "LONG") is False
+
+    def test_genuine_pump_still_vetoes_short(self):
+        agent = MicrostructureAgent()
+        closes = [96, 97, 98, 99, 100]
+        opens  = [95.5, 96.5, 97.5, 98.5, 99.5]    # green
+        assert agent.check_cvd_absorption(make_df(closes, opens, [300]*5), "SHORT") is False
+
+    def test_threshold_is_config_overridable(self):
+        """move_mult/cvd_strong_threshold come from config; a strict config can
+        still veto the noisy case, proving the knobs are wired through."""
+        strict = MicrostructureAgent(
+            {"absorption": {"cvd_strong_threshold": 0.05, "move_mult": 0.0}})
+        assert strict.absorption_move_mult == 0.0
+        assert strict.cvd_strong_threshold == 0.05
+        # With the floor at 0 and a near-zero CVD bar, the noisy down move now
+        # trips the veto — confirming both knobs feed the decision.
+        assert strict.check_cvd_absorption(noisy_down_long_df(), "LONG") is False

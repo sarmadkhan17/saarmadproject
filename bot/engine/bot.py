@@ -49,7 +49,7 @@ from engine.correlation_check import CorrelationCheck
 from agents.macro_context    import MacroContextAgent
 from agents.microstructure   import MicrostructureAgent
 from agents.trade_memory     import TradeMemory
-from agents.shadow_tracker   import ShadowTracker
+from agents.shadow_tracker   import ShadowTracker, risk_gate_label
 from agents import trade_memory as trade_memory_mod
 from agents import vector_store
 from agents import llm_reasoning
@@ -353,7 +353,7 @@ class BaseBot:
 
         # New agents
         self.macro_context = MacroContextAgent(get_coingecko_key())
-        self.microstructure = MicrostructureAgent()
+        self.microstructure = MicrostructureAgent(self.config.get("microstructure", {}))
 
         # Ensemble: SMC (structure) + Technical (indicators) + MacroFlow (dominance)
         self.smc_agent   = SMCAgent()
@@ -502,12 +502,16 @@ class BaseBot:
         tf = self.config.get("scanner", {}).get("timeframe", "15m")
         return self.feed.get_atr(symbol, tf, 14)
 
-    def _record_shadow(self, symbol, gate, reason, ensemble, micro, regime, macro):
+    def _record_shadow(self, symbol, gate, reason, ensemble, micro, regime, macro,
+                       action=None):
         """Record a rejected directional signal as a shadow trade.
+        `action` overrides ensemble.action for gates that fire before/inside the
+        ensemble (trend veto converts the result to HOLD, losing the side).
         Must never break the scan loop — swallow everything."""
         if not self.shadow_tracker:
             return
         try:
+            action = action or ensemble.action
             # Redundancy matrix input: which OTHER cheap gates would also have
             # blocked this signal? (LLM gates excluded — no extra API calls.)
             # High overlap between two gates = duplication, not complementarity.
@@ -521,7 +525,7 @@ class BaseBot:
                 redundant.append("microstructure_soft")
             self.shadow_tracker.record_rejection(
                 symbol=symbol,
-                side="long" if ensemble.action == "BUY" else "short",
+                side="long" if action == "BUY" else "short",
                 gate=gate, reason=reason,
                 entry_price=self.get_price(symbol),
                 atr=self.get_atr(symbol),
@@ -762,15 +766,25 @@ class BaseBot:
                 self.log.debug(f"AGENT {symbol} | {s.agent}: net={s.net_score:+.3f} | {s.reasoning[:80]}")
 
             if ensemble.action == "HOLD":
+                is_trend_veto = (ensemble.source or "").startswith("trend_veto") \
+                    and ensemble.vetoed_action in ("BUY", "SELL")
                 self.state.add_signal({
                     "symbol": symbol, "action": "HOLD", "confidence": ensemble.confidence,
-                    "status": "hold", "reason": f"net={ensemble.net_score:+.3f}",
+                    "status": "hold",
+                    "reason": ensemble.source if is_trend_veto else f"net={ensemble.net_score:+.3f}",
                     "strategy": f"ensemble:{ensemble.net_score:+.3f}", "timeframe": "AUTO",
                     "indicators": {"buy_score": ensemble.buy_score, "sell_score": ensemble.sell_score,
                                    "agents_agree": ensemble.agents_agreeing},
                     "timestamp": datetime.now(LOCAL_TZ).isoformat(),
                 })
                 self.log.info(f"SIGNAL {symbol} → HOLD | net={ensemble.net_score:+.3f} regime={regime}")
+                # The trend veto is the only gate whose rejections were not
+                # shadow-tracked (it fires inside the ensemble, pre-micro).
+                # Record so its cost is measurable like every other gate.
+                if is_trend_veto:
+                    self._record_shadow(symbol, "trend_veto", ensemble.source,
+                                        ensemble, None, regime, macro,
+                                        action=ensemble.vetoed_action)
                 return
 
             # ── Gate 4: Microstructure confirm/kill ─────────────────────
@@ -782,8 +796,20 @@ class BaseBot:
             except Exception:
                 pass
 
+            # Absorption needs a true 5m frame — without it the agent silently
+            # falls back to the trading TF (15m), turning the documented
+            # 25-minute absorption window into 75 minutes. Fetched here (not in
+            # the bulk multi-TF fetch) because only actionable signals reach
+            # this gate; on failure pass None → agent falls back to df_tf.
+            df_5m = None
+            try:
+                df_5m = self.feed.fetch_ohlcv(symbol, "5m", limit=120)
+            except Exception:
+                pass
+
             micro = self.microstructure.analyze(
-                self.exchange, symbol, df_tf, ensemble.action, funding_rate
+                self.exchange, symbol, df_tf, ensemble.action, funding_rate,
+                df_5m=df_5m,
             )
             self.log.debug(f"MICRO {symbol} | {micro.reasoning}")
             if micro.kill:
@@ -848,13 +874,19 @@ class BaseBot:
                 skeptic = cached.get("skeptic")
                 self.log.info(f"ACTOR {symbol} | cached approved={actor.approved} conf={actor.confidence:.2f}")
             else:
-                # Vector RAG: retrieve similar past setups (hybrid semantic +
-                # feature) and semantically-relevant Judge lessons.
-                similar = self.trade_memory.find_similar(
-                    symbol, ensemble.action, regime, ensemble.net_score, macro["btc_d"], n=5,
+                # Vector RAG: precedent over the UNBIASED population — executed
+                # trades (realized) PLUS resolved shadow trades (counterfactual,
+                # i.e. rejected signals tracked to a hypothetical outcome). The
+                # counterfactual half breaks the selection-bias loop where the
+                # Actor only ever learns from setups it already approved.
+                precedent = self.trade_memory.find_similar_precedent(
+                    symbol, ensemble.action, regime, ensemble.net_score, macro["btc_d"],
                     confidence=ensemble.confidence, usdt_d=macro["usdt_d"],
                     ob_imbalance=micro.ob_imbalance, cvd_direction=micro.cvd_direction,
                     cvd_divergence=micro.cvd_divergence,
+                    half_life_h=float(actor_cfg.get("winrate_half_life_hours", 48.0)),
+                    prior=float(actor_cfg.get("winrate_prior_strength", 1.0)),
+                    shadow_weight=float(actor_cfg.get("shadow_precedent_weight", 0.7)),
                 )
                 side_word = "long" if ensemble.action == "BUY" else "short"
                 query_text = trade_memory_mod.entry_text(symbol, side_word, {
@@ -866,11 +898,11 @@ class BaseBot:
                     "cvd_divergence": micro.cvd_divergence,
                 })
                 lessons = self.trade_memory.find_similar_critiques(query_text, n=3)
-                sem = "semantic" if vector_store.get_embedder().available else "feature-only"
-                top_sim = f" top={similar[0]['symbol']}:{similar[0].get('_score',0):.2f}" if similar else ""
+                rz, cf = precedent["realized"], precedent["counterfactual"]
                 self.log.info(
-                    f"RAG {symbol} | {sem} | {len(similar)} similar trades, "
-                    f"{len(lessons)} lessons{top_sim}"
+                    f"RAG {symbol} | precedent realized {rz['win_rate']:.0%}(n={rz['n']}) "
+                    f"+ counterfactual {cf['win_rate']:.0%}(n={cf['n']}) "
+                    f"→ blended {precedent['blended']['win_rate']:.0%} | {len(lessons)} lessons"
                 )
                 extra_context = ""
                 if lessons:
@@ -892,10 +924,8 @@ class BaseBot:
                     ensemble_score=ensemble.net_score,
                     ensemble_confidence=ensemble.confidence,
                     regime=regime, macro=macro, micro_signal=micro,
-                    similar_trades=similar, extra_context=extra_context,
+                    precedent=precedent, extra_context=extra_context,
                     approve_threshold=self.profile.min_confidence,
-                    winrate_half_life_h=float(actor_cfg.get("winrate_half_life_hours", 48.0)),
-                    winrate_prior=float(actor_cfg.get("winrate_prior_strength", 1.0)),
                     trend_direction=trend_direction,
                 )
                 # Gate 5.5: skeptic argues against approved setups only — a
@@ -991,7 +1021,8 @@ class BaseBot:
                                    "regime": regime},
                     "timestamp": datetime.now(LOCAL_TZ).isoformat(),
                 })
-                self._record_shadow(symbol, "risk", " | ".join(decision.reasons),
+                self._record_shadow(symbol, risk_gate_label(decision.reasons),
+                                    " | ".join(decision.reasons),
                                     ensemble, micro, regime, macro)
                 return
 
@@ -1074,6 +1105,8 @@ class BaseBot:
                     "actor_reasoning": actor.reasoning,
                     "actor_approved": actor.approved,
                     "trend_change": trend_change,
+                    "micro_size_mult": getattr(micro, "size_mult", 1.0),
+                    "skeptic_size_mult": skeptic_size_mult,
                     "skeptic_strength": (skeptic.rebuttal_strength if skeptic else None),
                     "skeptic_objection": (skeptic.objection if skeptic else None),
                     "skeptic_size_mult": skeptic_size_mult,

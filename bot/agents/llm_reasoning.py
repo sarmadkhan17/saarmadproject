@@ -109,7 +109,15 @@ already passed a hard microstructure gate. Do NOT reduce confidence again for
 evidence was counted once upstream; counting it again silently double-charges
 every setup. Your exclusive value is what the quantitative gates cannot see:
 - Precedent: how did genuinely similar setups actually end? This is your
-  primary evidence.
+  primary evidence. You are given it in TWO forms:
+    · realized — setups that were actually traded. This sample is BIASED: it
+      only contains setups past gating approved, so a soured direction shows
+      few, unlucky examples.
+    · counterfactual — similar setups the gates REJECTED, then tracked to a
+      hypothetical TP/SL. This is the unbiased complement.
+  Lean on the BLENDED estimate. A counterfactual win-rate much higher than the
+  realized one means past gating was too strict on this kind of setup (it was
+  rejecting winners) — do not inherit that bias; judge on the blended edge.
 - Internal contradiction: layers that individually pass but jointly make no
   sense (e.g. a breakout thesis while funding shows the move is crowded).
 - Event risk or anything plainly anomalous in the combined picture.
@@ -119,8 +127,8 @@ Rules you NEVER break:
 - You do not predict price. You assess setup quality.
 - If microstructure.kill is true, output approved=false, confidence below 0.4.
 - If macro.kill is true, output approved=false, confidence=0.0.
-- Weigh the similar-trade record by its evidential strength: a clearly
-  negative precedent over a meaningful sample should lower confidence
+- Weigh precedent by the BLENDED estimate and its sample size: a clearly
+  negative blended edge over a meaningful sample should lower confidence
   materially; a small or mixed sample is weak evidence in either direction,
   not grounds for a mechanical penalty.
 - Confidence 0.0–1.0. approved=true only when confidence >= the approval
@@ -137,44 +145,6 @@ Output ONLY valid JSON. No preamble. No explanation outside JSON. Format:
 }"""
 
 
-def _decayed_winrate(similar_trades: list, half_life_h: float, prior: float) -> tuple:
-    """Recency-weighted, Bayesian-smoothed win-rate over similar past trades.
-
-    Fixes the freeze loop: a raw wins/total off the 5 most-recent similar trades
-    collapses to ~0% after a single losing session, which pins Actor confidence
-    below threshold and stops trading — so no new outcomes are ever recorded and
-    the prior never recovers. Here each trade is weighted by exp-decay on its age
-    (so a cluster of same-session losses fades over `half_life_h`) and the rate is
-    smoothed toward 0.5 with a Beta(prior, prior) pseudo-count (so a tiny sample
-    cannot read as 0% or 100%). Returns (smoothed_rate, raw_wins, total, avg_r).
-    """
-    now = datetime.now(LOCAL_TZ)
-    w_sum = w_win = wr_sum = 0.0
-    raw_wins = 0
-    for t in similar_trades:
-        pnl = t.get("pnl", 0) or 0
-        age_h = 24.0  # default if timestamp missing/unparseable
-        ca = t.get("closed_at")
-        if ca:
-            try:
-                dt = datetime.fromisoformat(str(ca).replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=LOCAL_TZ)
-                age_h = max(0.0, (now - dt).total_seconds() / 3600.0)
-            except Exception:
-                pass
-        w = 0.5 ** (age_h / max(half_life_h, 1e-6))
-        w_sum += w
-        if pnl > 0:
-            w_win += w
-            raw_wins += 1
-        wr_sum += w * (t.get("r_multiple", 0) or 0)
-    total = len(similar_trades)
-    smoothed_rate = (w_win + prior) / (w_sum + 2 * prior) if (w_sum + 2 * prior) > 0 else 0.5
-    avg_r = (wr_sum / w_sum) if w_sum > 0 else 0.0
-    return smoothed_rate, raw_wins, total, avg_r
-
-
 def actor_evaluate(
     symbol: str,
     action: str,
@@ -183,11 +153,9 @@ def actor_evaluate(
     regime: str,
     macro: dict,
     micro_signal,
-    similar_trades: list,
+    precedent: dict,
     extra_context: str = "",
     approve_threshold: float = 0.50,
-    winrate_half_life_h: float = 48.0,
-    winrate_prior: float = 1.0,
     trend_direction: str = "NEUTRAL",
 ) -> ActorDecision:
     """Call DeepSeek V3 to evaluate a trading setup.
@@ -195,21 +163,28 @@ def actor_evaluate(
     `approve_threshold` is the confidence floor for approval — wired to
     profile.min_confidence by the caller so the Actor gate matches the
     documented profile floor instead of a hidden hardcoded 0.50.
+
+    `precedent` is TradeMemory.find_similar_precedent() output: realized,
+    counterfactual and blended smoothed stats over similar past setups. The
+    recency-decay + Bayesian shrink (incl. avg_r) live there now.
     """
 
-    # Build similar trades summary (recency-weighted, smoothed — see _decayed_winrate)
+    # Build the precedent summary: realized (biased) + counterfactual (rejected,
+    # tracked) + blended edge. See ACTOR_SYSTEM for how the model must weigh them.
     trade_summary = ""
-    if similar_trades:
-        rate, raw_wins, total, avg_r = _decayed_winrate(
-            similar_trades, winrate_half_life_h, winrate_prior)
+    if precedent and (precedent["realized"]["n"] or precedent["counterfactual"]["n"]):
+        rz, cf, bl = precedent["realized"], precedent["counterfactual"], precedent["blended"]
+        def _f(s):
+            return f"{s['win_rate']:.0%} win, avgR {s['avg_r']:+.2f} (n={s['n']})"
         trade_summary = (
-            f"Similar past trades ({total}, recency-weighted): "
-            f"est win-rate {rate:.0%} (smoothed; raw {raw_wins}/{total}), "
-            f"avg R={avg_r:.2f}. "
+            f"Similar {precedent['regime']} {precedent['side']} setups — "
+            f"realized/taken: {_f(rz)}; "
+            f"counterfactual/rejected-but-tracked: {_f(cf)}. "
+            f"BLENDED edge: {bl['win_rate']:.0%} win, avgR {bl['avg_r']:+.2f}. "
         )
-        for t in similar_trades[:3]:
-            outcome = "WIN" if t.get("pnl", 0) > 0 else "LOSS"
-            trade_summary += f"[{t.get('symbol','?')} {t.get('side','?')} {outcome} R={t.get('r_multiple',0):.1f}] "
+        for e in precedent.get("examples", []):
+            tag = "WIN" if e["win"] else "LOSS"
+            trade_summary += f"[{e['symbol']} {e['source'][:4]} {tag} R={e['r']:+.1f}] "
 
     user_msg = f"""Symbol: {symbol} | Action: {action}
 Regime: {regime} | Trend direction: {trend_direction}

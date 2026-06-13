@@ -37,6 +37,29 @@ SL_MIN_PCT = 0.015   # SL never closer than 1.5% of entry
 SL_MAX_PCT = 0.25    # SL never further than 25% of entry
 
 
+def risk_gate_label(reasons: list) -> str:
+    """Sub-categorize a risk_agent rejection so each internal gate (4b breadth,
+    4c EMA20, HTF, BTC momentum, confidence floor, …) is individually
+    measurable in shadow stats. The failing gate's message is the last reason
+    appended before evaluate() returned."""
+    last = (reasons[-1] if reasons else "").lower()
+    if "breadth" in last or "blow-off" in last or "capitulation" in last:
+        return "risk_breadth"
+    if "20ema" in last or "ema" in last:
+        return "risk_ema20"
+    if "htf" in last:
+        return "risk_htf"
+    if "btc momentum" in last:
+        return "risk_btc"
+    if "regime" in last or "blocked in" in last:
+        return "risk_regime"
+    if "conf" in last:
+        return "risk_conf"
+    if "agents=" in last:
+        return "risk_agreement"
+    return "risk_other"
+
+
 def _to_utc_naive(dt: datetime) -> datetime:
     """Normalize any datetime to naive UTC (DataFeed candle index convention)."""
     if dt.tzinfo is None:
@@ -102,9 +125,12 @@ class ShadowTracker:
         now = datetime.now(LOCAL_TZ)
         try:
             with self._conn() as c:
+                # Cap is PER GATE: the trend veto fires ~10× more often than
+                # the downstream gates, and a shared cap would let it starve
+                # their shadows entirely.
                 n_open = c.execute(
-                    "SELECT COUNT(*) FROM shadow_trades WHERE mode=? AND status='open'",
-                    (self.mode,),
+                    "SELECT COUNT(*) FROM shadow_trades WHERE mode=? AND status='open' AND gate=?",
+                    (self.mode, gate),
                 ).fetchone()[0]
                 if n_open >= self.max_open:
                     return None

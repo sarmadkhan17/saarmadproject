@@ -57,6 +57,22 @@ class MicrostructureAgent:
     SOFT_WALL_MULT = 0.7    # contra wall present but CVD confirms the trade
     SOFT_DIV_MULT  = 0.75   # CVD divergence alone, order book not against
 
+    # Absorption-veto calibration (overridable from config — see __init__).
+    # The veto fires only on a GENUINE, unabsorbed adverse move: a meaningful
+    # price displacement (≥ MOVE_MULT × the window's own typical bar size) that
+    # CVD strongly confirms (slope ≥ CVD_STRONG_THRESHOLD). A low threshold here
+    # mistakes ordinary 5m chop for an aggressive dump/pump and vetoes both
+    # sides indiscriminately — the failure mode that soft-halted the bot.
+    CVD_STRONG_THRESHOLD = 0.45  # net delta/volume that counts as decisive flow
+    ABSORPTION_MOVE_MULT = 1.0   # adverse move must exceed this × typical bar move
+
+    def __init__(self, config: dict = None):
+        cfg = ((config or {}).get("absorption") or {})
+        self.cvd_strong_threshold = float(
+            cfg.get("cvd_strong_threshold", self.CVD_STRONG_THRESHOLD))
+        self.absorption_move_mult = float(
+            cfg.get("move_mult", self.ABSORPTION_MOVE_MULT))
+
     def analyze(
         self,
         exchange,
@@ -187,17 +203,23 @@ class MicrostructureAgent:
         """
         Detect whether passive limit orders are absorbing aggressive market flow.
 
-        For LONG at support:
-          - Absorption confirmed when price is falling but CVD is NOT falling
-            aggressively (CVD higher low vs price lower low, or CVD flattening).
-          - No absorption when price AND CVD both fall — genuine dump.
+        Returns True (absorption present / no decisive opposing flow → don't
+        veto) UNLESS a genuine, unabsorbed adverse move is in progress. "No
+        absorption" requires ALL of:
+          1. Significant adverse price displacement — the net move over the
+             window exceeds MOVE_MULT × the window's own typical bar move
+             (volatility-scaled, so ordinary 5m chop nets ~0 and never vetoes).
+          2. CVD strongly confirms it — directional slope ≥ CVD_STRONG_THRESHOLD
+             on BOTH the full window and the last 3 bars.
+          3. No rescuing divergence — for a LONG, falling price on net-buying
+             candles (CVD rising) IS absorption; symmetric for a SHORT.
 
-        For SHORT at resistance:
-          - Absorption confirmed when price is rising but CVD is NOT rising
-            aggressively (CVD lower high vs price higher high, or CVD flattening).
-          - No absorption when price AND CVD both rise — genuine pump.
+        For LONG at support: veto only on a real dump (price down + CVD down).
+        For SHORT at resistance: veto only on a real pump (price up + CVD up).
+        A small/noisy move, a flat/diverging CVD, or a late flattening → pass.
 
-        Returns True if absorption is detected, False otherwise (safe default).
+        Returns False (no absorption) only on a decisive adverse move; True
+        otherwise. Insufficient data defaults to False (safe).
         """
         if df_5m is None or len(df_5m) < self.ABSORPTION_MIN_LEN:
             return False
@@ -213,9 +235,6 @@ class MicrostructureAgent:
                              np.where(close < open_, -volume, 0.0))
             cvd   = np.cumsum(delta)
 
-            price_falling = close[-1] < close[0]
-            price_rising  = close[-1] > close[0]
-
             cvd_start, cvd_end = cvd[0], cvd[-1]
             cvd_falling = cvd_end < cvd_start
             cvd_rising  = cvd_end > cvd_start
@@ -224,29 +243,40 @@ class MicrostructureAgent:
             total_volume   = volume.sum() or 1.0
             cvd_slope_norm = abs(cvd_end - cvd_start) / total_volume
 
-            # Recent slope: last 3 bars only (captures late flattening)
+            # Recent slope: last 3 bars only (so a late flattening still rescues)
             recent_net_delta  = abs(delta[-3:].sum())
             recent_volume     = volume[-3:].sum() or 1.0
             recent_slope_norm = recent_net_delta / recent_volume
 
-            CVD_FLAT_THRESHOLD = 0.15  # ≤15 % net delta/volume = flat
+            cvd_decisive = (cvd_slope_norm > self.cvd_strong_threshold
+                            and recent_slope_norm > self.cvd_strong_threshold)
+
+            # Adverse price displacement, scaled by the window's own volatility:
+            # the net move must exceed MOVE_MULT × the typical per-bar move
+            # (mean abs bar-to-bar return). Chop → net≈0 ≪ scale → no veto.
+            base = close[0] if close[0] else 1.0
+            net_move = (close[-1] - close[0]) / base
+            steps = np.abs(np.diff(close)) / base
+            typical_bar = float(steps.mean()) if steps.size else 0.0
+            move_floor = self.absorption_move_mult * typical_bar
+            # Degenerate (flat synthetic data, no volatility) → fall back to the
+            # sign of the net move so directional test fixtures still resolve.
+            significant_against = (
+                abs(net_move) > move_floor if move_floor > 0 else net_move != 0
+            )
 
             if side == "LONG":
-                if not price_falling:
-                    return True
-                # Genuine dump requires: CVD falling AND recent slope still aggressive
-                if cvd_falling and cvd_slope_norm > CVD_FLAT_THRESHOLD \
-                        and recent_slope_norm > CVD_FLAT_THRESHOLD:
-                    return False
-                # CVD flat/rising OR recently flattened → absorption detected
-                return True
+                price_against = net_move < 0  # price falling
+                if price_against and significant_against \
+                        and cvd_falling and cvd_decisive:
+                    return False                       # genuine dump
+                return True                            # absorption / no decisive flow
 
             elif side == "SHORT":
-                if not price_rising:
-                    return True
-                if cvd_rising and cvd_slope_norm > CVD_FLAT_THRESHOLD \
-                        and recent_slope_norm > CVD_FLAT_THRESHOLD:
-                    return False
+                price_against = net_move > 0  # price rising
+                if price_against and significant_against \
+                        and cvd_rising and cvd_decisive:
+                    return False                       # genuine pump
                 return True
 
             return True  # unknown side — don't veto

@@ -8,9 +8,14 @@ actor:
   #   recency-decayed win-rate fed to the Actor (smaller = forgets losses faster).
   # winrate_prior_strength: Beta(prior,prior) smoothing toward 50% so a tiny
   #   recent losing cluster can't read as 0% and freeze trading.
+  # shadow_precedent_weight: weight of counterfactual (rejected-but-tracked
+  #   shadow) trades vs realized trades in the blended precedent. 0 = realized
+  #   only (the old selection-biased behaviour); 1 = equal. Counterfactuals are
+  #   hypothetical (fixed ATR TP/SL, no active management) so they sit <1.
   cache_ttl_seconds: 180
   winrate_half_life_hours: 24
   winrate_prior_strength: 3.0
+  shadow_precedent_weight: 0.7
 adversary:
   # Skeptic / adversarial deliberation (Gate 5.5) — Llama on Groq argues
   # AGAINST every Actor-approved setup. Deterministic resolution:
@@ -73,10 +78,18 @@ shadow_tracker:
   # real trade would have used) so Meta-Judge/operator learn whether gates
   # block winners or save losses. Observational only — never auto-tunes.
   enabled: true
-  max_open: 60                 # cap on concurrent open shadows
+  max_open: 60                 # cap on concurrent open shadows PER GATE
   max_age_hours: 48            # unresolved after this → expired (mark-to-market)
   per_symbol_cooldown_min: 60  # dedup re-fired rejections per (symbol, side)
   resolve_every_n_cycles: 10   # check outcomes every ~10 min at 60s scans
+microstructure:
+  # Gate 4 order-flow validation. The absorption sub-check hard-kills a signal
+  # only on a GENUINE unabsorbed adverse move (real dump vs a long, real pump
+  # vs a short). Both thresholds gate that veto; lowering them re-introduces
+  # the failure where ordinary 5m chop vetoes both sides and halts the bot.
+  absorption:
+    cvd_strong_threshold: 0.45  # net delta/volume that counts as decisive flow
+    move_mult: 1.0              # adverse move must exceed this × typical bar move
 strategy:
   # NOTE: min_confidence / min_votes / htf_filter_mode here are display/legacy only.
   # The live entry gates use the TradingProfile preset (see bot/engine/profiles.py).

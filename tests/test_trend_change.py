@@ -219,3 +219,78 @@ class TestTrendVetoOverride:
         eng = self._engine("down", long_allowed=False, short_allowed=False)
         assert eng._apply_trend_filter("SELL", {}, "down") is None
         assert eng._apply_trend_filter("SELL", {}, "up") is not None
+
+    def test_veto_preserves_original_action_for_shadow(self):
+        """A trend veto converts the result to HOLD but must keep the original
+        side in vetoed_action so the rejection can be shadow-tracked."""
+        from bot.engine.ensemble import EnsembleEngine
+        from bot.engine.smc_agent import AgentSignal
+
+        bull = AgentSignal("smc", 0.8, 0.0, 0.8, 0.8, reasoning="stub")
+        bull_t = AgentSignal("technical", 0.8, 0.0, 0.8, 0.8, reasoning="stub")
+        smc = SimpleNamespace(analyze=lambda df, p, ctx=None: bull)
+        tech = SimpleNamespace(analyze=lambda df, p: bull_t)
+        eng = EnsembleEngine(smc, tech, None,
+                             trend_filter={"enabled": True, "use_two_tier": True})
+        eng._tf2 = SimpleNamespace(check=lambda dfs: {
+            "long_allowed": False, "short_allowed": False,
+            "reasoning": "fast=flat → no direction admitted",
+            "fast": {"direction": "flat"},
+            "slow": {"direction": "down", "strong": False},
+        })
+        profile = SimpleNamespace(net_score_threshold=0.05)
+        df = _df_1h("up")
+        res = eng.run("BTC/USDT", {"1h": df}, profile, market_ctx={})
+        assert res.action == "HOLD"
+        assert res.source.startswith("trend_veto")
+        assert res.vetoed_action == "BUY"
+
+    def test_no_veto_leaves_vetoed_action_none(self):
+        from bot.engine.ensemble import EnsembleEngine
+        from bot.engine.smc_agent import AgentSignal
+
+        bull = AgentSignal("smc", 0.8, 0.0, 0.8, 0.8, reasoning="stub")
+        bull_t = AgentSignal("technical", 0.8, 0.0, 0.8, 0.8, reasoning="stub")
+        smc = SimpleNamespace(analyze=lambda df, p, ctx=None: bull)
+        tech = SimpleNamespace(analyze=lambda df, p: bull_t)
+        eng = EnsembleEngine(smc, tech, None,
+                             trend_filter={"enabled": True, "use_two_tier": True})
+        eng._tf2 = SimpleNamespace(check=lambda dfs: {
+            "long_allowed": True, "short_allowed": False,
+            "reasoning": "fast=up slow=up → LONG allowed",
+            "fast": {"direction": "up"},
+            "slow": {"direction": "up", "strong": False},
+        })
+        profile = SimpleNamespace(net_score_threshold=0.05)
+        res = eng.run("BTC/USDT", {"1h": _df_1h("up")}, profile, market_ctx={})
+        assert res.action == "BUY"
+        assert res.vetoed_action is None
+
+
+# ─── Risk rejection → shadow gate label ─────────────────────────────────────
+
+class TestRiskGateLabel:
+    def test_categories(self):
+        from bot.agents.shadow_tracker import risk_gate_label
+        assert risk_gate_label(["shorts blocked: STRONG_TREND breadth=75%"]) == "risk_breadth"
+        assert risk_gate_label(["longs blocked: blow-off breadth=85%"]) == "risk_breadth"
+        assert risk_gate_label(["price 1.00 below 20EMA 1.10 (bearish)"]) == "risk_ema20"
+        assert risk_gate_label(["HTF SELL hard-block (conf=0.50 < 0.65)"]) == "risk_htf"
+        assert risk_gate_label(["BTC momentum: conf=0.40 < eff=0.50"]) == "risk_btc"
+        assert risk_gate_label(["regime=CHOPPY gate closed"]) == "risk_regime"
+        assert risk_gate_label(["conf=0.44 < eff=0.50"]) == "risk_conf"
+        assert risk_gate_label(["agents=1/3 < 2"]) == "risk_agreement"
+        assert risk_gate_label(["size too small: $5.00"]) == "risk_other"
+        assert risk_gate_label([]) == "risk_other"
+
+    def test_uses_last_reason(self):
+        """Earlier reasons are passed gates' annotations; the failure is last.
+        A post-HTF confidence failure attributes to the HTF gate — the
+        softening is what pushed conf under the floor."""
+        from bot.agents.shadow_tracker import risk_gate_label
+        assert risk_gate_label(
+            ["agents=2/3 ok",
+             "post-HTF conf=0.48 < eff=0.50"]) == "risk_htf"
+        assert risk_gate_label(
+            ["HTF SELL softened → conf=0.48",
+             "size too small: $5.00"]) == "risk_other"

@@ -45,8 +45,8 @@ Gotcha: the project `venv/` does **not** have `pytest` installed — use the sys
 Gate 0/1  Macro kill + universe filter   agents/macro_context.py (CoinGecko BTC.D/USDT.D RoC)
 Layer 1   Ensemble vote                  engine/ensemble.py = SMC + Technical + MacroFlow,
                                            regime-adaptive weights + TrendFilter veto
-Gate 4    Microstructure confirm/kill    agents/microstructure.py (orderbook imbalance, CVD, funding)
-Gate 5    DeepSeek Actor reasoning       agents/llm_reasoning.py (LLM endorses, RAG over past trades)
+Gate 4    Microstructure confirm/kill    agents/microstructure.py (orderbook imbalance, CVD, funding, 5m absorption)
+Gate 5    DeepSeek Actor reasoning       agents/llm_reasoning.py (LLM endorses, RAG: realized + counterfactual precedent)
 Gate 6    Risk decision + Kelly sizing   engine/risk_agent.py + risk/manager.py
           → execute on Binance Demo      engine/execution_engine.py
 On close          → Judge (R1) writes a verbal critique  (agents/llm_reasoning.py)
@@ -55,7 +55,9 @@ Every 20 closes   → Meta-Judge (R1) synthesizes rules injected into the Actor 
 
 The "regime gate" and "ensemble minimum" (the `BOT_MANUAL` calls them Gate 2/3) live *inside* Layer 1's aggregation, not as separate steps.
 
-**Learning loop (no ML training):** `agents/trade_memory.py` is a SQLite store (`data/trade_memory.db`) of every closed trade + its entry context + the Judge's critique. The Actor pulls similar past trades as RAG context (`agents/vector_store.py`, sentence-transformers embeddings). Meta-Judge distills accumulated critiques into rules. This is the entire "self-improvement" mechanism — there are no model files or retrain pipelines.
+**Learning loop (no ML training):** `agents/trade_memory.py` is a SQLite store (`data/trade_memory.db`) of every closed trade + its entry context + the Judge's critique. The Actor pulls similar past setups as RAG context (`agents/vector_store.py`, sentence-transformers embeddings + a regime/flow feature vector). Meta-Judge distills accumulated critiques into rules. This is the entire "self-improvement" mechanism — there are no model files or retrain pipelines.
+
+**Counterfactual precedent (selection-bias fix).** `find_similar_precedent()` blends two populations: *realized* trades (executed — biased, since the Actor only takes what it approved) and *counterfactual* trades (resolved `shadow_trades` — signals the gates REJECTED, tracked to a hypothetical TP/SL). Without the counterfactual half the Actor learned only from its own picks and could lock a direction permanently (it once read longs as 0/5 win while the longs it *rejected* won 56%). The blended, recency-decayed, Bayesian-smoothed win-rate/avg-R (both shrunk — see `smoothed_stats`) is the Actor's primary precedent; shadow weight is `actor.shadow_precedent_weight`. Similarity is regime-conditioned — `vector_store._REGIMES` must list the **live** regime names (`STRONG_TREND/WEAK_TREND/CHOPPY/EXHAUSTION_*/…`) or a regime collapses to the all-zeros bucket and stops discriminating.
 
 **`data/` is the IPC bus.** The bot, dashboard, and `system_auditor.py` are separate processes that coordinate through JSON/SQLite files in `data/`, not shared memory: `*_state.json` (per-mode trades), `bot_heartbeat_<mode>.json` (watchdog liveness), `circuit_breaker.json`, `scanner_cache.json`, `deepseek_usage.json`, `proposed_changes.md` / `audit_proposals.json` (auditor output). Dashboard control endpoints and the auditor mutate the same files the bot reads.
 

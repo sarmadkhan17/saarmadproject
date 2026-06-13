@@ -22,11 +22,15 @@ import logging
 import sqlite3
 import numpy as np
 from datetime import datetime, timezone
-from core.tz import LOCAL_TZ
 from pathlib import Path
 from typing import Optional
 
-from agents import vector_store as vs
+try:                                       # bot runtime (sys.path = bot/)
+    from core.tz import LOCAL_TZ
+    from agents import vector_store as vs
+except ImportError:                        # tests import via the bot. package
+    from bot.core.tz import LOCAL_TZ
+    from bot.agents import vector_store as vs
 
 log = logging.getLogger("TradeMemory")
 
@@ -59,6 +63,37 @@ def critique_text(critique: dict) -> str:
         f"Missed warnings: {critique.get('missed_warnings','') or 'none'}. "
         f"Lesson: {critique.get('lesson','')}"
     ).strip()
+
+
+def smoothed_stats(rows: list, half_life_h: float, prior: float,
+                   now: Optional[datetime] = None) -> dict:
+    """Recency-weighted, Bayesian-smoothed win-rate AND avg-R over `rows`.
+
+    Each row is ``{"win": bool, "r": float, "age_h": float, "sw": float}`` where
+    ``sw`` is an optional per-row source weight (realized=1.0, counterfactual<1).
+    A trade's weight is ``sw · 0.5**(age_h/half_life)`` so same-session clusters
+    fade over `half_life_h`. Both statistics are shrunk toward their neutral
+    value with a Beta/pseudo-count `prior`:
+      - win-rate toward 0.5 — a tiny sample can't read as 0% or 100%
+      - avg_r toward 0.0    — the bug the old prompt had: avg_r was NEVER
+        smoothed, so 5 losers read as a hard −0.6R anchor regardless of sample.
+    Returns {n, raw_wins, win_rate, avg_r, weight}.
+    """
+    now = now or datetime.now(LOCAL_TZ)
+    w_sum = w_win = wr_sum = 0.0
+    raw_wins = 0
+    for t in rows:
+        w = float(t.get("sw", 1.0)) * 0.5 ** (t["age_h"] / max(half_life_h, 1e-6))
+        w_sum += w
+        if t["win"]:
+            w_win += w
+            raw_wins += 1
+        wr_sum += w * (t["r"] or 0.0)
+    n = len(rows)
+    win_rate = (w_win + prior) / (w_sum + 2 * prior) if (w_sum + 2 * prior) > 0 else 0.5
+    avg_r = wr_sum / (w_sum + prior) if (w_sum + prior) > 0 else 0.0
+    return {"n": n, "raw_wins": raw_wins, "win_rate": win_rate,
+            "avg_r": avg_r, "weight": w_sum}
 
 
 class TradeMemory:
@@ -336,6 +371,112 @@ class TradeMemory:
         except Exception as e:
             log.error(f"TradeMemory find_similar error: {e}")
             return []
+
+    # ── Counterfactual-aware precedent (the Actor's primary evidence) ────────
+
+    @staticmethod
+    def _empty_precedent(regime: str, side: str) -> dict:
+        z = {"n": 0, "raw_wins": 0, "win_rate": 0.5, "avg_r": 0.0, "weight": 0.0}
+        return {"realized": dict(z), "counterfactual": dict(z), "blended": dict(z),
+                "examples": [], "regime": regime, "side": side}
+
+    def find_similar_precedent(
+        self, symbol: str, action: str, regime: str, ensemble_score: float,
+        btc_d: float, *, confidence: float = 0.0, usdt_d: float = 5.0,
+        ob_imbalance: float = 1.0, cvd_direction: str = "neutral",
+        cvd_divergence: bool = False, half_life_h: float = 48.0,
+        prior: float = 1.0, shadow_weight: float = 0.7, sim_floor: float = 0.7,
+        max_realized: int = 40, max_shadow: int = 120, n_examples: int = 4,
+    ) -> dict:
+        """Precedent over the UNBIASED population for "setups like this".
+
+        Pools two sources, each scored by *feature-only* similarity (same scale
+        — shadows carry no text embedding) with NO outcome reranking so the
+        retrieved sample is representative, not cherry-picked:
+          - realized: executed trades (the `trades` table). Biased — it only
+            contains setups the Actor already approved.
+          - counterfactual: resolved shadow trades (rejected signals tracked to
+            a hypothetical TP/SL). The unbiased complement; breaks the
+            self-fulfilling loop where the Actor learns only from its own picks.
+
+        Returns smoothed realized / counterfactual / blended stats (shadows
+        down-weighted by `shadow_weight`) plus a few source-tagged examples.
+        """
+        side = "long" if action == "BUY" else "short"
+        now = datetime.now(LOCAL_TZ)
+        q = vs.feature_vector(side, regime, ensemble_score, confidence, btc_d,
+                              usdt_d, ob_imbalance, cvd_direction, bool(cvd_divergence))
+
+        def _age_h(ts) -> float:
+            try:
+                dt = datetime.fromisoformat(str(ts))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
+                return max(0.0, (now - dt).total_seconds() / 3600.0)
+            except Exception:
+                return 24.0
+
+        def _sim(r) -> float:
+            cf = vs.feature_vector(side, r["regime"], r["ensemble_score"],
+                                   r["confidence"], r["btc_d"], r["usdt_d"],
+                                   r["ob_imbalance"], r["cvd_direction"] or "neutral",
+                                   bool(r["cvd_divergence"]))
+            return float(vs.cosine_matrix(q, cf[None, :])[0])
+
+        def _select(rows, cap):
+            scored = sorted(((_sim(r), r) for r in rows), key=lambda x: x[0], reverse=True)
+            kept = [(s, r) for s, r in scored if s >= sim_floor][:cap]
+            # Sparse source above the floor → fall back to its top-8 so it still
+            # contributes (a thin realized sample must not vanish entirely).
+            if len(kept) < min(8, len(scored)):
+                kept = scored[:min(8, len(scored))]
+            return kept
+
+        cols = ("regime,ensemble_score,confidence,ob_imbalance,"
+                "cvd_direction,cvd_divergence,btc_d,usdt_d,symbol")
+        # Realized and counterfactual are queried independently so a missing or
+        # empty shadow_trades table only zeros the counterfactual, never the
+        # realized precedent (and vice-versa).
+        ex_rows, sh_rows = [], []
+        try:
+            with self._conn() as c:
+                ex_rows = [dict(zip((cols + ",pnl,r_multiple,closed_at").split(","), r))
+                           for r in c.execute(
+                    f"SELECT {cols},pnl,r_multiple,closed_at FROM trades "
+                    f"WHERE side=? ORDER BY closed_at DESC LIMIT 300", (side,))]
+        except Exception as e:
+            log.error(f"find_similar_precedent realized query error: {e}")
+        try:
+            with self._conn() as c:
+                sh_rows = [dict(zip((cols + ",outcome_r,status,resolved_at").split(","), r))
+                           for r in c.execute(
+                    f"SELECT {cols},outcome_r,status,resolved_at FROM shadow_trades "
+                    f"WHERE side=? AND status IN ('tp','sl') "
+                    f"ORDER BY resolved_at DESC LIMIT 500", (side,))]
+        except Exception as e:
+            log.debug(f"find_similar_precedent counterfactual unavailable: {e}")
+
+        realized = [{"win": (r["pnl"] or 0) > 0, "r": r["r_multiple"] or 0.0,
+                     "age_h": _age_h(r["closed_at"]), "sw": 1.0,
+                     "symbol": r["symbol"], "sim": s, "source": "realized"}
+                    for s, r in _select(ex_rows, max_realized)]
+        counter = [{"win": r["status"] == "tp", "r": r["outcome_r"] or 0.0,
+                    "age_h": _age_h(r["resolved_at"]), "sw": shadow_weight,
+                    "symbol": r["symbol"], "sim": s, "source": "counterfactual"}
+                   for s, r in _select(sh_rows, max_shadow)]
+
+        rz = smoothed_stats(realized, half_life_h, prior, now)
+        cf = smoothed_stats(counter, half_life_h, prior, now)
+        bl = smoothed_stats(realized + counter, half_life_h, prior, now)
+
+        # Examples: the most-similar few from each source (mix realized + tracked)
+        examples = []
+        for pool in (realized, counter):
+            for e in sorted(pool, key=lambda x: x["sim"], reverse=True)[:max(1, n_examples // 2)]:
+                examples.append({"symbol": e["symbol"], "source": e["source"],
+                                 "win": e["win"], "r": round(e["r"], 2)})
+        return {"realized": rz, "counterfactual": cf, "blended": bl,
+                "examples": examples[:n_examples], "regime": regime, "side": side}
 
     def find_similar_critiques(self, query_text: str, n: int = 3) -> list:
         """Semantic retrieval over the Judge-critique store, reranked by recency.

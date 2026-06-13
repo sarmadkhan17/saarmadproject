@@ -1,5 +1,11 @@
 bot:
   scan_interval_seconds: 30
+actor:
+  # DeepSeek Actor (Gate 5) controls — see config_futures.yaml for full notes.
+  cache_ttl_seconds: 180
+  winrate_half_life_hours: 24
+  winrate_prior_strength: 3.0
+  shadow_precedent_weight: 0.7   # counterfactual (rejected-but-tracked) weight vs realized
 adversary:
   # Skeptic / adversarial deliberation (Gate 5.5) — see config_futures.yaml.
   enabled: true
@@ -55,10 +61,18 @@ shadow_tracker:
   # real trade would have used) so Meta-Judge/operator learn whether gates
   # block winners or save losses. Observational only — never auto-tunes.
   enabled: true
-  max_open: 60                 # cap on concurrent open shadows
+  max_open: 60                 # cap on concurrent open shadows PER GATE
   max_age_hours: 48            # unresolved after this → expired (mark-to-market)
   per_symbol_cooldown_min: 60  # dedup re-fired rejections per (symbol, side)
   resolve_every_n_cycles: 10   # check outcomes every ~5 min at 30s scans
+microstructure:
+  # Gate 4 order-flow validation. The absorption sub-check hard-kills a signal
+  # only on a GENUINE unabsorbed adverse move (real dump vs a long, real pump
+  # vs a short). Both thresholds gate that veto; lowering them re-introduces
+  # the failure where ordinary 5m chop vetoes both sides and halts the bot.
+  absorption:
+    cvd_strong_threshold: 0.45  # net delta/volume that counts as decisive flow
+    move_mult: 1.0              # adverse move must exceed this × typical bar move
 strategy:
   # NOTE: min_confidence / min_votes / htf_filter_mode here are display/legacy only.
   # The live entry gates use the TradingProfile preset (see bot/engine/profiles.py).

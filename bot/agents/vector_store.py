@@ -165,7 +165,18 @@ def cosine_matrix(query: np.ndarray, mat: np.ndarray) -> np.ndarray:
 # with an explicit feature vector. Each field is mapped onto a roughly
 # unit-scaled axis so plain cosine over the vector is meaningful.
 
-_REGIMES = ["TRENDING", "RANGING", "VOLATILE", "BULLISH", "BEARISH", "NEUTRAL"]
+# Live regime taxonomy (bot/risk/manager.py MarketRegimeGate). Each name gets its
+# own one-hot axis so "similar" trades must share regime. Previously this listed
+# only legacy names (TRENDING/VOLATILE/…), so the live regimes — CHOPPY,
+# WEAK_TREND, STRONG_TREND, EXHAUSTION_* — all collapsed to the all-zeros vector
+# and regime contributed NOTHING to similarity. An unlisted/UNKNOWN regime still
+# maps to all-zeros (no regime signal) rather than silently colliding.
+_REGIMES = [
+    "STRONG_TREND", "WEAK_TREND", "TRENDING", "RANGING", "CHOPPY",
+    "VOLATILE", "HIGH_VOLATILITY", "CRASH",
+    "EXHAUSTION_TOP", "EXHAUSTION_BOTTOM",
+    "BULLISH", "BEARISH", "NEUTRAL",
+]
 _CVD = {"bullish": 1.0, "bearish": -1.0, "neutral": 0.0, "up": 1.0, "down": -1.0}
 
 

@@ -170,6 +170,18 @@ class TestGuards:
         # Different gate for same symbol/side → allowed (adversary must not be blocked by micro)
         adv = tracker.record_rejection("ETH/USDT", "long", "adversary", "r3", 101.0, 2.0, p, CTX)
         assert adv is not None
+
+    def test_max_open_cap_is_per_gate(self, tmp_path):
+        """The open-shadow cap applies per gate: a high-volume gate (trend_veto
+        fires ~10× more than the others) must not starve other gates' shadows."""
+        tracker = make_tracker(tmp_path, max_open=2, per_symbol_cooldown_min=0)
+        p = TradingProfile.load("BALANCED")
+        assert tracker.record_rejection("A/USDT", "long", "trend_veto", "r", 100.0, 2.0, p, CTX)
+        assert tracker.record_rejection("B/USDT", "long", "trend_veto", "r", 100.0, 2.0, p, CTX)
+        # trend_veto at cap → rejected
+        assert tracker.record_rejection("C/USDT", "long", "trend_veto", "r", 100.0, 2.0, p, CTX) is None
+        # other gate unaffected by trend_veto's cap
+        assert tracker.record_rejection("C/USDT", "long", "micro", "r", 100.0, 2.0, p, CTX)
         # Opposite side is NOT deduped
         other = tracker.record_rejection("ETH/USDT", "short", "actor", "r", 100.0, 2.0, p, CTX)
         assert other is not None
