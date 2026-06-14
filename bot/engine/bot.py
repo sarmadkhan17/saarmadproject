@@ -335,6 +335,9 @@ class BaseBot:
         # the first scan (no-op if embeddings are unavailable or already done).
         try:
             self.trade_memory.backfill_embeddings()
+            # One-time mint of lessons from already-resolved skipped trades so the
+            # balanced lesson pool exists from the first scan, not days later.
+            self.trade_memory.backfill_shadow_lessons()
         except Exception as e:
             self.log.warning(f"Embedding backfill skipped: {e}")
 
@@ -558,6 +561,12 @@ class BaseBot:
             resolved = self.shadow_tracker.resolve_open(self.feed.fetch_ohlcv)
             if resolved:
                 self.log.info(f"SHADOW resolved {len(resolved)} hypothetical trades")
+                # Mint a balanced lesson from each skipped-trade outcome so the
+                # Actor's lesson channel stops being one-sided (taken trades only).
+                minted = sum(1 for s in resolved
+                             if self.trade_memory.add_shadow_lesson(s))
+                if minted:
+                    self.log.info(f"SHADOW minted {minted} skipped-trade lessons")
         except Exception as e:
             self.log.debug(f"shadow resolve failed: {e}")
 

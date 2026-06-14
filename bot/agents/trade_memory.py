@@ -228,6 +228,88 @@ class TradeMemory:
         except Exception as e:
             log.error(f"TradeMemory critique error: {e}")
 
+    def add_shadow_lesson(self, shadow: dict) -> bool:
+        """Mint a templated lesson from a RESOLVED shadow (skipped) trade.
+
+        The Judge only critiques trades that were TAKEN, so the lesson pool is
+        one-sided (it can say "this long lost" but never "the long we skipped
+        won"). This writes the missing half — a plain-language note for each
+        rejected signal tracked to TP/SL — so the Actor's lesson channel becomes
+        as representative as its stats channel. No LLM call: the text is a
+        template over data the shadow already carries (the embedding is local).
+        Idempotent per shadow id; only decided (tp/sl) shadows qualify.
+        """
+        status = shadow.get("status")
+        if status not in ("tp", "sl"):
+            return False
+        tid = f"shadow:{shadow.get('id')}"
+        side = shadow.get("side", "?")
+        regime = shadow.get("regime") or "?"
+        r = float(shadow.get("outcome_r") or 0.0)
+        if status == "tp":
+            outcome = "WIN"
+            lesson = (f"A {side} in {regime} like this was SKIPPED but would have "
+                      f"hit TP (+{r:.1f}R) — this setup type was profitable; do not "
+                      f"reject it by default.")
+        else:
+            outcome = "LOSS"
+            lesson = (f"A {side} in {regime} like this was SKIPPED and would have "
+                      f"hit SL (-1R) — correctly avoided; this setup type was "
+                      f"unprofitable.")
+        try:
+            ctx = {
+                "regime": regime,
+                "ensemble_score": shadow.get("ensemble_score", 0),
+                "confidence": shadow.get("confidence", 0),
+                "btc_d": shadow.get("btc_d", 50),
+                "usdt_d": shadow.get("usdt_d", 5),
+                "ob_imbalance": shadow.get("ob_imbalance", 1),
+                "cvd_direction": shadow.get("cvd_direction", "neutral"),
+                "cvd_divergence": shadow.get("cvd_divergence"),
+            }
+            emb = vs.get_embedder().encode(entry_text(shadow.get("symbol", ""), side, ctx))
+            with self._conn() as c:
+                exists = c.execute(
+                    "SELECT 1 FROM judge_critiques WHERE trade_id=? LIMIT 1", (tid,)
+                ).fetchone()
+                if exists:
+                    return False
+                c.execute("""
+                INSERT INTO judge_critiques
+                (trade_id, symbol, outcome, pnl, decision_quality,
+                 entry_valid, risk_managed, missed_warnings, lesson,
+                 pattern_tag, reviewed_at, embedding)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    tid, shadow.get("symbol", ""), outcome, 0.0, "skipped",
+                    1, 1, "", lesson,
+                    f"skipped_{side}_{regime}",
+                    shadow.get("resolved_at") or datetime.now(LOCAL_TZ).isoformat(),
+                    vs.to_blob(emb),
+                ))
+            return True
+        except Exception as e:
+            log.debug(f"add_shadow_lesson failed {shadow.get('id')}: {e}")
+            return False
+
+    def backfill_shadow_lessons(self, limit: int = 400) -> int:
+        """One-time mint of shadow lessons for already-resolved shadows so the
+        balanced lesson pool exists immediately (bounded to the most recent
+        `limit`). Safe/idempotent on startup; a no-op once they exist."""
+        try:
+            with self._conn() as c:
+                c.row_factory = sqlite3.Row
+                rows = [dict(r) for r in c.execute(
+                    "SELECT * FROM shadow_trades WHERE status IN ('tp','sl') "
+                    "ORDER BY resolved_at DESC LIMIT ?", (limit,)
+                ).fetchall()]
+        except Exception as e:
+            log.debug(f"backfill_shadow_lessons query failed: {e}")
+            return 0
+        minted = sum(1 for s in rows if self.add_shadow_lesson(s))
+        if minted:
+            log.info(f"Backfilled {minted} shadow lessons (skipped-trade outcomes).")
+        return minted
+
     def save_meta_rules(self, meta_output: dict):
         """Save Meta-Judge synthesized rules."""
         try:
@@ -253,14 +335,22 @@ class TradeMemory:
         return None
 
     def get_recent_critiques(self, limit: int = 20) -> list:
-        """Return recent Judge critiques for Meta-Judge input."""
+        """Return recent Judge critiques for Meta-Judge input.
+
+        Excludes minted shadow lessons (trade_id 'shadow:%') — those balance the
+        Actor's per-setup lesson channel, but Meta-Judge rules must still be
+        synthesized only from REAL closed trades the Judge actually reviewed.
+        """
         try:
             with self._conn() as c:
-                rows = c.execute(
-                    "SELECT * FROM judge_critiques ORDER BY id DESC LIMIT ?",
+                cur = c.execute(
+                    "SELECT * FROM judge_critiques "
+                    "WHERE trade_id NOT LIKE 'shadow:%' "
+                    "ORDER BY id DESC LIMIT ?",
                     (limit,)
-                ).fetchall()
-                cols = [d[0] for d in c.description]
+                )
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, r)) for r in rows]
         except Exception as e:
             log.error(f"TradeMemory critiques fetch error: {e}")
@@ -484,6 +574,13 @@ class TradeMemory:
         Returns the most relevant past lessons for the current setup. Returns
         an empty list if embeddings are unavailable (no lexical fallback here —
         critiques are free-form prose where a lexical match adds little).
+
+        SOURCE-BALANCED: the pool now holds two kinds of lesson — realized (from
+        TAKEN trades, the Judge's biased sample) and shadow (from SKIPPED trades,
+        the unbiased complement minted by add_shadow_lesson). We interleave the
+        two so neither drowns the other; a realized-only top-n would re-impose the
+        very selection bias the shadow lessons exist to correct (and shadows far
+        outnumber realized, so a naive top-n would flip the bias the other way).
         """
         q_emb = vs.get_embedder().encode(query_text)
         if q_emb is None:
@@ -491,14 +588,16 @@ class TradeMemory:
         try:
             with self._conn() as c:
                 rows = c.execute(
-                    """SELECT symbol, outcome, decision_quality, missed_warnings,
-                              lesson, pattern_tag, reviewed_at, embedding
+                    """SELECT trade_id, symbol, outcome, decision_quality,
+                              missed_warnings, lesson, pattern_tag, reviewed_at,
+                              embedding
                        FROM judge_critiques
                        WHERE embedding IS NOT NULL
-                       ORDER BY id DESC LIMIT 300"""
+                       ORDER BY id DESC LIMIT 600"""
                 ).fetchall()
-                cols = ["symbol","outcome","decision_quality","missed_warnings",
-                        "lesson","pattern_tag","reviewed_at","embedding"]
+                cols = ["trade_id","symbol","outcome","decision_quality",
+                        "missed_warnings","lesson","pattern_tag","reviewed_at",
+                        "embedding"]
                 crits = [dict(zip(cols, r)) for r in rows]
 
             scored = []
@@ -512,9 +611,17 @@ class TradeMemory:
                 scored.append(cr)
 
             scored.sort(key=lambda x: x["_score"], reverse=True)
-            for cr in scored[:n]:
+            real = [c for c in scored if not str(c.get("trade_id") or "").startswith("shadow:")]
+            shad = [c for c in scored if str(c.get("trade_id") or "").startswith("shadow:")]
+            out, i, j = [], 0, 0
+            while len(out) < n and (i < len(real) or j < len(shad)):
+                if i < len(real):
+                    out.append(real[i]); i += 1
+                if len(out) < n and j < len(shad):
+                    out.append(shad[j]); j += 1
+            for cr in out:
                 cr.pop("embedding", None)
-            return scored[:n]
+            return out
         except Exception as e:
             log.error(f"TradeMemory find_similar_critiques error: {e}")
             return []
