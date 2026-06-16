@@ -37,6 +37,16 @@ SL_MIN_PCT = 0.015   # SL never closer than 1.5% of entry
 SL_MAX_PCT = 0.25    # SL never further than 25% of entry
 
 
+def _opt_float(v):
+    """Coerce to float, preserving None so a missing agent vote stays NULL."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def risk_gate_label(reasons: list) -> str:
     """Sub-categorize a risk_agent rejection so each internal gate (4b breadth,
     4c EMA20, HTF, BTC momentum, confidence floor, …) is individually
@@ -109,6 +119,36 @@ class ShadowTracker:
             cols = [r[1] for r in c.execute("PRAGMA table_info(shadow_trades)")]
             if "redundant_gates" not in cols:
                 c.execute("ALTER TABLE shadow_trades ADD COLUMN redundant_gates TEXT")
+            # Per-agent vote at rejection (agent_reliability Phase A). Nullable;
+            # the aggregator excludes NULLs. This is the unbiased complement to
+            # the taken-trade votes — rejected signals tracked to a real ±R.
+            for col in ("smc_score", "tech_score", "macro_score"):
+                if col not in cols:
+                    c.execute(f"ALTER TABLE shadow_trades ADD COLUMN {col} REAL")
+
+            # Post-exit excursion tracker — READ-ONLY instrument. After a trade
+            # exits (taken) or a shadow resolves (hypothetical), watch price for
+            # watch_hours and record how far the move CONTINUED past our exit and
+            # whether a stopped-out trade later reached its original TP (noise vs
+            # genuine). Never feeds a live decision.
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS post_exit_tracks (
+                id TEXT PRIMARY KEY,
+                mode TEXT, symbol TEXT, side TEXT,
+                source TEXT, ref_id TEXT,
+                entry_price REAL, r_unit REAL,
+                exit_price REAL, exit_at TEXT, exit_reason TEXT, exit_r REAL,
+                orig_tp REAL, orig_sl REAL,
+                watch_until TEXT,
+                status TEXT DEFAULT 'watching',
+                mfe_price REAL, mae_price REAL,
+                post_mfe_r REAL, post_mae_r REAL,
+                continued_r REAL, recovered_to_tp INTEGER,
+                finalized_at TEXT
+            )""")
+            c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pet_watching
+            ON post_exit_tracks(mode, status)""")
 
     # ── capture ──────────────────────────────────────────────────────────
 
@@ -161,8 +201,9 @@ class ShadowTracker:
                         entry_price, atr, sl_price, tp_price, r_target,
                         regime, ensemble_score, confidence,
                         ob_imbalance, cvd_direction, cvd_divergence,
-                        btc_d, usdt_d, created_at, status, redundant_gates)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?)""",
+                        btc_d, usdt_d, created_at, status, redundant_gates,
+                        smc_score, tech_score, macro_score)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?)""",
                     (
                         sid, self.mode, symbol, side, gate, str(reason)[:300],
                         float(entry_price), float(atr),
@@ -177,6 +218,9 @@ class ShadowTracker:
                         float(ctx.get("usdt_d", 0) or 0),
                         now.isoformat(),
                         ctx.get("redundant_gates") or None,
+                        _opt_float(ctx.get("smc_score")),
+                        _opt_float(ctx.get("tech_score")),
+                        _opt_float(ctx.get("macro_score")),
                     ),
                 )
                 log.debug(f"shadow {symbol} {side} gate={gate} sl={sl_price:.4f} tp={tp_price:.4f}")
@@ -308,6 +352,156 @@ class ShadowTracker:
 
     def gate_stats(self, days: int = 30) -> dict:
         return load_stats(self.db_path, self.mode, days)
+
+    # ── post-exit excursion tracker (read-only instrument) ────────────────────
+
+    def start_post_exit_track(
+        self, source: str, symbol: str, side: str,
+        entry_price: float, r_unit: float, exit_price: float,
+        exit_reason: str, exit_r: Optional[float] = None,
+        orig_tp: Optional[float] = None, orig_sl: Optional[float] = None,
+        ref_id: str = "", watch_hours: float = 8.0,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Begin watching price AFTER a trade exits. `r_unit` is the trade's R in
+        price terms (initial stop distance) so every excursion is reported in R.
+        `side` is 'long'/'short'. Returns the track id, or None on bad input.
+        READ-ONLY — never affects a live decision."""
+        if (entry_price is None or exit_price is None
+                or not r_unit or r_unit <= 0 or side not in ("long", "short")):
+            return None
+        now = now or datetime.now(LOCAL_TZ)
+        tid = uuid.uuid4().hex
+        try:
+            with self._conn() as c:
+                c.execute(
+                    """INSERT INTO post_exit_tracks
+                       (id, mode, symbol, side, source, ref_id,
+                        entry_price, r_unit, exit_price, exit_at, exit_reason, exit_r,
+                        orig_tp, orig_sl, watch_until, status, mfe_price, mae_price)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'watching', ?, ?)""",
+                    (tid, self.mode, symbol, side, source, str(ref_id),
+                     float(entry_price), float(r_unit), float(exit_price),
+                     now.isoformat(), str(exit_reason)[:120],
+                     (float(exit_r) if exit_r is not None else None),
+                     (float(orig_tp) if orig_tp else None),
+                     (float(orig_sl) if orig_sl else None),
+                     (now + timedelta(hours=watch_hours)).isoformat(),
+                     float(exit_price), float(exit_price)),
+                )
+        except sqlite3.Error as e:
+            log.debug(f"start_post_exit_track failed {symbol}: {e}")
+            return None
+        return tid
+
+    def update_post_exit_tracks(self, fetch_ohlcv_fn: Callable,
+                                now: Optional[datetime] = None) -> int:
+        """Poll watching tracks: extend the running max-favorable / max-adverse
+        from candles since exit, and finalize those past watch_until. Returns the
+        number finalized. Never raises — a feed failure just leaves them open."""
+        now = now or datetime.now(LOCAL_TZ)
+        try:
+            with self._conn() as c:
+                c.row_factory = sqlite3.Row
+                rows = [dict(r) for r in c.execute(
+                    "SELECT * FROM post_exit_tracks WHERE mode=? AND status='watching'",
+                    (self.mode,),
+                ).fetchall()]
+        except sqlite3.Error as e:
+            log.debug(f"post_exit query failed: {e}")
+            return 0
+
+        by_symbol: dict = {}
+        for r in rows:
+            by_symbol.setdefault(r["symbol"], []).append(r)
+
+        finalized = 0
+        for symbol, tracks in by_symbol.items():
+            try:
+                df = fetch_ohlcv_fn(symbol, "15m", 200)
+            except Exception as e:
+                log.debug(f"post_exit fetch failed {symbol}: {e}")
+                continue
+            if df is None or len(df) == 0:
+                continue
+            idx = df.index
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert("UTC").tz_localize(None)
+            for t in tracks:
+                try:
+                    if self._update_one_track(t, df, idx, now):
+                        finalized += 1
+                except Exception as e:
+                    log.debug(f"post_exit update failed {t.get('id')}: {e}")
+        return finalized
+
+    def _update_one_track(self, t: dict, df, idx, now: datetime) -> bool:
+        """Update one track from its post-exit candle window. Returns True if it
+        was finalized this call."""
+        exit_at = _to_utc_naive(datetime.fromisoformat(t["exit_at"]))
+        window = df.loc[idx >= exit_at]
+        is_long = t["side"] == "long"
+        ex, ru, entry = t["exit_price"], t["r_unit"], t["entry_price"]
+
+        mfe_price, mae_price = t["mfe_price"], t["mae_price"]
+        last = ex
+        if len(window) > 0:
+            hi = float(window["high"].max())
+            lo = float(window["low"].min())
+            last = float(window["close"].iloc[-1])
+            if is_long:                       # favorable = up, adverse = down
+                mfe_price = max(mfe_price, hi)
+                mae_price = min(mae_price, lo)
+            else:                             # short: favorable = down
+                mfe_price = min(mfe_price, lo)
+                mae_price = max(mae_price, hi)
+
+        fields = {"mfe_price": mfe_price, "mae_price": mae_price}
+        done = now >= datetime.fromisoformat(t["watch_until"])
+        if done:
+            # Excursion past the EXIT, signed in trade direction:
+            #   post_mfe_r > 0 → the move kept going our way after we left
+            #   post_mae_r < 0 → it went against the trade after exit
+            post_mfe_r = ((mfe_price - ex) if is_long else (ex - mfe_price)) / ru
+            post_mae_r = ((mae_price - ex) if is_long else (ex - mae_price)) / ru
+            continued_r = ((last - entry) if is_long else (entry - last)) / ru
+            # Noise test: only meaningful for a stopped/losing exit with a TP set.
+            recovered = None
+            tp = t["orig_tp"]
+            if tp and t["exit_r"] is not None and t["exit_r"] <= 0:
+                reached = (mfe_price >= tp) if is_long else (mfe_price <= tp)
+                recovered = 1 if reached else 0
+            fields.update(status="done", finalized_at=now.isoformat(),
+                          post_mfe_r=post_mfe_r, post_mae_r=post_mae_r,
+                          continued_r=continued_r, recovered_to_tp=recovered)
+
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        try:
+            with self._conn() as c:
+                c.execute(
+                    f"UPDATE post_exit_tracks SET {set_clause} "
+                    f"WHERE id=? AND status='watching'",
+                    (*fields.values(), t["id"]),
+                )
+        except sqlite3.Error as e:
+            log.debug(f"post_exit update write failed {t['id']}: {e}")
+            return False
+        return done
+
+    def post_exit_rows(self, days: int = 30, status: str = "done") -> list:
+        """Finalized post-exit tracks over the window — pure read for the report."""
+        cutoff = (datetime.now(LOCAL_TZ) - timedelta(days=days)).isoformat()
+        col = "finalized_at" if status == "done" else "exit_at"
+        try:
+            with self._conn() as c:
+                c.row_factory = sqlite3.Row
+                return [dict(r) for r in c.execute(
+                    f"SELECT * FROM post_exit_tracks "
+                    f"WHERE mode=? AND status=? AND {col}>=?",
+                    (self.mode, status, cutoff),
+                ).fetchall()]
+        except sqlite3.Error:
+            return []
 
 
 def load_stats(db_path, mode: str, days: int = 30) -> dict:

@@ -60,6 +60,7 @@ from agents import usage_tracker
 from engine.profiles       import TradingProfile
 from engine.smc_agent      import SMCAgent
 from engine.ensemble       import EnsembleEngine
+from engine import ensemble as ensemble_mod
 from engine.risk_agent     import RiskDecisionAgent
 from engine.execution_engine import ExecutionEngine
 
@@ -276,6 +277,21 @@ class BaseBot:
 
     MODE = "spot"   # Override in subclass
 
+    # Scans a directional signal must persist before it's tradeable (debounce).
+    CONFIRM_SCANS = 2
+
+    def _confirm_signal(self, symbol: str, action: str) -> tuple:
+        """Track signal persistence. Returns (confirmed, streak_count).
+
+        A direction that repeats for CONFIRM_SCANS consecutive scans is
+        confirmed; a flip restarts the count. See the debounce gate in the
+        scan loop and self._signal_streak.
+        """
+        prev_action, count = self._signal_streak.get(symbol, (None, 0))
+        count = count + 1 if prev_action == action else 1
+        self._signal_streak[symbol] = (action, count)
+        return count >= self.CONFIRM_SCANS, count
+
     def __init__(self, config_file: str = "config.yaml", log_file: str = "bot.log"):
         self.config_file = config_file
         cfg_path = BOT_ROOT / config_file
@@ -353,18 +369,31 @@ class BaseBot:
             self.log.warning(f"ShadowTracker disabled: {e}")
             self.shadow_tracker = None
         self._shadow_cycle_count = 0
+        # Post-exit excursion tracker watch window (read-only instrument).
+        self._post_exit_watch_h = float(
+            (self.config.get("post_exit_tracker") or {}).get("watch_hours", 8.0))
 
         # New agents
         self.macro_context = MacroContextAgent(get_coingecko_key())
         self.microstructure = MicrostructureAgent(self.config.get("microstructure", {}))
 
+        # Signal-confirmation debounce: a non-HOLD action must repeat for
+        # CONFIRM_SCANS consecutive scans before it's tradeable. Kills
+        # single-scan flip-flops from any agent. {symbol: (action, count)}.
+        self._signal_streak: dict = {}
+
         # Ensemble: SMC (structure) + Technical (indicators) + MacroFlow (dominance)
         self.smc_agent   = SMCAgent()
         self.tech_agent  = TechnicalAgent()
         from engine.macro_agent import MacroFlowAgent
+        ens_cfg = self.config.get("ensemble") or {}
         self.ensemble = EnsembleEngine(
             self.smc_agent, self.tech_agent, MacroFlowAgent(self.agents.macro),
             trend_filter=self.config.get("trend_filter") or {},
+            # Phase B (agent_reliability): off by default. Reads the advisory JSON
+            # written by scripts/agent_reliability.py for this mode.
+            adaptive_weights=bool(ens_cfg.get("adaptive_weights", False)),
+            reliability_path=DATA / f"agent_reliability_{self.MODE}.json",
         )
 
         # Risk decision agent (GNN replaced by CorrelationCheck pass-through)
@@ -543,6 +572,8 @@ class BaseBot:
                     "btc_d": (macro or {}).get("btc_d", 0.0),
                     "usdt_d": (macro or {}).get("usdt_d", 0.0),
                     "redundant_gates": ",".join(redundant),
+                    # Per-agent votes — agent_reliability Phase A (rejected population).
+                    **ensemble_mod.agent_score_map(ensemble),
                 },
             )
         except Exception as e:
@@ -567,6 +598,22 @@ class BaseBot:
                              if self.trade_memory.add_shadow_lesson(s))
                 if minted:
                     self.log.info(f"SHADOW minted {minted} skipped-trade lessons")
+                # Post-exit tracker: watch each hypothetical TP/SL hit onward, so
+                # the same "did the move continue / was the stop noise" question is
+                # answered for skipped trades too.
+                for s in resolved:
+                    if s.get("status") in ("tp", "sl"):
+                        ru = abs(float(s["entry_price"]) - float(s["sl_price"]))
+                        self.shadow_tracker.start_post_exit_track(
+                            source="shadow", symbol=s["symbol"], side=s["side"],
+                            entry_price=s["entry_price"], r_unit=ru,
+                            exit_price=s["resolve_price"], exit_reason=s["status"],
+                            exit_r=s.get("outcome_r"), ref_id=s["id"],
+                            orig_tp=s["tp_price"], orig_sl=s["sl_price"],
+                            watch_hours=self._post_exit_watch_h,
+                        )
+            # Advance every watching track (taken + shadow) on the same cadence.
+            self.shadow_tracker.update_post_exit_tracks(self.feed.fetch_ohlcv)
         except Exception as e:
             self.log.debug(f"shadow resolve failed: {e}")
 
@@ -774,6 +821,30 @@ class BaseBot:
             for s in ensemble.signals:
                 self.log.debug(f"AGENT {symbol} | {s.agent}: net={s.net_score:+.3f} | {s.reasoning[:80]}")
 
+            # ── Signal-confirmation debounce ────────────────────────────
+            # A directional call must persist across CONFIRM_SCANS consecutive
+            # scans before it's tradeable — filters single-scan flip-flops.
+            # HOLD resets the streak; a direction flip restarts the count.
+            if ensemble.action in ("BUY", "SELL"):
+                confirmed, streak = self._confirm_signal(symbol, ensemble.action)
+                if not confirmed:
+                    self.log.info(f"SIGNAL {symbol} → {ensemble.action} pending "
+                                  f"confirmation ({streak}/{self.CONFIRM_SCANS}) | "
+                                  f"net={ensemble.net_score:+.3f}")
+                    self.state.add_signal({
+                        "symbol": symbol, "action": ensemble.action,
+                        "confidence": ensemble.confidence, "status": "hold",
+                        "reason": f"pending confirmation {streak}/{self.CONFIRM_SCANS}",
+                        "strategy": f"ensemble:{ensemble.net_score:+.3f}", "timeframe": "AUTO",
+                        "indicators": {"buy_score": ensemble.buy_score,
+                                       "sell_score": ensemble.sell_score,
+                                       "agents_agree": ensemble.agents_agreeing},
+                        "timestamp": datetime.now(LOCAL_TZ).isoformat(),
+                    })
+                    return
+            else:
+                self._signal_streak.pop(symbol, None)
+
             if ensemble.action == "HOLD":
                 is_trend_veto = (ensemble.source or "").startswith("trend_veto") \
                     and ensemble.vetoed_action in ("BUY", "SELL")
@@ -913,12 +984,15 @@ class BaseBot:
                     f"+ counterfactual {cf['win_rate']:.0%}(n={cf['n']}) "
                     f"→ blended {precedent['blended']['win_rate']:.0%} | {len(lessons)} lessons"
                 )
-                extra_context = ""
-                if lessons:
-                    extra_context = "Relevant past lessons:\n" + "\n".join(
-                        f"- [{l.get('outcome','?')}] {l.get('lesson','')}".strip()
-                        for l in lessons if l.get("lesson")
-                    )
+                # Demote-to-context: a past lesson may not act as a frozen veto.
+                # A cautionary (LOSS) lesson keeps full weight only while the LIVE
+                # blended edge for this same regime+side still agrees the setup is
+                # weak; once that edge turns positive the lesson is relabelled as
+                # stale advisory so the Actor reads it as context, not a directive.
+                extra_context = trade_memory_mod.annotate_lessons(
+                    lessons, precedent["blended"],
+                    precedent["regime"], precedent["side"],
+                )
                 if trend_change:
                     extra_context += (
                         ("\n" if extra_context else "")
@@ -1120,6 +1194,11 @@ class BaseBot:
                     "skeptic_objection": (skeptic.objection if skeptic else None),
                     "skeptic_size_mult": skeptic_size_mult,
                     "entry_price": price,
+                    # Entry ATR — lets the post-exit tracker reconstruct the R unit
+                    # (stop_loss_atr_mult × ATR) from the volatility at entry, not close.
+                    "atr": self.get_atr(symbol),
+                    # Per-agent votes — agent_reliability Phase A (taken population).
+                    **ensemble_mod.agent_score_map(ensemble),
                 }
                 self._save_entry_contexts()
 
@@ -1189,6 +1268,29 @@ class BaseBot:
 
             # Store in memory
             self.trade_memory.record_trade(trade_record, entry_ctx, r_multiple=r_mult)
+
+            # Post-exit excursion tracker (read-only instrument). Reconstruct the
+            # R unit from the profile stop (stop_loss_atr_mult × ATR) — the trade's
+            # initial SL isn't stored; entry ATR falls back to the live ATR.
+            if self.shadow_tracker:
+                try:
+                    symbol = trade.get("symbol")
+                    atr = float(entry_ctx.get("atr") or self.get_atr(symbol) or 0.0)
+                    r_unit = self.profile.stop_loss_atr_mult * atr
+                    if r_unit > 0 and entry > 0:
+                        side = "long" if str(trade.get("side", "")).upper() in ("BUY", "LONG") else "short"
+                        tp_dist = self.profile.take_profit_atr_mult * atr
+                        orig_tp = entry + tp_dist if side == "long" else entry - tp_dist
+                        orig_sl = entry - r_unit if side == "long" else entry + r_unit
+                        self.shadow_tracker.start_post_exit_track(
+                            source="taken", symbol=symbol, side=side,
+                            entry_price=entry, r_unit=r_unit, exit_price=close_price,
+                            exit_reason=reason, exit_r=r_mult, ref_id=trade_id,
+                            orig_tp=orig_tp, orig_sl=orig_sl,
+                            watch_hours=self._post_exit_watch_h,
+                        )
+                except Exception as e:
+                    self.log.debug(f"post_exit start (taken) failed: {e}")
 
             # Judge review (R1) — runs async to not block the cycle
             def _judge():

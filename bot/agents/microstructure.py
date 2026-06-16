@@ -101,8 +101,19 @@ class MicrostructureAgent:
         if ob_ratio is not None:
             if action == "BUY":
                 if ob_ratio < (1.0 / self.IMBALANCE_VETO):
-                    kill = True
-                    reasons.append(f"OB: overwhelming ask pressure {ob_ratio:.2f}x (veto)")
+                    if cvd_dir == "bullish":
+                        # Overwhelming ask wall BUT CVD shows buyers lifting it —
+                        # classic absorption, not a squeeze. Don't hard-kill the
+                        # long; shrink and let the 5m absorption check below be the
+                        # arbiter (wall survives only if absorption also confirms).
+                        # Shadow data: these longs won ~68%. The SELL side keeps the
+                        # unconditional veto — the Jun 6/7 squeeze showed a stacked
+                        # bid book must block shorts regardless of CVD.
+                        size_mult *= self.SOFT_WALL_MULT
+                        reasons.append(f"OB: overwhelming ask pressure {ob_ratio:.2f}x — CVD buying through, defer to absorption (size ×{self.SOFT_WALL_MULT})")
+                    else:
+                        kill = True
+                        reasons.append(f"OB: overwhelming ask pressure {ob_ratio:.2f}x (veto)")
                 elif ob_ratio < (1.0 / self.IMBALANCE_STRONG):
                     if cvd_dir != "bullish":
                         kill = True
@@ -158,11 +169,25 @@ class MicrostructureAgent:
                 reasons.append(f"CVD: neutral ({cvd_dir})")
 
         # ── Order flow absorption check (5m) ──────────────────────────
+        # A LONE absorption-fail is not enough to block: shadow data showed
+        # "no absorption on 5m" hard-kills threw away ~70%-win longs (ordinary
+        # weak-trend drift misread as an unabsorbed dump). Apply the gate's own
+        # two-reads-to-kill rule — hard-kill only when the order book is also
+        # against the trade; otherwise shrink and let the trade through.
         if not absorption:
-            kill = True
-            reasons.append(
-                f"Absorption: no absorption on 5m — aggressive {'selling' if action == 'BUY' else 'buying'} ongoing (veto)"
-            )
+            ob_against = (action == "BUY"  and ob_ratio < (1.0 / self.IMBALANCE_MILD)) or \
+                         (action == "SELL" and ob_ratio > self.IMBALANCE_MILD)
+            if ob_against:
+                kill = True
+                reasons.append(
+                    f"Absorption: no absorption on 5m + order book against — "
+                    f"aggressive {'selling' if action == 'BUY' else 'buying'} ongoing (veto)"
+                )
+            else:
+                size_mult *= self.SOFT_DIV_MULT
+                reasons.append(
+                    f"Absorption: no absorption on 5m — lone signal (size ×{self.SOFT_DIV_MULT})"
+                )
         else:
             reasons.append("Absorption: limit orders absorbing flow ✓")
 

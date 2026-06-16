@@ -205,23 +205,43 @@ class TestAnalyzeAbsorptionVeto:
             "MicrostructureSignal must have an 'absorption_confirmed' field"
         )
 
-    def test_long_with_no_absorption_triggers_kill(self):
+    def test_long_no_absorption_with_book_against_triggers_kill(self):
         """
-        If side=LONG and absorption_confirmed=False, the agent must hard-kill the signal.
+        LONG, absorption_confirmed=False AND the order book leaning against the
+        trade = two concurring contra reads → hard-kill.
         """
         agent = MicrostructureAgent()
         df_5m = self._make_long_setup(absorption=False)
         result = agent.analyze(
-            exchange=FakeExchange(),
+            exchange=FakeBookExchange(0.6),   # ask-heavy book, against the long
             symbol="BTCUSDT",
             df=df_5m,
             df_5m=df_5m,
             action="BUY",
         )
         assert result.kill is True, (
-            "Expected kill=True when LONG has no CVD absorption (aggressive selling)"
+            "Expected kill=True when LONG has no absorption AND book is against"
         )
         assert result.confirmed is False
+
+    def test_long_no_absorption_neutral_book_soft_shrinks(self):
+        """
+        LONG, absorption_confirmed=False but the book is NEUTRAL — a LONE
+        absorption-fail must shrink, not kill. Shadow data showed lone
+        absorption-fail kills threw away ~70%-win weak-trend longs.
+        """
+        agent = MicrostructureAgent()
+        df_5m = self._make_long_setup(absorption=False)
+        result = agent.analyze(
+            exchange=FakeExchange(),          # balanced book → not against
+            symbol="BTCUSDT",
+            df=df_5m,
+            df_5m=df_5m,
+            action="BUY",
+        )
+        assert result.kill is False
+        assert result.size_mult < 1.0
+        assert "no absorption" in result.reasoning.lower()
 
     def test_long_with_absorption_does_not_kill_on_absorption_grounds(self):
         """
@@ -242,9 +262,10 @@ class TestAnalyzeAbsorptionVeto:
             "Absorption kill message should not appear when absorption IS confirmed"
         )
 
-    def test_short_with_no_absorption_triggers_kill(self):
+    def test_short_no_absorption_with_book_against_triggers_kill(self):
         """
-        If side=SHORT and absorption_confirmed=False (genuine pump), hard-kill the SHORT.
+        SHORT, absorption_confirmed=False (genuine pump) AND a bid-heavy book
+        leaning against the short = two concurring contra reads → hard-kill.
         """
         agent = MicrostructureAgent()
         # Genuine pump for a short setup: price rising + CVD rising
@@ -253,14 +274,14 @@ class TestAnalyzeAbsorptionVeto:
         df_5m  = make_df(closes, opens, [300] * 5, n=20)
 
         result = agent.analyze(
-            exchange=FakeExchange(),
+            exchange=FakeBookExchange(1.7),   # bid-heavy book, against the short
             symbol="BTCUSDT",
             df=df_5m,
             df_5m=df_5m,
             action="SELL",
         )
         assert result.kill is True, (
-            "Expected kill=True when SHORT has no CVD absorption (aggressive buying)"
+            "Expected kill=True when SHORT has no absorption AND book is against"
         )
 
 
@@ -316,11 +337,22 @@ class TestSoftKillConversion:
         assert r.kill is False
         assert r.size_mult == pytest.approx(0.7)
 
-    def test_overwhelming_ask_wall_still_hard_kills_long(self):
-        # ob 0.30 < 1/2.5 → squeeze-grade wall vetoes regardless of CVD
+    def test_overwhelming_ask_wall_with_bullish_cvd_defers_to_absorption(self):
+        # ob 0.30 = squeeze-grade wall, BUT CVD bullish (buyers lifting it) →
+        # absorption setup, not a squeeze. Shrinks instead of hard-killing; the
+        # 5m absorption check (rising price → confirmed) lets the long through.
+        # Shadow data: these longs won ~68%.
         r = MicrostructureAgent().analyze(
             exchange=FakeBookExchange(0.30), symbol="X", df=rising_green_df(),
             df_5m=rising_green_df(), action="BUY")
+        assert r.kill is False
+        assert r.size_mult == pytest.approx(0.7)
+
+    def test_overwhelming_ask_wall_with_cvd_not_confirming_hard_kills_long(self):
+        # ob 0.30 wall + CVD NOT bullish → genuine squeeze evidence, still kills.
+        r = MicrostructureAgent().analyze(
+            exchange=FakeBookExchange(0.30), symbol="X", df=falling_red_df(),
+            df_5m=absorbing_long_df(), action="BUY")
         assert r.kill is True and r.size_mult == 0.0
 
     def test_ask_wall_plus_cvd_not_confirming_hard_kills_long(self):

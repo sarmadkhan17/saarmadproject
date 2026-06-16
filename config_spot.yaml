@@ -90,6 +90,11 @@ training:
   - 1h
   - 4h
   - 1d
+# Ensemble agent-weight learning (agent_reliability Phase B). See config_futures.yaml
+# for the full note. Keep OFF until the advisory JSON has ~1-2 weeks of data.
+ensemble:
+  adaptive_weights: false
+
 trend_filter:
   enabled: true
   use_two_tier: true        # P3 flag (flipped 2026-05-19 after replay evidence)

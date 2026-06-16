@@ -955,7 +955,24 @@ class CircuitBreaker:
         self.consec_losses = self.consec_losses + 1 if pnl < 0 else 0
         self._save()
 
+    def _sync_external(self):
+        """Re-read fields the dashboard can mutate while the bot is running.
+        The 'disable 24h' / reset button writes consec_losses + disabled_until
+        straight to circuit_breaker.json; without this the live breaker keeps
+        its in-memory state and the button has no effect until a restart."""
+        p = DATA / "circuit_breaker.json"
+        if not p.exists():
+            return
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except Exception:
+            return
+        self._disabled_until = d.get("disabled_until")
+        self.consec_losses   = d.get("consec_losses", self.consec_losses)
+
     def can_trade(self, balance):
+        self._sync_external()
         if self._disabled_until:
             from datetime import datetime, timezone
             until = datetime.fromisoformat(self._disabled_until)

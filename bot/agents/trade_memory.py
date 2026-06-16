@@ -35,6 +35,16 @@ except ImportError:                        # tests import via the bot. package
 log = logging.getLogger("TradeMemory")
 
 
+def _opt_float(v):
+    """Coerce to float, preserving None (so a missing agent vote stays NULL)."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── Text builders for the semantic stores ───────────────────────────────────
 # These render an entry context (or critique) into the short natural-language
 # string that gets embedded. The trade/query text deliberately EXCLUDES the
@@ -63,6 +73,51 @@ def critique_text(critique: dict) -> str:
         f"Missed warnings: {critique.get('missed_warnings','') or 'none'}. "
         f"Lesson: {critique.get('lesson','')}"
     ).strip()
+
+
+# Minimum blended sample below which the live edge is too thin to override a
+# past lesson (avoids demoting a caution on the strength of one or two outcomes).
+LESSON_OVERRIDE_MIN_N = 8
+
+
+def annotate_lessons(lessons: list, blended: dict, regime: str, side: str,
+                     min_n: int = LESSON_OVERRIDE_MIN_N) -> str:
+    """Render retrieved Judge lessons into the Actor's 'past lessons' block,
+    DEMOTING any cautionary (LOSS) lesson the live blended stat now contradicts.
+
+    A frozen LOSS critique ("this setup loses") must never act as a veto once the
+    continuously-updated blended edge for the SAME regime+side has turned
+    positive. Rather than wait to "retire" the lesson from outcomes (lagging —
+    the winning trades are missed first), the live blended stat is the arbiter:
+    when it shows positive edge over a meaningful sample, the contradicted
+    caution is relabelled as stale advisory context — the Actor still reads it
+    but is told the live edge overrides it. Favourable (WIN) lessons, and
+    cautions the live edge still corroborates, keep their normal label.
+    """
+    if not lessons:
+        return ""
+    n     = int(blended.get("n", 0) or 0)
+    wr    = float(blended.get("win_rate", 0.0) or 0.0)
+    avg_r = float(blended.get("avg_r", 0.0) or 0.0)
+    live_edge_positive = (n >= min_n and wr >= 0.5 and avg_r > 0.0)
+
+    lines = []
+    for l in lessons:
+        txt = (l.get("lesson") or "").strip()
+        if not txt:
+            continue
+        cautionary = str(l.get("outcome", "")).upper() == "LOSS"
+        if cautionary and live_edge_positive:
+            lines.append(
+                f"- [STALE ADVISORY — live blended {regime} {side} edge is now "
+                f"{wr:.0%} win / {avg_r:+.2f}R over n={n}; this past caution is "
+                f"contradicted by current data — context only, do not gate on it] {txt}"
+            )
+        else:
+            lines.append(f"- [{l.get('outcome','?')}] {txt}")
+    if not lines:
+        return ""
+    return "Relevant past lessons:\n" + "\n".join(lines)
 
 
 def smoothed_stats(rows: list, half_life_h: float, prior: float,
@@ -138,6 +193,11 @@ class TradeMemory:
             # Migration: add embedding BLOB columns to existing DBs.
             self._ensure_column(c, "trades", "embedding", "BLOB")
             self._ensure_column(c, "judge_critiques", "embedding", "BLOB")
+            # Per-agent vote at entry (agent_reliability Phase A). Nullable —
+            # old rows stay NULL and the aggregator excludes them.
+            self._ensure_column(c, "trades", "smc_score", "REAL")
+            self._ensure_column(c, "trades", "tech_score", "REAL")
+            self._ensure_column(c, "trades", "macro_score", "REAL")
 
     @staticmethod
     def _ensure_column(c, table: str, col: str, decl: str):
@@ -162,8 +222,9 @@ class TradeMemory:
                     ensemble_score, confidence, ob_imbalance,
                     cvd_direction, cvd_divergence, actor_reasoning,
                     actor_approved, judge_critique, pattern_tag,
-                    closed_at, embedding
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    closed_at, embedding,
+                    smc_score, tech_score, macro_score
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     trade.get("id", ""),
                     trade.get("symbol", ""),
                     side,
@@ -190,6 +251,9 @@ class TradeMemory:
                     "",  # pattern_tag filled in later
                     datetime.now(LOCAL_TZ).isoformat(),
                     vs.to_blob(emb),
+                    _opt_float(entry_context.get("smc_score")),
+                    _opt_float(entry_context.get("tech_score")),
+                    _opt_float(entry_context.get("macro_score")),
                 ))
         except Exception as e:
             log.error(f"TradeMemory record error: {e}")

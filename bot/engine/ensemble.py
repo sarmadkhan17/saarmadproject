@@ -2,9 +2,11 @@
 Ensemble Engine — runs all strategy agents in parallel, produces weighted consensus.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import List, Optional
 import numpy as np
 import pandas as pd
@@ -27,15 +29,72 @@ class EnsembleResult:
     vetoed_action: Optional[str] = None  # original BUY/SELL when the trend filter forced HOLD
 
 
+def agent_score_map(result) -> dict:
+    """Per-agent net_score from an EnsembleResult, keyed for the reliability
+    store (agent_reliability Phase A). Missing/abstaining agents → None so the
+    aggregator can exclude them. Pure read; safe on any result shape."""
+    by = {s.agent: s.net_score for s in getattr(result, "signals", []) or []}
+    return {
+        "smc_score":   by.get("smc"),
+        "tech_score":  by.get("technical"),
+        "macro_score": by.get("macro_flow"),
+    }
+
+
+class _ReliabilityWeights:
+    """Phase B loader for the advisory per-(agent, regime) multipliers written
+    by agent_reliability.compute(). Reloads on file mtime change (weekly
+    cadence — cheap). Only buckets the aggregator flagged `actionable` (enough
+    resolved votes) deviate from 1.0; everything else returns a neutral 1.0, so
+    a stale/absent/thin file can never distort weights — it just no-ops."""
+
+    def __init__(self, path):
+        self.path = Path(path) if path else None
+        self._mtime = None
+        self._table: dict = {}   # {REGIME: {agent: multiplier}}
+
+    def _maybe_reload(self):
+        if not self.path or not self.path.exists():
+            self._table = {}
+            return
+        try:
+            m = self.path.stat().st_mtime
+            if m == self._mtime:
+                return
+            self._mtime = m
+            with open(self.path) as f:
+                data = json.load(f)
+            tbl: dict = {}
+            for regime, agents in (data.get("regimes") or {}).items():
+                for agent, s in (agents or {}).items():
+                    if s.get("actionable"):
+                        tbl.setdefault(regime.upper(), {})[agent] = \
+                            float(s.get("multiplier", 1.0))
+            self._table = tbl
+            log.info(f"Ensemble adaptive weights loaded: "
+                     f"{sum(len(v) for v in tbl.values())} actionable buckets")
+        except Exception as e:
+            log.debug(f"reliability weights load failed: {e}")
+
+    def mult(self, agent: str, regime: str) -> float:
+        self._maybe_reload()
+        return self._table.get((regime or "").upper(), {}).get(agent, 1.0)
+
+
 class EnsembleEngine:
     BASE_AGENT_WEIGHTS = {"smc": 0.35, "technical": 0.40,
                           "macro_flow": 0.25, "mean_reversion": 0.0}
 
     def __init__(self, smc_agent, tech_agent, macro_agent=None,
-                 trend_filter=None, mr_agent=None):
+                 trend_filter=None, mr_agent=None,
+                 adaptive_weights=False, reliability_path=None):
         self.smc     = smc_agent
         self.tech    = tech_agent
         self.macro   = macro_agent
+        # Phase B: when adaptive_weights is on, the base regime weight table is
+        # scaled by each agent's debiased reliability multiplier (agent_reliability).
+        # Off by default — until enabled the engine behaves exactly as before.
+        self._rel = _ReliabilityWeights(reliability_path) if adaptive_weights else None
         # mr_agent: optional mean-reversion agent (Phase 3). When present the
         # ensemble routes weight to it by regime; when None the engine behaves
         # exactly as the legacy 3-agent ensemble.
@@ -90,9 +149,14 @@ class EnsembleEngine:
         signals = []
         with ThreadPoolExecutor(max_workers=min(4, len(agents))) as pool:
             futures = {}
+            htf_df = dfs.get("4h")
             for name, agent in agents.items():
                 if name == "smc":
                     futures[pool.submit(agent.analyze, df, profile, market_ctx)] = name
+                elif name == "technical":
+                    # Technical agent scores on 1h but gates by the 4h trend
+                    # (multi-TF confluence) and adapts thresholds by regime.
+                    futures[pool.submit(agent.analyze, df, profile, market_ctx, htf_df)] = name
                 else:
                     futures[pool.submit(agent.analyze, df, profile)] = name
             n_submitted = len(futures)
@@ -195,6 +259,13 @@ class EnsembleEngine:
                    market_ctx: dict = None, regime: str = "RANGING",
                    threshold_mult: float = 1.0) -> EnsembleResult:
         weights = self._regime_weights(regime)
+        # Phase B: scale base weights by each agent's debiased reliability
+        # (no-op unless adaptive_weights is enabled and the bucket is actionable).
+        # The downstream net/=total_w renormalizes, so this re-balances relative
+        # agent influence without changing the overall confidence scale.
+        if self._rel is not None:
+            weights = {a: w * self._rel.mult(a, regime) for a, w in weights.items()}
+            log.debug(f"ENSEMBLE DEBUG: adaptive weights ({regime}) → {weights}")
         net = 0.0
         buy_score  = 0.0
         sell_score = 0.0
