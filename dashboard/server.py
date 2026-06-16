@@ -611,6 +611,86 @@ def shadow_stats():
         return jsonify({"mode": mode, "gates": {}})
 
 
+@app.route("/api/agent_reliability")
+def agent_reliability_live():
+    """Debiased per-agent, per-regime reliability (agent_reliability Phase A),
+    computed live from trade_memory.db. ADVISORY — not applied to live weights."""
+    db = DATA / "trade_memory.db"
+    mode = _detect_active_mode() or "futures"
+    if not db.exists():
+        return jsonify({"mode": mode, "samples": 0, "regimes": {}})
+    try:
+        from agents import agent_reliability as ar
+        return jsonify(ar.compute(str(db), mode, days=30))
+    except Exception:
+        return jsonify({"mode": mode, "samples": 0, "regimes": {}})
+
+
+@app.route("/api/post_exit")
+def post_exit():
+    """Post-exit excursion tracker — how far moves continued AFTER we exited
+    (Q3) and whether stops were noise vs genuine (Q2). Read-only instrument."""
+    import sqlite3
+    import statistics as st
+    db = DATA / "trade_memory.db"
+    mode = _detect_active_mode() or "futures"
+    out = {"mode": mode, "sources": {}, "watching": 0}
+    if not db.exists():
+        return jsonify(out)
+    try:
+        cutoff = (datetime.now(LOCAL_TZ) - timedelta(days=30)).isoformat()
+        with sqlite3.connect(str(db), timeout=10) as c:
+            c.row_factory = sqlite3.Row
+            try:
+                rows = [dict(r) for r in c.execute(
+                    "SELECT source, exit_reason, post_mfe_r, continued_r, recovered_to_tp "
+                    "FROM post_exit_tracks WHERE mode=? AND status='done' AND finalized_at>=?",
+                    (mode, cutoff)).fetchall()]
+                out["watching"] = c.execute(
+                    "SELECT COUNT(*) FROM post_exit_tracks WHERE mode=? AND status='watching'",
+                    (mode,)).fetchone()[0]
+            except sqlite3.OperationalError:
+                return jsonify(out)  # table not created yet
+    except sqlite3.Error:
+        return jsonify(out)
+
+    def bucket(rs):
+        b = {"<0": 0, "0-0.5R": 0, "0.5-1R": 0, "1-2R": 0, "2-3.5R": 0, ">=3.5R": 0}
+        for r in rs:
+            x = r.get("post_mfe_r")
+            if x is None:
+                continue
+            if x < 0:       b["<0"] += 1
+            elif x < 0.5:   b["0-0.5R"] += 1
+            elif x < 1:     b["0.5-1R"] += 1
+            elif x < 2:     b["1-2R"] += 1
+            elif x < 3.5:   b["2-3.5R"] += 1
+            else:           b[">=3.5R"] += 1
+        return b
+
+    for src in ("taken", "shadow"):
+        srows = [r for r in rows if r["source"] == src]
+        if not srows:
+            continue
+        mfe = [r["post_mfe_r"] for r in srows if r["post_mfe_r"] is not None]
+        cap = [r["post_mfe_r"] for r in srows
+               if "BACKSTOP" in (r["exit_reason"] or "") and r["post_mfe_r"] is not None]
+        stops = [r for r in srows if r["recovered_to_tp"] is not None]
+        cont = [r["continued_r"] for r in stops if r["continued_r"] is not None]
+        out["sources"][src] = {
+            "n": len(srows),
+            "median_continuation_r": round(st.median(mfe), 2) if mfe else None,
+            "buckets": bucket(srows),
+            "backstop_n": len(cap),
+            "backstop_ran_on": sum(1 for x in cap if x > 0.2),
+            "backstop_median_further_r": round(st.median(cap), 2) if cap else None,
+            "stops_n": len(stops),
+            "stops_noise": sum(1 for r in stops if r["recovered_to_tp"] == 1),
+            "stops_median_continued_r": round(st.median(cont), 2) if cont else None,
+        }
+    return jsonify(out)
+
+
 @app.route("/api/token_budget")
 def token_budget():
     # v5: reads deepseek_usage.json (was Groq's token_budget.json)

@@ -1411,6 +1411,35 @@ td {
     </div>
   </div>
 
+  <div class="section-label">Agent Reliability &amp; Post-Exit Tracker</div>
+  <div class="row row-5050 mb-18">
+    <div>
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Agent Reliability (debiased)</span>
+          <span class="panel-badge" id="agentRelBadge">Advisory · 30d</span>
+        </div>
+        <div class="table-wrap" style="max-height:260px">
+          <table class="shadow-table">
+            <thead><tr><th>Regime / Agent</th><th>Acc</th><th>Edge</th><th>n</th><th>Weight</th></tr></thead>
+            <tbody id="agentRelBody"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Post-Exit Excursion</span>
+          <span class="panel-badge" id="postExitBadge">8h watch</span>
+        </div>
+        <div id="postExitBody" style="padding:10px 12px;max-height:260px;overflow:auto">
+          <div class="empty">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="section-label">Agent Analytics</div>
   <div class="panel">
     <div class="panel-header">
@@ -2114,6 +2143,79 @@ function updateShadowStats() {
   });
 }
 
+/* ─── AGENT RELIABILITY (debiased, advisory) ─── */
+function updateAgentReliability() {
+  get('/api/agent_reliability', function(r) {
+    var tbody = document.getElementById('agentRelBody');
+    var badge = document.getElementById('agentRelBadge');
+    if (!tbody) return;
+    var regimes = (r && r.regimes) ? r.regimes : {};
+    var rnames = Object.keys(regimes).sort();
+    if (badge) badge.textContent = (r && r.samples ? r.samples : 0) + ' samples · advisory';
+    if (!rnames.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">No agent-tagged outcomes yet</td></tr>';
+      return;
+    }
+    var h = '';
+    rnames.forEach(function(reg) {
+      h += '<tr><td colspan="5" style="font-weight:600;color:var(--text2)">' + escapeHtml(reg) + '</td></tr>';
+      var agents = regimes[reg];
+      Object.keys(agents).sort().forEach(function(a) {
+        var s = agents[a];
+        var acc = (s.accuracy * 100).toFixed(0) + '%';
+        var edge = (s.edge >= 0 ? '+' : '') + s.edge.toFixed(2);
+        var edgeCls = s.edge > 0.02 ? 'good' : (s.edge < -0.02 ? 'bad' : 'neu');
+        var thin = s.actionable ? '' : ' <span class="shadow-chip exp">thin</span>';
+        h += '<tr>' +
+          '<td style="padding-left:14px">' + escapeHtml(a) + thin + '</td>' +
+          '<td>' + acc + '</td>' +
+          '<td><span class="shadow-netr ' + edgeCls + '">' + edge + '</span></td>' +
+          '<td>' + Math.round(s.n || 0) + '</td>' +
+          '<td>×' + s.multiplier.toFixed(2) + '</td>' +
+          '</tr>';
+      });
+    });
+    tbody.innerHTML = h;
+  });
+}
+
+/* ─── POST-EXIT EXCURSION TRACKER ─── */
+function updatePostExit() {
+  get('/api/post_exit', function(r) {
+    var el = document.getElementById('postExitBody');
+    var badge = document.getElementById('postExitBadge');
+    if (!el) return;
+    var sources = (r && r.sources) ? r.sources : {};
+    var watching = (r && r.watching) ? r.watching : 0;
+    if (badge) badge.textContent = '8h watch · ' + watching + ' watching';
+    if (!Object.keys(sources).length) {
+      el.innerHTML = '<div class="empty">Collecting — ' + watching +
+        ' trade(s) being watched, none finalized yet (8h window)</div>';
+      return;
+    }
+    function rtxt(v) { return (v === null || v === undefined) ? '—' : ((v >= 0 ? '+' : '') + v.toFixed(2) + 'R'); }
+    var h = '';
+    ['taken', 'shadow'].forEach(function(src) {
+      var s = sources[src];
+      if (!s) return;
+      var noiseTxt = s.stops_n ? Math.round(s.stops_noise / s.stops_n * 100) + '% (' + s.stops_noise + '/' + s.stops_n + ')' : '—';
+      var capTxt = s.backstop_n ? (s.backstop_ran_on + '/' + s.backstop_n + ' ran on · med ' + rtxt(s.backstop_median_further_r)) : '—';
+      h += '<div style="margin-bottom:12px">' +
+        '<div style="font-weight:600;color:var(--text2);margin-bottom:4px">' + escapeHtml(src) + ' (' + s.n + ')</div>' +
+        '<div style="font-size:11px;color:var(--text1);line-height:1.7">' +
+          'Median continuation past exit: <b>' + rtxt(s.median_continuation_r) + '</b><br>' +
+          'Backstop run-on (Q3): <b>' + capTxt + '</b><br>' +
+          'Stop hit TP afterward = noise (Q2): <b>' + noiseTxt + '</b>' +
+        '</div>';
+      var b = s.buckets || {};
+      var order = ['<0', '0-0.5R', '0.5-1R', '1-2R', '2-3.5R', '>=3.5R'];
+      var chips = order.map(function(k) { return '<span class="shadow-chip open">' + k + ': ' + (b[k] || 0) + '</span>'; }).join(' ');
+      h += '<div class="shadow-chips" style="margin-top:4px">' + chips + '</div></div>';
+    });
+    el.innerHTML = h;
+  });
+}
+
 /* ─── SYSTEM HEALTH ─── */
 function updateHealth() {
   get('/api/detailed_health', function(r) {
@@ -2335,6 +2437,8 @@ function refresh() {
   updateLogs();
   updateStatus();
   updateShadowStats();
+  updateAgentReliability();
+  updatePostExit();
   updateHealth();
   updateExchangeMode();
   updateBotUI();
